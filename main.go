@@ -1787,6 +1787,7 @@ const dashboardHTML = `<!DOCTYPE html>
     const pageInfoEl = document.getElementById('page-info');
 
     let eventSource = null;
+    let livePollTimer = null;
     let currentMode = 'live';
     let currentPage = 1;
 
@@ -1947,6 +1948,10 @@ const dashboardHTML = `<!DOCTYPE html>
         eventSource.close();
         eventSource = null;
       }
+      if (livePollTimer) {
+        clearInterval(livePollTimer);
+        livePollTimer = null;
+      }
     }
 
     async function fetchState() {
@@ -1984,30 +1989,33 @@ const dashboardHTML = `<!DOCTYPE html>
       }
       await fetchState();
       if (currentPage === 1) {
-        connectEvents();
+        startLivePolling();
       } else {
         stopLiveStream();
         setConnectionState('Canlı akış yalnızca 1. sayfada aktif', null);
       }
     }
 
-    function connectEvents() {
-      stopLiveStream();
-      const es = new EventSource('/events');
-      eventSource = es;
-      es.addEventListener('state', (event) => {
-        setConnectionState('Canlı', 'live');
-        const state = JSON.parse(event.data);
+    async function pollLiveState() {
+      try {
+        const state = await fetchState();
         state.mode = 'live';
-        state.limit = 50;
         render(state);
-      });
-      es.onerror = () => {
-        setConnectionState('Yeniden bağlanıyor', 'retry');
-      };
-      es.onopen = () => {
         setConnectionState('Canlı', 'live');
-      };
+      } catch (error) {
+        setConnectionState('Yeniden bağlanıyor', 'retry');
+      }
+    }
+
+    function startLivePolling() {
+      stopLiveStream();
+      setConnectionState('Canlı', 'live');
+      livePollTimer = setInterval(() => {
+        if (currentMode !== 'live' || currentPage !== 1) {
+          return;
+        }
+        void pollLiveState();
+      }, 1000);
     }
 
     dateSelectEl.addEventListener('change', async () => {
@@ -2015,7 +2023,7 @@ const dashboardHTML = `<!DOCTYPE html>
       hourSelectEl.value = '';
       if (!dateSelectEl.value) {
         await fetchState();
-        connectEvents();
+        startLivePolling();
         return;
       }
       await fetchState();
@@ -2039,7 +2047,7 @@ const dashboardHTML = `<!DOCTYPE html>
       }
       if (!dateSelectEl.value && !hourSelectEl.value) {
         await fetchState();
-        connectEvents();
+        startLivePolling();
         return;
       }
       await fetchState();
@@ -2052,7 +2060,7 @@ const dashboardHTML = `<!DOCTYPE html>
       hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
       hourSelectEl.disabled = true;
       await fetchState();
-      connectEvents();
+      startLivePolling();
     });
 
     prevPageEl.addEventListener('click', async () => {
@@ -2068,7 +2076,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     fetchState().then((state) => {
       if ((state.mode || 'live') === 'live') {
-        connectEvents();
+        startLivePolling();
       }
     }).catch((error) => {
       setConnectionState(error.message, 'error');
