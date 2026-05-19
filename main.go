@@ -1412,49 +1412,11 @@ const dashboardHTML = `<!DOCTYPE html>
       flex-wrap: wrap;
     }
 
-    .hero-left {
+    .hero-stats {
       display: grid;
-      gap: 12px;
-    }
-
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--muted);
-      font-size: 13px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-
-    .eyebrow-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: linear-gradient(135deg, var(--accent), #2563eb);
-      box-shadow: 0 0 18px rgba(96,165,250,0.7);
-    }
-
-    h1 {
-      margin: 0;
-      font-size: clamp(30px, 4vw, 42px);
-      line-height: 1.05;
-      font-weight: 700;
-      letter-spacing: -0.03em;
-    }
-
-    .hero-subtitle {
-      margin: 0;
-      max-width: 760px;
-      color: var(--muted);
-      font-size: 15px;
-      line-height: 1.65;
-    }
-
-    .hero-right {
-      display: grid;
-      gap: 12px;
-      min-width: 240px;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 16px;
+      align-items: stretch;
     }
 
     .status-card {
@@ -1694,25 +1656,26 @@ const dashboardHTML = `<!DOCTYPE html>
 </head>
 <body>
   <div class="layout">
-    <section class="hero">
-      <div class="hero-left">
-        <div class="eyebrow"><span class="eyebrow-dot"></span> NetFlow izleme paneli</div>
-        <h1>Akış kayıtlarını canlı ve geçmişte görüntüle</h1>
-        <p class="hero-subtitle">Saatlik log dosyalarını gün ve saat bazında seçebilir, istersen tek tıkla yeniden canlı SSE akışına dönebilirsin.</p>
+    <section class="hero hero-stats">
+      <div class="status-card">
+        <div class="status-label">Bağlantı durumu</div>
+        <div class="status-value"><span class="status-badge" id="connection">Bağlanıyor</span></div>
       </div>
-      <div class="hero-right">
-        <div class="status-card">
-          <div class="status-label">Bağlantı durumu</div>
-          <div class="status-value"><span class="status-badge" id="connection">Bağlanıyor</span></div>
-        </div>
-        <div class="status-card">
-          <div class="status-label">Görüntü modu</div>
-          <div class="status-value"><button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button></div>
-        </div>
-        <div class="status-card">
-          <div class="status-label">Son güncelleme</div>
-          <div class="status-value" id="updated-at">-</div>
-        </div>
+      <div class="status-card">
+        <div class="status-label">Görüntü modu</div>
+        <div class="status-value"><button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button></div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">Son güncelleme</div>
+        <div class="status-value" id="updated-at">-</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">Toplam kayıt</div>
+        <div class="status-value" id="total-records">0</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">Sayfa</div>
+        <div class="status-value" id="page-summary">1 / 1</div>
       </div>
     </section>
 
@@ -1785,11 +1748,15 @@ const dashboardHTML = `<!DOCTYPE html>
     const prevPageEl = document.getElementById('prev-page');
     const nextPageEl = document.getElementById('next-page');
     const pageInfoEl = document.getElementById('page-info');
+    const totalRecordsEl = document.getElementById('total-records');
+    const pageSummaryEl = document.getElementById('page-summary');
 
     let eventSource = null;
     let livePollTimer = null;
     let currentMode = 'live';
     let currentPage = 1;
+    const totalRecordsEl = document.getElementById('total-records');
+    const pageSummaryEl = document.getElementById('page-summary');
 
     function formatTime(value) {
       if (!value) return '-';
@@ -1924,6 +1891,8 @@ const dashboardHTML = `<!DOCTYPE html>
       limitSelectEl.value = String(state.limit || 50);
       updatedAtEl.textContent = formatTime(state.updated_at || '');
       pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
+      pageSummaryEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
+      totalRecordsEl.textContent = String(state.total_records || 0);
       prevPageEl.disabled = (state.page || 1) <= 1;
       nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
       renderRows(state.records || []);
