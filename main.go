@@ -886,6 +886,8 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 		values[field.Translated.Name] = field.Translated.Value
 	}
 
+	packetTime := time.Unix(int64(header.UnixSecs), 0).In(location)
+
 	srcIP := firstString(values, "sourceIPv4Address", "sourceIPv6Address")
 	dstIP := firstString(values, "destinationIPv4Address", "destinationIPv6Address")
 	srcPort, okSrcPort := firstUint16(values, "sourceTransportPort")
@@ -898,11 +900,45 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 	flowStart, okFlowStart := resolveFlowStart(values, header, location)
 	flowEnd, okFlowEnd := resolveFlowEnd(values, header, location)
 
-	if srcIP == "" || dstIP == "" || !okSrcPort || !okDstPort || !okProtocol || !okPackets || !okBytes || !okInputIf || !okOutputIf || !okFlowStart || !okFlowEnd {
+	missing := make([]string, 0)
+	if srcIP == "" {
+		missing = append(missing, "src_ip")
+	}
+	if dstIP == "" {
+		missing = append(missing, "dst_ip")
+	}
+	if !okSrcPort {
+		missing = append(missing, "src_port")
+	}
+	if !okDstPort {
+		missing = append(missing, "dst_port")
+	}
+	if !okProtocol {
+		missing = append(missing, "protocol")
+	}
+	if !okPackets {
+		missing = append(missing, "packets")
+	}
+	if !okBytes {
+		missing = append(missing, "bytes")
+	}
+	if len(missing) > 0 {
+		log.Printf("flow record skipped, missing required fields: %s | available=%s", strings.Join(missing, ", "), strings.Join(sortedKeys(values), ", "))
 		return FlowRecord{}, false
 	}
 
-	packetTime := time.Unix(int64(header.UnixSecs), 0).In(location)
+	if !okInputIf {
+		inputIf = 0
+	}
+	if !okOutputIf {
+		outputIf = 0
+	}
+	if !okFlowStart {
+		flowStart = packetTime
+	}
+	if !okFlowEnd {
+		flowEnd = packetTime
+	}
 
 	return FlowRecord{
 		Timestamp: packetTime,
@@ -918,6 +954,15 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 		FlowStart: flowStart,
 		FlowEnd:   flowEnd,
 	}, true
+}
+
+func sortedKeys(values map[string]interface{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func firstString(values map[string]interface{}, keys ...string) string {
