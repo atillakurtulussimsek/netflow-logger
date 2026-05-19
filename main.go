@@ -55,6 +55,7 @@ type Config struct {
 	TSAURL           string
 	LogRoot          string
 	Location         *time.Location
+	DebugFlowMapping bool
 }
 
 type App struct {
@@ -206,6 +207,7 @@ func loadConfig(envPath string) (Config, error) {
 		TSAURL:           firstNonEmpty(env["TSA_URL"], defaultTSAURL),
 		LogRoot:          firstNonEmpty(env["LOG_ROOT"], defaultLogRoot),
 		Location:         location,
+		DebugFlowMapping: strings.EqualFold(strings.TrimSpace(env["DEBUG_FLOW_MAPPING"]), "true"),
 	}
 
 	if cfg.DashboardUser == "" || cfg.DashboardPass == "" {
@@ -741,7 +743,7 @@ func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
 		return fmt.Errorf("netflow decode failed: %w (len=%d version=%d count=%d)", err, len(packetBytes), packetVersion(packetBytes), packetCount(packetBytes))
 	}
 
-	records := extractFlowRecords(packet, a.cfg.Location)
+	records := extractFlowRecords(packet, a.cfg.Location, a.cfg.DebugFlowMapping)
 	if len(records) == 0 {
 		log.Printf("no eligible flow records in packet from %s", addr.String())
 		return nil
@@ -864,11 +866,11 @@ func packetCount(packetBytes []byte) uint16 {
 	return binary.BigEndian.Uint16(packetBytes[2:4])
 }
 
-func extractFlowRecords(packet *netflow9.Packet, location *time.Location) []FlowRecord {
+func extractFlowRecords(packet *netflow9.Packet, location *time.Location, debugFlowMapping bool) []FlowRecord {
 	result := make([]FlowRecord, 0)
 	for _, flowSet := range packet.DataFlowSets {
 		for _, dataRecord := range flowSet.Records {
-			record, ok := mapFlowRecord(packet.Header, dataRecord, location)
+			record, ok := mapFlowRecord(packet.Header, dataRecord, location, debugFlowMapping)
 			if ok {
 				result = append(result, record)
 			}
@@ -877,7 +879,7 @@ func extractFlowRecords(packet *netflow9.Packet, location *time.Location) []Flow
 	return result
 }
 
-func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord, location *time.Location) (FlowRecord, bool) {
+func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord, location *time.Location, debugFlowMapping bool) (FlowRecord, bool) {
 	values := make(map[string]interface{})
 	for _, field := range dataRecord.Fields {
 		if field.Translated == nil || field.Translated.Name == "" {
@@ -919,7 +921,11 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 		missing = append(missing, "bytes")
 	}
 	if len(missing) > 0 {
-		log.Printf("flow record skipped, missing required fields: %s | available=%s", strings.Join(missing, ", "), strings.Join(sortedKeys(values), ", "))
+		if debugFlowMapping {
+			log.Printf("flow record skipped, missing required fields: %s | available=%s | values=%s", strings.Join(missing, ", "), strings.Join(sortedKeys(values), ", "), formatFieldMap(values))
+		} else {
+			log.Printf("flow record skipped, missing required fields: %s | available=%s", strings.Join(missing, ", "), strings.Join(sortedKeys(values), ", "))
+		}
 		return FlowRecord{}, false
 	}
 
@@ -963,6 +969,15 @@ func sortedKeys(values map[string]interface{}) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func formatFieldMap(values map[string]interface{}) string {
+	keys := sortedKeys(values)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+fmt.Sprint(values[key]))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func firstString(values map[string]interface{}, keys ...string) string {
