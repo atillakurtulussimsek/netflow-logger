@@ -893,7 +893,6 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 	srcPort, okSrcPort := firstUint16(values, "sourceTransportPort")
 	dstPort, okDstPort := firstUint16(values, "destinationTransportPort")
 	protocolNumber, okProtocol := firstUint8(values, "protocolIdentifier")
-	packets, okPackets := firstUint64(values, "packetDeltaCount", "postPacketDeltaCount")
 	bytesCount, okBytes := firstUint64(values, "octetDeltaCount", "postOctetDeltaCount")
 	inputIf, okInputIf := firstUint32(values, "ingressInterface")
 	outputIf, okOutputIf := firstUint32(values, "egressInterface")
@@ -916,9 +915,6 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 	if !okProtocol {
 		missing = append(missing, "protocol")
 	}
-	if !okPackets {
-		missing = append(missing, "packets")
-	}
 	if !okBytes {
 		missing = append(missing, "bytes")
 	}
@@ -927,6 +923,10 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 		return FlowRecord{}, false
 	}
 
+	packets, okPackets := firstUint64(values, "packetDeltaCount", "postPacketDeltaCount")
+	if !okPackets {
+		packets = 0
+	}
 	if !okInputIf {
 		inputIf = 0
 	}
