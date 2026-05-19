@@ -109,6 +109,9 @@ type DashboardState struct {
 	SelectedDate   string   `json:"selected_date"`
 	SelectedHour   string   `json:"selected_hour"`
 	Limit          int      `json:"limit"`
+	Page           int      `json:"page"`
+	TotalRecords   int      `json:"total_records"`
+	TotalPages     int      `json:"total_pages"`
 	AvailableDates []string `json:"available_dates"`
 	AvailableHours []string `json:"available_hours"`
 	ActiveFile     string   `json:"active_file,omitempty"`
@@ -300,13 +303,17 @@ func (h *DashboardHub) Snapshot() DashboardState {
 }
 
 func (h *DashboardHub) snapshotLocked() DashboardState {
+	records := append([]string(nil), h.records...)
 	state := DashboardState{
 		Mode:          "live",
-		Records:       append([]string(nil), h.records...),
+		Records:       records,
 		ActiveFile:    h.activeFile,
 		LastSHA256:    h.lastSHA256,
 		LastTSAStatus: h.lastTSAStatus,
-		Limit:         len(h.records),
+		Limit:         len(records),
+		Page:          1,
+		TotalRecords:  len(records),
+		TotalPages:    1,
 	}
 	if !h.updatedAt.IsZero() {
 		state.UpdatedAt = h.updatedAt.Format(time.RFC3339)
@@ -451,9 +458,10 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	selectedDate := strings.TrimSpace(r.URL.Query().Get("date"))
 	selectedHour := strings.TrimSpace(r.URL.Query().Get("hour"))
 	limit := normalizeDashboardLimit(r.URL.Query().Get("limit"))
+	page := normalizeDashboardPage(r.URL.Query().Get("page"))
 
 	if selectedDate != "" && selectedHour != "" {
-		state, err := buildHistoricalDashboardState(a.cfg.LogRoot, selectedDate, selectedHour, limit)
+		state, err := buildHistoricalDashboardState(a.cfg.LogRoot, selectedDate, selectedHour, limit, page)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -466,6 +474,9 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 
 	state := a.dashboard.Snapshot()
 	state.Limit = limit
+	state.Page = page
+	state.TotalRecords = len(state.Records)
+	state.TotalPages = totalPages(len(state.Records), limit)
 	state.AvailableDates = availableLogDates(a.cfg.LogRoot)
 	if selectedDate != "" {
 		availableHours, err := availableLogHours(a.cfg.LogRoot, selectedDate)
@@ -474,6 +485,7 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 			state.AvailableHours = availableHours
 		}
 	}
+	state.Records = paginateLiveRecords(state.Records, page, limit)
 	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -533,13 +545,73 @@ func normalizeDashboardLimit(raw string) int {
 	}
 }
 
-func buildHistoricalDashboardState(logRoot string, selectedDate string, selectedHour string, limit int) (DashboardState, error) {
+func normalizeDashboardPage(raw string) int {
+	if raw == "" {
+		return 1
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return 1
+	}
+	return value
+}
+
+func totalPages(total int, limit int) int {
+	if limit <= 0 {
+		return 1
+	}
+	pages := (total + limit - 1) / limit
+	if pages < 1 {
+		return 1
+	}
+	return pages
+}
+
+func paginateRecords(records []string, page int, limit int) []string {
+	if limit <= 0 {
+		return records
+	}
+	if page < 1 {
+		page = 1
+	}
+	start := (page - 1) * limit
+	if start >= len(records) {
+		return []string{}
+	}
+	end := start + limit
+	if end > len(records) {
+		end = len(records)
+	}
+	return records[start:end]
+}
+
+func paginateLiveRecords(records []string, page int, limit int) []string {
+	if limit <= 0 {
+		return records
+	}
+	if page < 1 {
+		page = 1
+	}
+
+	total := len(records)
+	end := total - ((page - 1) * limit)
+	if end <= 0 {
+		return []string{}
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	return records[start:end]
+}
+
+func buildHistoricalDashboardState(logRoot string, selectedDate string, selectedHour string, limit int, page int) (DashboardState, error) {
 	availableDates := availableLogDates(logRoot)
 	availableHours, err := availableLogHours(logRoot, selectedDate)
 	if err != nil {
 		return DashboardState{}, err
 	}
-	records, updatedAt, err := readHistoricalLogRecords(logRoot, selectedDate, selectedHour, limit)
+	records, updatedAt, total, err := readHistoricalLogRecords(logRoot, selectedDate, selectedHour, limit, page)
 	if err != nil {
 		return DashboardState{}, err
 	}
@@ -550,6 +622,9 @@ func buildHistoricalDashboardState(logRoot string, selectedDate string, selected
 		SelectedDate:   selectedDate,
 		SelectedHour:   selectedHour,
 		Limit:          limit,
+		Page:           page,
+		TotalRecords:   total,
+		TotalPages:     totalPages(total, limit),
 		AvailableDates: availableDates,
 		AvailableHours: availableHours,
 	}
@@ -622,44 +697,42 @@ func availableLogHours(logRoot string, selectedDate string) ([]string, error) {
 	return hours, nil
 }
 
-func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour string, limit int) ([]string, time.Time, error) {
+func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour string, limit int, page int) ([]string, time.Time, int, error) {
 	parts := strings.Split(selectedDate, "-")
 	if len(parts) != 3 {
-		return nil, time.Time{}, fmt.Errorf("invalid date format: %s", selectedDate)
+		return nil, time.Time{}, 0, fmt.Errorf("invalid date format: %s", selectedDate)
 	}
 	if len(selectedHour) != 2 {
-		return nil, time.Time{}, fmt.Errorf("invalid hour format: %s", selectedHour)
+		return nil, time.Time{}, 0, fmt.Errorf("invalid hour format: %s", selectedHour)
 	}
 
 	logPath := filepath.Join(logRoot, parts[0], parts[1], parts[2], selectedHour+".log")
 	file, err := os.Open(logPath)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("open selected log file failed: %w", err)
+		return nil, time.Time{}, 0, fmt.Errorf("open selected log file failed: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("stat selected log file failed: %w", err)
+		return nil, time.Time{}, 0, fmt.Errorf("stat selected log file failed: %w", err)
 	}
 
-	records := make([]string, 0, limit)
+	allRecords := make([]string, 0)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		if len(records) >= limit {
-			break
-		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		records = append(records, line)
+		allRecords = append(allRecords, line)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, time.Time{}, fmt.Errorf("read selected log file failed: %w", err)
+		return nil, time.Time{}, 0, fmt.Errorf("read selected log file failed: %w", err)
 	}
 
-	return records, info.ModTime(), nil
+	paged := paginateRecords(allRecords, page, limit)
+	return paged, info.ModTime(), len(allRecords), nil
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
@@ -1636,6 +1709,10 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="status-label">Görüntü modu</div>
           <div class="status-value"><button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button></div>
         </div>
+        <div class="status-card">
+          <div class="status-label">Son güncelleme</div>
+          <div class="status-value" id="updated-at">-</div>
+        </div>
       </div>
     </section>
 
@@ -1667,6 +1744,14 @@ const dashboardHTML = `<!DOCTYPE html>
               <option value="500">500</option>
             </select>
           </div>
+          <div class="field">
+            <label>Sayfa</label>
+            <div class="pager">
+              <button type="button" class="mode-button" id="prev-page">Önceki</button>
+              <span class="pager-info" id="page-info">1 / 1</span>
+              <button type="button" class="mode-button" id="next-page">Sonraki</button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="table-wrap">
@@ -1697,9 +1782,13 @@ const dashboardHTML = `<!DOCTYPE html>
     const limitSelectEl = document.getElementById('limit-select');
     const liveToggleEl = document.getElementById('live-toggle');
     const tableSubtitleEl = document.getElementById('table-subtitle');
+    const prevPageEl = document.getElementById('prev-page');
+    const nextPageEl = document.getElementById('next-page');
+    const pageInfoEl = document.getElementById('page-info');
 
     let eventSource = null;
     let currentMode = 'live';
+    let currentPage = 1;
 
     function formatTime(value) {
       if (!value) return '-';
@@ -1828,10 +1917,14 @@ const dashboardHTML = `<!DOCTYPE html>
         return;
       }
       applyMode(state.mode || 'live');
+      currentPage = state.page || 1;
       renderDateOptions(state.available_dates || [], state.selected_date || '');
       renderHourOptions(state.available_hours || [], state.selected_hour || '');
       limitSelectEl.value = String(state.limit || 50);
       updatedAtEl.textContent = formatTime(state.updated_at || '');
+      pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
+      prevPageEl.disabled = (state.page || 1) <= 1;
+      nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
       renderRows(state.records || []);
     }
 
@@ -1865,6 +1958,7 @@ const dashboardHTML = `<!DOCTYPE html>
         params.set('hour', hourSelectEl.value);
       }
       params.set('limit', limitSelectEl.value || '50');
+      params.set('page', String(currentPage || 1));
 
       const query = params.toString();
       const response = await fetch('/api/state' + (query ? ('?' + query) : ''), { cache: 'no-store' });
@@ -1880,6 +1974,21 @@ const dashboardHTML = `<!DOCTYPE html>
       stopLiveStream();
       setConnectionState('Geçmiş görünüm', null);
       await fetchState();
+    }
+
+    async function changePage(page) {
+      currentPage = page;
+      if (currentMode === 'historical') {
+        await refreshHistorical();
+        return;
+      }
+      await fetchState();
+      if (currentPage === 1) {
+        connectEvents();
+      } else {
+        stopLiveStream();
+        setConnectionState('Canlı akış yalnızca 1. sayfada aktif', null);
+      }
     }
 
     function connectEvents() {
@@ -1902,6 +2011,7 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     dateSelectEl.addEventListener('change', async () => {
+      currentPage = 1;
       hourSelectEl.value = '';
       if (!dateSelectEl.value) {
         await fetchState();
@@ -1914,6 +2024,7 @@ const dashboardHTML = `<!DOCTYPE html>
     });
 
     hourSelectEl.addEventListener('change', async () => {
+      currentPage = 1;
       if (!dateSelectEl.value || !hourSelectEl.value) {
         return;
       }
@@ -1921,11 +2032,14 @@ const dashboardHTML = `<!DOCTYPE html>
     });
 
     limitSelectEl.addEventListener('change', async () => {
+      currentPage = 1;
       if (dateSelectEl.value && hourSelectEl.value) {
         await refreshHistorical();
         return;
       }
       if (!dateSelectEl.value && !hourSelectEl.value) {
+        await fetchState();
+        connectEvents();
         return;
       }
       await fetchState();
@@ -1933,11 +2047,23 @@ const dashboardHTML = `<!DOCTYPE html>
 
     liveToggleEl.addEventListener('click', async () => {
       currentMode = 'live';
+      currentPage = 1;
       dateSelectEl.value = '';
       hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
       hourSelectEl.disabled = true;
       await fetchState();
       connectEvents();
+    });
+
+    prevPageEl.addEventListener('click', async () => {
+      if (currentPage <= 1) {
+        return;
+      }
+      await changePage(currentPage - 1);
+    });
+
+    nextPageEl.addEventListener('click', async () => {
+      await changePage(currentPage + 1);
     });
 
     fetchState().then((state) => {
