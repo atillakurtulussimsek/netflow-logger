@@ -1,0 +1,24 @@
+[Unit]
+Description=NetFlow Logger Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=netflow-logger
+Group=netflow-logger
+WorkingDirectory=/srv/netflow-logger
+EnvironmentFile=/srv/netflow-logger/.env
+ExecStart=/srv/netflow-logger/netflow-logger
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/netflow-logger
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
