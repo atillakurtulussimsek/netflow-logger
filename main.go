@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,11 +103,17 @@ type DashboardHub struct {
 }
 
 type DashboardState struct {
-	Records       []string `json:"records"`
-	ActiveFile    string   `json:"active_file"`
-	LastSHA256    string   `json:"last_sha256"`
-	LastTSAStatus string   `json:"last_tsa_status"`
-	UpdatedAt     string   `json:"updated_at"`
+	Mode           string   `json:"mode"`
+	Records        []string `json:"records"`
+	UpdatedAt      string   `json:"updated_at"`
+	SelectedDate   string   `json:"selected_date"`
+	SelectedHour   string   `json:"selected_hour"`
+	Limit          int      `json:"limit"`
+	AvailableDates []string `json:"available_dates"`
+	AvailableHours []string `json:"available_hours"`
+	ActiveFile     string   `json:"active_file,omitempty"`
+	LastSHA256     string   `json:"last_sha256,omitempty"`
+	LastTSAStatus  string   `json:"last_tsa_status,omitempty"`
 }
 
 type tsRequest struct {
@@ -294,10 +301,12 @@ func (h *DashboardHub) Snapshot() DashboardState {
 
 func (h *DashboardHub) snapshotLocked() DashboardState {
 	state := DashboardState{
+		Mode:          "live",
 		Records:       append([]string(nil), h.records...),
 		ActiveFile:    h.activeFile,
 		LastSHA256:    h.lastSHA256,
 		LastTSAStatus: h.lastTSAStatus,
+		Limit:         len(h.records),
 	}
 	if !h.updatedAt.IsZero() {
 		state.UpdatedAt = h.updatedAt.Format(time.RFC3339)
@@ -436,9 +445,36 @@ func (a *App) handleDashboard(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, dashboardHTML)
 }
 
-func (a *App) handleDashboardState(w http.ResponseWriter, _ *http.Request) {
+func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(a.dashboard.Snapshot()); err != nil {
+
+	selectedDate := strings.TrimSpace(r.URL.Query().Get("date"))
+	selectedHour := strings.TrimSpace(r.URL.Query().Get("hour"))
+	limit := normalizeDashboardLimit(r.URL.Query().Get("limit"))
+
+	if selectedDate != "" && selectedHour != "" {
+		state, err := buildHistoricalDashboardState(a.cfg.LogRoot, selectedDate, selectedHour, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := json.NewEncoder(w).Encode(state); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	state := a.dashboard.Snapshot()
+	state.Limit = limit
+	state.AvailableDates = availableLogDates(a.cfg.LogRoot)
+	if selectedDate != "" {
+		availableHours, err := availableLogHours(a.cfg.LogRoot, selectedDate)
+		if err == nil {
+			state.SelectedDate = selectedDate
+			state.AvailableHours = availableHours
+		}
+	}
+	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -479,6 +515,151 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func normalizeDashboardLimit(raw string) int {
+	if raw == "" {
+		return 50
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 50
+	}
+	switch value {
+	case 50, 100, 250, 500:
+		return value
+	default:
+		return 50
+	}
+}
+
+func buildHistoricalDashboardState(logRoot string, selectedDate string, selectedHour string, limit int) (DashboardState, error) {
+	availableDates := availableLogDates(logRoot)
+	availableHours, err := availableLogHours(logRoot, selectedDate)
+	if err != nil {
+		return DashboardState{}, err
+	}
+	records, updatedAt, err := readHistoricalLogRecords(logRoot, selectedDate, selectedHour, limit)
+	if err != nil {
+		return DashboardState{}, err
+	}
+
+	state := DashboardState{
+		Mode:           "historical",
+		Records:        records,
+		SelectedDate:   selectedDate,
+		SelectedHour:   selectedHour,
+		Limit:          limit,
+		AvailableDates: availableDates,
+		AvailableHours: availableHours,
+	}
+	if !updatedAt.IsZero() {
+		state.UpdatedAt = updatedAt.Format(time.RFC3339)
+	}
+	return state, nil
+}
+
+func availableLogDates(logRoot string) []string {
+	dates := make([]string, 0)
+	years, err := os.ReadDir(logRoot)
+	if err != nil {
+		return dates
+	}
+
+	for _, year := range years {
+		if !year.IsDir() {
+			continue
+		}
+		months, err := os.ReadDir(filepath.Join(logRoot, year.Name()))
+		if err != nil {
+			continue
+		}
+		for _, month := range months {
+			if !month.IsDir() {
+				continue
+			}
+			days, err := os.ReadDir(filepath.Join(logRoot, year.Name(), month.Name()))
+			if err != nil {
+				continue
+			}
+			for _, day := range days {
+				if !day.IsDir() {
+					continue
+				}
+				dates = append(dates, year.Name()+"-"+month.Name()+"-"+day.Name())
+			}
+		}
+	}
+
+	sort.Sort(sort.Reverse(sort.StringSlice(dates)))
+	return dates
+}
+
+func availableLogHours(logRoot string, selectedDate string) ([]string, error) {
+	parts := strings.Split(selectedDate, "-")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid date format: %s", selectedDate)
+	}
+
+	dayPath := filepath.Join(logRoot, parts[0], parts[1], parts[2])
+	entries, err := os.ReadDir(dayPath)
+	if err != nil {
+		return nil, fmt.Errorf("read selected date directory failed: %w", err)
+	}
+
+	hours := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".log") || strings.Contains(name, ".log.") {
+			continue
+		}
+		hours = append(hours, strings.TrimSuffix(name, ".log"))
+	}
+	sort.Strings(hours)
+	return hours, nil
+}
+
+func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour string, limit int) ([]string, time.Time, error) {
+	parts := strings.Split(selectedDate, "-")
+	if len(parts) != 3 {
+		return nil, time.Time{}, fmt.Errorf("invalid date format: %s", selectedDate)
+	}
+	if len(selectedHour) != 2 {
+		return nil, time.Time{}, fmt.Errorf("invalid hour format: %s", selectedHour)
+	}
+
+	logPath := filepath.Join(logRoot, parts[0], parts[1], parts[2], selectedHour+".log")
+	file, err := os.Open(logPath)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("open selected log file failed: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("stat selected log file failed: %w", err)
+	}
+
+	records := make([]string, 0, limit)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if len(records) >= limit {
+			break
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		records = append(records, line)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, time.Time{}, fmt.Errorf("read selected log file failed: %w", err)
+	}
+
+	return records, info.ModTime(), nil
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
@@ -1108,13 +1289,13 @@ const dashboardHTML = `<!DOCTYPE html>
       --bg: #0b1220;
       --panel: #111827;
       --panel-2: #0f172a;
-      --panel-3: #162033;
       --border: rgba(148, 163, 184, 0.16);
       --border-soft: rgba(148, 163, 184, 0.10);
       --text: #e5e7eb;
       --muted: #94a3b8;
       --muted-2: #64748b;
       --accent: #60a5fa;
+      --accent-soft: rgba(96,165,250,0.12);
       --accent-2: #22c55e;
       --warn: #f59e0b;
       --danger: #f87171;
@@ -1224,21 +1405,32 @@ const dashboardHTML = `<!DOCTYPE html>
       color: var(--text);
     }
 
-    .status-badge {
+    .status-badge,
+    .mode-button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 34px;
-      padding: 0 12px;
+      min-height: 36px;
+      padding: 0 14px;
       border-radius: 999px;
       background: rgba(148,163,184,0.10);
       border: 1px solid rgba(148,163,184,0.16);
       color: var(--text);
       font-size: 13px;
       font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: 0.2s ease;
     }
 
-    .status-badge.live {
+    .mode-button:hover {
+      border-color: rgba(96,165,250,0.35);
+      background: var(--accent-soft);
+      color: #dbeafe;
+    }
+
+    .status-badge.live,
+    .mode-button.live {
       color: #86efac;
       border-color: rgba(34,197,94,0.24);
       background: rgba(34,197,94,0.10);
@@ -1254,43 +1446,6 @@ const dashboardHTML = `<!DOCTYPE html>
       color: #fca5a5;
       border-color: rgba(248,113,113,0.24);
       background: rgba(248,113,113,0.10);
-    }
-
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 18px;
-    }
-
-    .metric {
-      background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(15,23,42,0.98));
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 22px;
-      min-width: 0;
-    }
-
-    .metric-label {
-      font-size: 12px;
-      color: var(--muted-2);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 12px;
-    }
-
-    .metric-value {
-      font-size: 22px;
-      font-weight: 700;
-      line-height: 1.3;
-      letter-spacing: -0.02em;
-      word-break: break-word;
-    }
-
-    .metric-note {
-      margin-top: 10px;
-      color: var(--muted);
-      font-size: 13px;
     }
 
     .table-card {
@@ -1324,17 +1479,35 @@ const dashboardHTML = `<!DOCTYPE html>
       font-size: 14px;
     }
 
-    .table-chip {
-      display: inline-flex;
+    .toolbar {
+      display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 10px 14px;
-      border-radius: 999px;
-      background: rgba(96,165,250,0.10);
-      border: 1px solid rgba(96,165,250,0.20);
-      color: #bfdbfe;
-      font-size: 13px;
-      font-weight: 600;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      min-width: 140px;
+    }
+
+    .field label {
+      color: var(--muted-2);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .select {
+      min-height: 42px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(15,23,42,0.9);
+      color: var(--text);
+      padding: 0 14px;
+      font-size: 14px;
+      outline: none;
     }
 
     .table-wrap {
@@ -1432,15 +1605,15 @@ const dashboardHTML = `<!DOCTYPE html>
 
     @media (max-width: 1100px) {
       body { padding: 18px; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
     @media (max-width: 720px) {
       body { padding: 12px; }
-      .hero, .metric, .table-card { border-radius: 22px; }
-      .metrics { grid-template-columns: 1fr; }
+      .hero, .table-card { border-radius: 22px; }
       .hero { padding: 22px; }
       .table-card-header { padding: 20px 20px 16px 20px; }
+      .toolbar { width: 100%; }
+      .field { width: 100%; }
     }
   </style>
 </head>
@@ -1449,8 +1622,8 @@ const dashboardHTML = `<!DOCTYPE html>
     <section class="hero">
       <div class="hero-left">
         <div class="eyebrow"><span class="eyebrow-dot"></span> NetFlow izleme paneli</div>
-        <h1>Canlı ağ akış görünürlüğü</h1>
-        <p class="hero-subtitle">OPNsense üzerinden gelen NetFlow v9 kayıtlarını gerçek zamanlı izle, aktif saatlik dosyayı takip et ve zaman damgası akışının durumunu tek ekranda gör.</p>
+        <h1>Akış kayıtlarını canlı ve geçmişte görüntüle</h1>
+        <p class="hero-subtitle">Saatlik log dosyalarını gün ve saat bazında seçebilir, istersen tek tıkla yeniden canlı SSE akışına dönebilirsin.</p>
       </div>
       <div class="hero-right">
         <div class="status-card">
@@ -1458,42 +1631,41 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="status-value"><span class="status-badge" id="connection">Bağlanıyor</span></div>
         </div>
         <div class="status-card">
-          <div class="status-label">Son güncelleme</div>
-          <div class="status-value" id="updated-at">-</div>
+          <div class="status-label">Görüntü modu</div>
+          <div class="status-value"><button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button></div>
         </div>
       </div>
-    </section>
-
-    <section class="metrics">
-      <article class="metric">
-        <div class="metric-label">Aktif log dosyası</div>
-        <div class="metric-value" id="active-file">-</div>
-        <div class="metric-note">Yazım yapılan saatlik dosya</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">Son SHA-256</div>
-        <div class="metric-value mono" id="last-sha">-</div>
-        <div class="metric-note">Mühürlenen son dosyanın özeti</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">TSA durumu</div>
-        <div class="metric-value" id="last-tsa">-</div>
-        <div class="metric-note">FreeTSA işlem sonucu</div>
-      </article>
-      <article class="metric">
-        <div class="metric-label">Bellekteki kayıt</div>
-        <div class="metric-value" id="record-count">0</div>
-        <div class="metric-note">Gösterilen son akış kaydı sayısı</div>
-      </article>
     </section>
 
     <section class="table-card">
       <div class="table-card-header">
         <div>
-          <h2 class="table-title">Son ağ akış kayıtları</h2>
-          <p class="table-subtitle">En yeni 200 kayıt, zaman ve trafik özetiyle birlikte aşağıda listelenir.</p>
+          <h2 class="table-title">Log kayıtları</h2>
+          <p class="table-subtitle" id="table-subtitle">Canlı modda en yeni kayıtlar gösterilir.</p>
         </div>
-        <div class="table-chip">Canlı SSE akışı</div>
+        <div class="toolbar">
+          <div class="field">
+            <label for="date-select">Gün</label>
+            <select id="date-select" class="select">
+              <option value="">Canlı görünüm</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="hour-select">Saat</label>
+            <select id="hour-select" class="select" disabled>
+              <option value="">Saat seç</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="limit-select">Satır sayısı</label>
+            <select id="limit-select" class="select">
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+            </select>
+          </div>
+        </div>
       </div>
       <div class="table-wrap">
         <table>
@@ -1515,13 +1687,17 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 
   <script>
-    const activeFileEl = document.getElementById('active-file');
-    const lastShaEl = document.getElementById('last-sha');
-    const lastTsaEl = document.getElementById('last-tsa');
     const updatedAtEl = document.getElementById('updated-at');
     const recordsEl = document.getElementById('records');
     const connectionEl = document.getElementById('connection');
-    const recordCountEl = document.getElementById('record-count');
+    const dateSelectEl = document.getElementById('date-select');
+    const hourSelectEl = document.getElementById('hour-select');
+    const limitSelectEl = document.getElementById('limit-select');
+    const liveToggleEl = document.getElementById('live-toggle');
+    const tableSubtitleEl = document.getElementById('table-subtitle');
+
+    let eventSource = null;
+    let currentMode = 'live';
 
     function formatTime(value) {
       if (!value) return '-';
@@ -1568,27 +1744,32 @@ const dashboardHTML = `<!DOCTYPE html>
       };
     }
 
+    function buildRowMarkup(record) {
+      const item = parseRecord(record);
+      return [
+        '<tr>',
+        '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
+        '<td class="mono">' + escapeHtml(item.srcIp) + '</td>',
+        '<td class="mono">' + escapeHtml(item.srcPort) + '</td>',
+        '<td class="mono">' + escapeHtml(item.dstIp) + '</td>',
+        '<td class="mono">' + escapeHtml(item.dstPort) + '</td>',
+        '<td><span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span></td>',
+        '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>',
+        '</tr>'
+      ].join('');
+    }
+
     function renderRows(records) {
-      recordsEl.innerHTML = '';
       if (!records.length) {
-        recordsEl.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-title">Henüz kayıt yok</div><div>NetFlow akışı geldiğinde son kayıtlar burada listelenecek.</div></td></tr>';
+        recordsEl.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-title">Kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
         return;
       }
 
-      [...records].reverse().forEach((record) => {
-        const item = parseRecord(record);
-        const row = document.createElement('tr');
-        row.innerHTML = [
-          '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
-          '<td class="mono">' + escapeHtml(item.srcIp) + '</td>',
-          '<td class="mono">' + escapeHtml(item.srcPort) + '</td>',
-          '<td class="mono">' + escapeHtml(item.dstIp) + '</td>',
-          '<td class="mono">' + escapeHtml(item.dstPort) + '</td>',
-          '<td><span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span></td>',
-          '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>'
-        ].join('');
-        recordsEl.appendChild(row);
-      });
+      const rows = new Array(records.length);
+      for (let i = 0; i < records.length; i += 1) {
+        rows[i] = buildRowMarkup(records[i]);
+      }
+      recordsEl.innerHTML = rows.join('');
     }
 
     function setConnectionState(text, mode) {
@@ -1599,30 +1780,112 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
-    function render(state) {
-      activeFileEl.textContent = state.active_file || '-';
-      lastShaEl.textContent = state.last_sha256 || '-';
-      lastTsaEl.textContent = state.last_tsa_status || '-';
-      updatedAtEl.textContent = formatTime(state.updated_at || '');
-      const records = state.records || [];
-      recordCountEl.textContent = String(records.length);
-      renderRows(records);
+    function renderDateOptions(dates, selectedDate) {
+      dateSelectEl.innerHTML = '<option value="">Canlı görünüm</option>';
+      (dates || []).forEach((date) => {
+        const option = document.createElement('option');
+        option.value = date;
+        option.textContent = date;
+        if (date === selectedDate) {
+          option.selected = true;
+        }
+        dateSelectEl.appendChild(option);
+      });
     }
 
-    async function loadInitial() {
-      const response = await fetch('/api/state', { cache: 'no-store' });
+    function renderHourOptions(hours, selectedHour) {
+      hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
+      (hours || []).forEach((hour) => {
+        const option = document.createElement('option');
+        option.value = hour;
+        option.textContent = hour + ':00';
+        if (hour === selectedHour) {
+          option.selected = true;
+        }
+        hourSelectEl.appendChild(option);
+      });
+      hourSelectEl.disabled = !(hours && hours.length);
+    }
+
+    function applyMode(mode) {
+      currentMode = mode;
+      if (mode === 'historical') {
+        liveToggleEl.classList.remove('live');
+        tableSubtitleEl.textContent = 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
+      } else {
+        liveToggleEl.classList.add('live');
+        tableSubtitleEl.textContent = 'Canlı modda en yeni kayıtlar gösterilir.';
+      }
+    }
+
+    let renderFrame = null;
+    let pendingState = null;
+
+    function commitRender(state) {
+      applyMode(state.mode || 'live');
+      renderDateOptions(state.available_dates || [], state.selected_date || '');
+      renderHourOptions(state.available_hours || [], state.selected_hour || '');
+      limitSelectEl.value = String(state.limit || 50);
+      updatedAtEl.textContent = formatTime(state.updated_at || '');
+      renderRows(state.records || []);
+    }
+
+    function render(state) {
+      pendingState = state;
+      if (renderFrame !== null) {
+        return;
+      }
+      renderFrame = requestAnimationFrame(() => {
+        if (pendingState) {
+          commitRender(pendingState);
+        }
+        pendingState = null;
+        renderFrame = null;
+      });
+    }
+
+    function stopLiveStream() {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+    }
+
+    async function fetchState() {
+      const params = new URLSearchParams();
+      if (dateSelectEl.value) {
+        params.set('date', dateSelectEl.value);
+      }
+      if (hourSelectEl.value) {
+        params.set('hour', hourSelectEl.value);
+      }
+      params.set('limit', limitSelectEl.value || '50');
+
+      const query = params.toString();
+      const response = await fetch('/api/state' + (query ? ('?' + query) : ''), { cache: 'no-store' });
       if (!response.ok) {
-        throw new Error('Başlangıç durumu alınamadı');
+        throw new Error('Log durumu alınamadı');
       }
       const state = await response.json();
       render(state);
+      return state;
+    }
+
+    async function refreshHistorical() {
+      stopLiveStream();
+      setConnectionState('Geçmiş görünüm', null);
+      await fetchState();
     }
 
     function connectEvents() {
+      stopLiveStream();
       const es = new EventSource('/events');
+      eventSource = es;
       es.addEventListener('state', (event) => {
         setConnectionState('Canlı', 'live');
         const state = JSON.parse(event.data);
+        state.mode = 'live';
+        state.limit = 50;
         render(state);
       });
       es.onerror = () => {
@@ -1633,10 +1896,50 @@ const dashboardHTML = `<!DOCTYPE html>
       };
     }
 
-    loadInitial().catch((error) => {
-      setConnectionState(error.message, 'error');
-    }).finally(() => {
+    dateSelectEl.addEventListener('change', async () => {
+      hourSelectEl.value = '';
+      if (!dateSelectEl.value) {
+        await fetchState();
+        connectEvents();
+        return;
+      }
+      await fetchState();
+      setConnectionState('Saat seçimi bekleniyor', null);
+      applyMode('historical');
+    });
+
+    hourSelectEl.addEventListener('change', async () => {
+      if (!dateSelectEl.value || !hourSelectEl.value) {
+        return;
+      }
+      await refreshHistorical();
+    });
+
+    limitSelectEl.addEventListener('change', async () => {
+      if (dateSelectEl.value && hourSelectEl.value) {
+        await refreshHistorical();
+        return;
+      }
+      if (!dateSelectEl.value && !hourSelectEl.value) {
+        return;
+      }
+      await fetchState();
+    });
+
+    liveToggleEl.addEventListener('click', async () => {
+      dateSelectEl.value = '';
+      hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
+      hourSelectEl.disabled = true;
+      await fetchState();
       connectEvents();
+    });
+
+    fetchState().then((state) => {
+      if ((state.mode || 'live') === 'live') {
+        connectEvents();
+      }
+    }).catch((error) => {
+      setConnectionState(error.message, 'error');
     });
   </script>
 </body>
