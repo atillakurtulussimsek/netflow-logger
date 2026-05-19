@@ -141,6 +141,11 @@ type encapContentInfo struct {
 	EContent     asn1.RawValue `asn1:"tag:0,explicit,optional"`
 }
 
+type timeStampResp struct {
+	Status         asn1.RawValue
+	TimeStampToken asn1.RawValue `asn1:"optional"`
+}
+
 func main() {
 	cfg, err := loadConfig(defaultEnvPath)
 	if err != nil {
@@ -1024,12 +1029,24 @@ func buildTSQ(digest []byte) ([]byte, error) {
 }
 
 func validateTSR(response []byte, digest []byte) error {
+	if len(response) == 0 {
+		return errors.New("empty tsr response")
+	}
+
+	var tsr timeStampResp
+	if _, err := asn1.Unmarshal(response, &tsr); err != nil {
+		return fmt.Errorf("unmarshal time-stamp response failed: %w", err)
+	}
+	if len(tsr.TimeStampToken.FullBytes) == 0 {
+		return errors.New("tsr does not contain time-stamp token")
+	}
+
 	var outer contentInfo
-	if _, err := asn1.Unmarshal(response, &outer); err != nil {
-		return fmt.Errorf("unmarshal tsr content info failed: %w", err)
+	if _, err := asn1.Unmarshal(tsr.TimeStampToken.FullBytes, &outer); err != nil {
+		return fmt.Errorf("unmarshal tsr token content info failed: %w", err)
 	}
 	if !outer.ContentType.Equal(oidSignedData) {
-		return fmt.Errorf("unexpected tsr content type: %s", outer.ContentType.String())
+		return fmt.Errorf("unexpected tsr token content type: %s", outer.ContentType.String())
 	}
 
 	var signed signedData
