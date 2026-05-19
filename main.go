@@ -477,12 +477,7 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
-	if err := validateNetFlowV9Packet(packetBytes); err != nil {
-		return fmt.Errorf("netflow v9 packet validation failed: %w", err)
-	}
-
-	decoder := netflow9.NewDecoder(nil, a.session)
-	packet, err := decoder.Decode(packetBytes)
+	packet, err := decodeNetFlowV9Packet(packetBytes, a.session)
 	if err != nil {
 		return fmt.Errorf("netflow decode failed: %w (len=%d version=%d count=%d)", err, len(packetBytes), packetVersion(packetBytes), packetCount(packetBytes))
 	}
@@ -502,14 +497,98 @@ func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
 	return nil
 }
 
-func validateNetFlowV9Packet(packetBytes []byte) error {
+func decodeNetFlowV9Packet(packetBytes []byte, sess flowsession.Session) (*netflow9.Packet, error) {
 	if len(packetBytes) < 20 {
-		return fmt.Errorf("packet too short for NetFlow v9 header: %d bytes", len(packetBytes))
+		return nil, fmt.Errorf("packet too short for NetFlow v9 header: %d bytes", len(packetBytes))
 	}
 	if version := packetVersion(packetBytes); version != netflow9.Version {
-		return fmt.Errorf("unexpected netflow version: %d", version)
+		return nil, fmt.Errorf("unexpected netflow version: %d", version)
 	}
-	return nil
+
+	reader := bytes.NewReader(packetBytes)
+	packet := &netflow9.Packet{}
+	if err := packet.Header.Unmarshal(reader); err != nil {
+		return nil, fmt.Errorf("header unmarshal failed: %w", err)
+	}
+
+	translator := netflow9.NewTranslate(sess)
+	for reader.Len() > 0 {
+		if reader.Len() < 4 {
+			break
+		}
+
+		var header netflow9.FlowSetHeader
+		if err := header.Unmarshal(reader); err != nil {
+			return nil, fmt.Errorf("flowset header unmarshal failed: %w", err)
+		}
+		if header.Length < 4 {
+			return nil, fmt.Errorf("invalid flowset length: %d", header.Length)
+		}
+
+		payloadLen := int(header.Length) - header.Len()
+		if payloadLen > reader.Len() {
+			return nil, fmt.Errorf("short flowset payload: need=%d remaining=%d id=%d", payloadLen, reader.Len(), header.ID)
+		}
+
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return nil, fmt.Errorf("flowset payload read failed: %w", err)
+		}
+
+		switch header.ID {
+		case 0:
+			flowSet := netflow9.TemplateFlowSet{Header: header}
+			if err := flowSet.UnmarshalRecords(bytes.NewReader(payload)); err != nil {
+				return nil, fmt.Errorf("template flowset unmarshal failed: %w", err)
+			}
+			if sess != nil {
+				for i := range flowSet.Records {
+					record := flowSet.Records[i]
+					sess.AddTemplate(&record)
+				}
+			}
+			packet.TemplateFlowSets = append(packet.TemplateFlowSets, flowSet)
+		case 1:
+			flowSet := netflow9.OptionsTemplateFlowSet{Header: header}
+			if err := flowSet.UnmarshalRecords(bytes.NewReader(payload)); err != nil {
+				return nil, fmt.Errorf("options template flowset unmarshal failed: %w", err)
+			}
+			if sess != nil {
+				for i := range flowSet.Records {
+					record := flowSet.Records[i]
+					sess.AddTemplate(&record)
+				}
+			}
+			packet.OptionsTemplateFlowSets = append(packet.OptionsTemplateFlowSets, flowSet)
+		default:
+			flowSet := netflow9.DataFlowSet{Header: header}
+			if sess == nil {
+				flowSet.Bytes = payload
+				packet.DataFlowSets = append(packet.DataFlowSets, flowSet)
+				continue
+			}
+
+			template, ok := sess.GetTemplate(header.ID)
+			if !ok {
+				flowSet.Bytes = payload
+				packet.DataFlowSets = append(packet.DataFlowSets, flowSet)
+				continue
+			}
+
+			if err := flowSet.Unmarshal(bytes.NewReader(payload), template, translator); err != nil {
+				return nil, fmt.Errorf("data flowset unmarshal failed for template=%d: %w", header.ID, err)
+			}
+
+			switch template.(type) {
+			case *netflow9.OptionTemplateRecord:
+				packet.OptionsDataFlowSets = append(packet.OptionsDataFlowSets, flowSet)
+			default:
+				packet.DataFlowSets = append(packet.DataFlowSets, flowSet)
+			}
+		}
+	}
+
+	return packet, nil
 }
 
 func packetVersion(packetBytes []byte) uint16 {
