@@ -1824,6 +1824,9 @@ const dashboardHTML = `<!DOCTYPE html>
     let pendingState = null;
 
     function commitRender(state) {
+      if ((state.mode || 'live') === 'live' && currentMode === 'historical') {
+        return;
+      }
       applyMode(state.mode || 'live');
       renderDateOptions(state.available_dates || [], state.selected_date || '');
       renderHourOptions(state.available_hours || [], state.selected_hour || '');
@@ -1929,6 +1932,7 @@ const dashboardHTML = `<!DOCTYPE html>
     });
 
     liveToggleEl.addEventListener('click', async () => {
+      currentMode = 'live';
       dateSelectEl.value = '';
       hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
       hourSelectEl.disabled = true;
