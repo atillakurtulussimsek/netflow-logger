@@ -1820,8 +1820,6 @@ const dashboardHTML = `<!DOCTYPE html>
     let livePollTimer = null;
     let currentMode = 'live';
     let currentPage = 1;
-    const totalRecordsEl = document.getElementById('total-records');
-    const pageSummaryEl = document.getElementById('page-summary');
 
     function formatTime(value) {
       if (!value) return '-';
