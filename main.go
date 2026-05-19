@@ -38,7 +38,7 @@ const (
 	defaultTimezoneName     = "Europe/Istanbul"
 	defaultEnvPath          = ".env"
 	maxPacketSize           = 65535
-	dashboardMaxRecords     = 200
+	dashboardMaxRecords     = 1000
 )
 
 var (
@@ -1583,6 +1583,26 @@ const dashboardHTML = `<!DOCTYPE html>
       vertical-align: middle;
     }
 
+    .cell-ip-src {
+      color: #7dd3fc;
+      font-weight: 600;
+    }
+
+    .cell-ip-dst {
+      color: #93c5fd;
+      font-weight: 600;
+    }
+
+    .cell-port-src {
+      color: #fbbf24;
+      font-weight: 700;
+    }
+
+    .cell-port-dst {
+      color: #fb7185;
+      font-weight: 700;
+    }
+
     tbody tr:hover td {
       background: rgba(148,163,184,0.04);
     }
@@ -1683,7 +1703,7 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="table-card-header">
         <div>
           <h2 class="table-title">Log kayıtları</h2>
-          <p class="table-subtitle" id="table-subtitle">Canlı modda en yeni kayıtlar gösterilir.</p>
+          <p class="table-subtitle" id="table-subtitle">Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.</p>
         </div>
         <div class="toolbar">
           <div class="field">
@@ -1808,10 +1828,10 @@ const dashboardHTML = `<!DOCTYPE html>
       return [
         '<tr>',
         '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
-        '<td class="mono">' + escapeHtml(item.srcIp) + '</td>',
-        '<td class="mono">' + escapeHtml(item.srcPort) + '</td>',
-        '<td class="mono">' + escapeHtml(item.dstIp) + '</td>',
-        '<td class="mono">' + escapeHtml(item.dstPort) + '</td>',
+        '<td class="mono cell-ip-src">' + escapeHtml(item.srcIp) + '</td>',
+        '<td class="mono cell-port-src">' + escapeHtml(item.srcPort) + '</td>',
+        '<td class="mono cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>',
+        '<td class="mono cell-port-dst">' + escapeHtml(item.dstPort) + '</td>',
         '<td><span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span></td>',
         '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>',
         '</tr>'
@@ -1873,7 +1893,7 @@ const dashboardHTML = `<!DOCTYPE html>
         tableSubtitleEl.textContent = 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
       } else {
         liveToggleEl.classList.add('live');
-        tableSubtitleEl.textContent = 'Canlı modda en yeni kayıtlar gösterilir.';
+        tableSubtitleEl.textContent = 'Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.';
       }
     }
 
