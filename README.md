@@ -75,12 +75,14 @@ Uygulama varsayılan olarak UDP `9995` portunu ve HTTP `8080` portunu kullanır.
 Ubuntu üzerinde otomatik kurulum için [`install.sh`](install.sh) scripti eklendi. Bu script aşağıdaki akışı yürütür:
 
 - temel paketleri kurar
-- Go yüklü değilse otomatik kurar
+- Go yüklü değilse önce `apt` ile kurmayı dener, olmazsa `go.dev` üzerinden güncel stable sürümü dinamik olarak indirir
 - sistem kullanıcısı ve grubu oluşturur
 - projeyi GitHub deposundan [`/srv/netflow-logger`](install.sh:5) altına çeker veya mevcut kurulum varsa GitHub'dan günceller
-- etkileşimli olarak dashboard kullanıcı adı, parola, portlar ve zaman dilimi bilgilerini ister
+- Git güvenlik denetimindeki `dubious ownership` durumuna karşı hedef dizini `safe.directory` olarak ekler
+- etkileşimli olarak dashboard kullanıcı adı, parola, portlar ve zaman dilimi bilgilerini doğrudan terminalden ister
 - mevcut [`.env`](.env) varsa üzerine yazmadan korur; istenirse yeniden oluşturur
-- uygulamayı derler
+- parola girişi ve diğer değerler `/dev/tty` üzerinden alındığı için here-doc veya stdin karışmasından kaynaklı `.env` bozulmalarını önler
+- uygulamayı `-buildvcs=false` ile derler; böylece VCS stamping kaynaklı kurulum hatalarını önler
 - [`deploy/netflow-logger.service`](deploy/netflow-logger.service) içeriğine denk gelen `systemd` servis dosyasını yazar
 - `daemon-reload`, `enable` ve `restart` işlemlerini yapar
 

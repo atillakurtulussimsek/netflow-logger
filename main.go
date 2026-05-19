@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -476,10 +477,14 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
+	if err := validateNetFlowV9Packet(packetBytes); err != nil {
+		return fmt.Errorf("netflow v9 packet validation failed: %w", err)
+	}
+
 	decoder := netflow9.NewDecoder(nil, a.session)
 	packet, err := decoder.Decode(packetBytes)
 	if err != nil {
-		return fmt.Errorf("netflow decode failed: %w", err)
+		return fmt.Errorf("netflow decode failed: %w (len=%d version=%d count=%d)", err, len(packetBytes), packetVersion(packetBytes), packetCount(packetBytes))
 	}
 
 	records := extractFlowRecords(packet, a.cfg.Location)
@@ -495,6 +500,30 @@ func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
 	}
 
 	return nil
+}
+
+func validateNetFlowV9Packet(packetBytes []byte) error {
+	if len(packetBytes) < 20 {
+		return fmt.Errorf("packet too short for NetFlow v9 header: %d bytes", len(packetBytes))
+	}
+	if version := packetVersion(packetBytes); version != netflow9.Version {
+		return fmt.Errorf("unexpected netflow version: %d", version)
+	}
+	return nil
+}
+
+func packetVersion(packetBytes []byte) uint16 {
+	if len(packetBytes) < 2 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(packetBytes[0:2])
+}
+
+func packetCount(packetBytes []byte) uint16 {
+	if len(packetBytes) < 4 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(packetBytes[2:4])
 }
 
 func extractFlowRecords(packet *netflow9.Packet, location *time.Location) []FlowRecord {
@@ -976,256 +1005,417 @@ const dashboardHTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>netio logger — log görüntüleyici</title>
+  <title>netflow logger panel</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #f2f2f3;
-      --window: #1d1d31;
-      --window-top: #171729;
-      --line: rgba(255,255,255,0.06);
-      --line-strong: rgba(255,255,255,0.08);
-      --text-dim: #67677f;
-      --text-soft: #7c7c92;
-      --blue: #45bbff;
-      --orange: #ff9617;
-      --green: #26e57c;
-      --white: #e8ebf4;
+      --bg: #0b1220;
+      --panel: #111827;
+      --panel-2: #0f172a;
+      --panel-3: #162033;
+      --border: rgba(148, 163, 184, 0.16);
+      --border-soft: rgba(148, 163, 184, 0.10);
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --muted-2: #64748b;
+      --accent: #60a5fa;
+      --accent-2: #22c55e;
+      --warn: #f59e0b;
+      --danger: #f87171;
+      --shadow: 0 20px 60px rgba(2, 6, 23, 0.45);
+      --radius: 22px;
     }
 
     * { box-sizing: border-box; }
+
     body {
       margin: 0;
       min-height: 100vh;
-      background: var(--bg);
-      font-family: Menlo, Monaco, Consolas, "SFMono-Regular", monospace;
-      color: var(--white);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 10px 0;
+      background:
+        radial-gradient(circle at top left, rgba(96,165,250,0.16), transparent 28%),
+        radial-gradient(circle at top right, rgba(34,197,94,0.10), transparent 22%),
+        linear-gradient(180deg, #0b1120 0%, #09101b 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 32px;
     }
 
-    .window {
-      width: min(1702px, 100vw);
-      min-height: 548px;
-      background: var(--window);
-      border-radius: 30px;
-      overflow: hidden;
-      box-shadow: 0 18px 48px rgba(11, 11, 20, 0.20);
+    .layout {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 22px;
     }
 
-    .window-top {
-      height: 80px;
-      background: var(--window-top);
+    .hero {
+      background: linear-gradient(180deg, rgba(17,24,39,0.96), rgba(15,23,42,0.96));
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 28px 30px;
       display: flex;
-      align-items: center;
-      gap: 18px;
-      padding: 0 32px;
-      border-bottom: 1px solid var(--line);
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      flex-wrap: wrap;
     }
 
-    .traffic-lights {
-      display: flex;
-      align-items: center;
+    .hero-left {
+      display: grid;
       gap: 12px;
-      flex: 0 0 auto;
     }
 
-    .dot {
-      width: 21px;
-      height: 21px;
-      border-radius: 50%;
-      display: inline-block;
-    }
-
-    .dot.red { background: #ff6057; }
-    .dot.yellow { background: #ffbd44; }
-    .dot.green { background: #28c840; }
-
-    .title {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 18px;
-      color: var(--text-soft);
-      letter-spacing: 0.01em;
-    }
-
-    .top-right {
-      margin-left: auto;
-      display: flex;
+    .eyebrow {
+      display: inline-flex;
       align-items: center;
-      gap: 12px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      gap: 10px;
+      color: var(--muted);
       font-size: 13px;
-      color: var(--text-soft);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--accent), #2563eb);
+      box-shadow: 0 0 18px rgba(96,165,250,0.7);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 42px);
+      line-height: 1.05;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .hero-subtitle {
+      margin: 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.65;
+    }
+
+    .hero-right {
+      display: grid;
+      gap: 12px;
+      min-width: 240px;
+    }
+
+    .status-card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border-soft);
+      border-radius: 18px;
+      padding: 16px 18px;
+    }
+
+    .status-label {
+      color: var(--muted-2);
+      font-size: 12px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .status-value {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      color: var(--text);
     }
 
     .status-badge {
-      padding: 6px 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 0 12px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.05);
-      color: var(--white);
-      font-size: 12px;
+      background: rgba(148,163,184,0.10);
+      border: 1px solid rgba(148,163,184,0.16);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
     }
 
-    .status-badge.live { color: var(--green); }
-    .status-badge.retry { color: var(--orange); }
-    .status-badge.error { color: #ff7b7b; }
+    .status-badge.live {
+      color: #86efac;
+      border-color: rgba(34,197,94,0.24);
+      background: rgba(34,197,94,0.10);
+    }
+
+    .status-badge.retry {
+      color: #fcd34d;
+      border-color: rgba(245,158,11,0.24);
+      background: rgba(245,158,11,0.10);
+    }
+
+    .status-badge.error {
+      color: #fca5a5;
+      border-color: rgba(248,113,113,0.24);
+      background: rgba(248,113,113,0.10);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .metric {
+      background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(15,23,42,0.98));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 22px;
+      min-width: 0;
+    }
+
+    .metric-label {
+      font-size: 12px;
+      color: var(--muted-2);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 12px;
+    }
+
+    .metric-value {
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+      word-break: break-word;
+    }
+
+    .metric-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .table-card {
+      background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(15,23,42,0.98));
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .table-card-header {
+      padding: 24px 28px 18px 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .table-title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .table-subtitle {
+      margin: 6px 0 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .table-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(96,165,250,0.10);
+      border: 1px solid rgba(96,165,250,0.20);
+      color: #bfdbfe;
+      font-size: 13px;
+      font-weight: 600;
+    }
 
     .table-wrap {
-      padding: 34px 44px 28px 44px;
-    }
-
-    .meta-bar {
-      display: grid;
-      grid-template-columns: 1.8fr 1.2fr 1.4fr 0.9fr;
-      gap: 18px;
-      margin-bottom: 26px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 12px;
-      color: var(--text-dim);
-    }
-
-    .meta-item {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .meta-item strong {
-      color: #9494ac;
-      font-weight: 500;
-      margin-right: 8px;
-    }
-
-    .header-row,
-    .table-row {
-      display: grid;
-      grid-template-columns: 120px 2.25fr 120px 2.25fr 120px 120px 1.3fr;
-      column-gap: 26px;
-      align-items: center;
-    }
-
-    .header-row {
-      padding: 10px 2px 18px 2px;
-      border-bottom: 1px solid var(--line-strong);
-      font-size: 17px;
-      line-height: 1;
-    }
-
-    .table {
-      margin-top: 10px;
-      max-height: 340px;
       overflow: auto;
-      padding-right: 6px;
+      padding: 8px 10px 12px 10px;
     }
 
-    .table-row {
-      min-height: 40px;
-      font-size: 18px;
-      color: var(--white);
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      min-width: 980px;
     }
 
-    .col-time,
-    .col-size,
-    .header-time,
-    .header-size {
-      color: var(--text-dim);
+    thead th {
+      text-align: left;
+      padding: 16px 18px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 600;
+      position: sticky;
+      top: 0;
+      background: rgba(15,23,42,0.96);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-soft);
+      z-index: 1;
     }
 
-    .col-src,
-    .col-dst,
-    .header-src,
-    .header-dst {
-      color: var(--blue);
+    tbody td {
+      padding: 16px 18px;
+      border-bottom: 1px solid rgba(148,163,184,0.08);
+      font-size: 14px;
+      color: var(--text);
+      vertical-align: middle;
     }
 
-    .col-sport,
-    .col-dport,
-    .header-sport,
-    .header-dport {
-      color: var(--orange);
+    tbody tr:hover td {
+      background: rgba(148,163,184,0.04);
     }
 
-    .col-proto,
-    .header-proto {
-      color: var(--green);
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .muted-cell { color: var(--muted); }
+
+    .proto {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 56px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      background: rgba(148,163,184,0.10);
+      border: 1px solid rgba(148,163,184,0.16);
+      color: var(--text);
+    }
+
+    .proto.tcp {
+      color: #93c5fd;
+      background: rgba(59,130,246,0.12);
+      border-color: rgba(59,130,246,0.22);
+    }
+
+    .proto.udp {
+      color: #86efac;
+      background: rgba(34,197,94,0.12);
+      border-color: rgba(34,197,94,0.22);
+    }
+
+    .proto.icmp {
+      color: #fcd34d;
+      background: rgba(245,158,11,0.12);
+      border-color: rgba(245,158,11,0.22);
     }
 
     .empty {
-      color: var(--text-dim);
-      padding: 20px 0 6px 0;
-      font-size: 16px;
+      padding: 44px 28px 54px 28px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 15px;
     }
 
-    .table::-webkit-scrollbar {
-      width: 8px;
-      height: 8px;
-    }
-
-    .table::-webkit-scrollbar-thumb {
-      background: rgba(255,255,255,0.10);
-      border-radius: 999px;
-    }
-
-    .table::-webkit-scrollbar-track {
-      background: transparent;
+    .empty-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 8px;
     }
 
     @media (max-width: 1100px) {
-      body { padding: 0; }
-      .window { border-radius: 0; min-height: 100vh; }
-      .table-wrap { padding: 24px; }
-      .meta-bar,
-      .header-row,
-      .table-row {
-        min-width: 980px;
-      }
-      .table-container {
-        overflow-x: auto;
-      }
+      body { padding: 18px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 720px) {
+      body { padding: 12px; }
+      .hero, .metric, .table-card { border-radius: 22px; }
+      .metrics { grid-template-columns: 1fr; }
+      .hero { padding: 22px; }
+      .table-card-header { padding: 20px 20px 16px 20px; }
     }
   </style>
 </head>
 <body>
-  <div class="window">
-    <div class="window-top">
-      <div class="traffic-lights">
-        <span class="dot red"></span>
-        <span class="dot yellow"></span>
-        <span class="dot green"></span>
+  <div class="layout">
+    <section class="hero">
+      <div class="hero-left">
+        <div class="eyebrow"><span class="eyebrow-dot"></span> NetFlow izleme paneli</div>
+        <h1>Canlı ağ akış görünürlüğü</h1>
+        <p class="hero-subtitle">OPNsense üzerinden gelen NetFlow v9 kayıtlarını gerçek zamanlı izle, aktif saatlik dosyayı takip et ve zaman damgası akışının durumunu tek ekranda gör.</p>
       </div>
-      <div class="title">netio logger — log görüntüleyici</div>
-      <div class="top-right">
-        <span id="updated-at">-</span>
-        <span class="status-badge" id="connection">Bağlanıyor</span>
-      </div>
-    </div>
-
-    <div class="table-wrap">
-      <div class="meta-bar">
-        <div class="meta-item"><strong>Aktif dosya:</strong><span id="active-file">-</span></div>
-        <div class="meta-item"><strong>Son SHA-256:</strong><span id="last-sha">-</span></div>
-        <div class="meta-item"><strong>TSA:</strong><span id="last-tsa">-</span></div>
-        <div class="meta-item"><strong>Kayıt:</strong><span id="record-count">0</span></div>
-      </div>
-
-      <div class="table-container">
-        <div class="header-row">
-          <div class="header-time">Zaman</div>
-          <div class="header-src">Kaynak IP</div>
-          <div class="header-sport">Port</div>
-          <div class="header-dst">Hedef IP</div>
-          <div class="header-dport">Port</div>
-          <div class="header-proto">Proto</div>
-          <div class="header-size">Boyut</div>
+      <div class="hero-right">
+        <div class="status-card">
+          <div class="status-label">Bağlantı durumu</div>
+          <div class="status-value"><span class="status-badge" id="connection">Bağlanıyor</span></div>
         </div>
-
-        <div class="table" id="records"></div>
+        <div class="status-card">
+          <div class="status-label">Son güncelleme</div>
+          <div class="status-value" id="updated-at">-</div>
+        </div>
       </div>
-    </div>
+    </section>
+
+    <section class="metrics">
+      <article class="metric">
+        <div class="metric-label">Aktif log dosyası</div>
+        <div class="metric-value" id="active-file">-</div>
+        <div class="metric-note">Yazım yapılan saatlik dosya</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">Son SHA-256</div>
+        <div class="metric-value mono" id="last-sha">-</div>
+        <div class="metric-note">Mühürlenen son dosyanın özeti</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">TSA durumu</div>
+        <div class="metric-value" id="last-tsa">-</div>
+        <div class="metric-note">FreeTSA işlem sonucu</div>
+      </article>
+      <article class="metric">
+        <div class="metric-label">Bellekteki kayıt</div>
+        <div class="metric-value" id="record-count">0</div>
+        <div class="metric-note">Gösterilen son akış kaydı sayısı</div>
+      </article>
+    </section>
+
+    <section class="table-card">
+      <div class="table-card-header">
+        <div>
+          <h2 class="table-title">Son ağ akış kayıtları</h2>
+          <p class="table-subtitle">En yeni 200 kayıt, zaman ve trafik özetiyle birlikte aşağıda listelenir.</p>
+        </div>
+        <div class="table-chip">Canlı SSE akışı</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Zaman</th>
+              <th>Kaynak IP</th>
+              <th>Kaynak Port</th>
+              <th>Hedef IP</th>
+              <th>Hedef Port</th>
+              <th>Protokol</th>
+              <th>Boyut</th>
+            </tr>
+          </thead>
+          <tbody id="records"></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 
   <script>
@@ -1252,22 +1442,32 @@ const dashboardHTML = `<!DOCTYPE html>
     function formatBytes(bytesValue) {
       const bytes = Number(bytesValue);
       if (!Number.isFinite(bytes)) return bytesValue || '-';
-      if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
-      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
       if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
       return bytes + ' B';
     }
 
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
     function parseRecord(record) {
       const parts = String(record || '').split('|');
+      const proto = (parts[5] || '-').toUpperCase();
       return {
-        raw: record,
         time: formatTime(parts[0] || ''),
         srcIp: parts[1] || '-',
         srcPort: parts[3] || '-',
         dstIp: parts[2] || '-',
         dstPort: parts[4] || '-',
-        proto: parts[5] || '-',
+        proto,
+        protoClass: proto.toLowerCase(),
         size: formatBytes(parts[7] || '0')
       };
     }
@@ -1275,25 +1475,21 @@ const dashboardHTML = `<!DOCTYPE html>
     function renderRows(records) {
       recordsEl.innerHTML = '';
       if (!records.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'Henüz kayıt yok';
-        recordsEl.appendChild(empty);
+        recordsEl.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-title">Henüz kayıt yok</div><div>NetFlow akışı geldiğinde son kayıtlar burada listelenecek.</div></td></tr>';
         return;
       }
 
       [...records].reverse().forEach((record) => {
         const item = parseRecord(record);
-        const row = document.createElement('div');
-        row.className = 'table-row';
+        const row = document.createElement('tr');
         row.innerHTML = [
-          '<div class="col-time">' + item.time + '</div>',
-          '<div class="col-src">' + item.srcIp + '</div>',
-          '<div class="col-sport">' + item.srcPort + '</div>',
-          '<div class="col-dst">' + item.dstIp + '</div>',
-          '<div class="col-dport">' + item.dstPort + '</div>',
-          '<div class="col-proto">' + item.proto + '</div>',
-          '<div class="col-size">' + item.size + '</div>'
+          '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
+          '<td class="mono">' + escapeHtml(item.srcIp) + '</td>',
+          '<td class="mono">' + escapeHtml(item.srcPort) + '</td>',
+          '<td class="mono">' + escapeHtml(item.dstIp) + '</td>',
+          '<td class="mono">' + escapeHtml(item.dstPort) + '</td>',
+          '<td><span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span></td>',
+          '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>'
         ].join('');
         recordsEl.appendChild(row);
       });

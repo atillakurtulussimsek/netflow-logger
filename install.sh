@@ -75,6 +75,8 @@ ensure_service_user() {
 }
 
 clone_or_update_repo() {
+  git config --global --add safe.directory "${INSTALL_DIR}" >/dev/null 2>&1 || true
+
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     echo "Mevcut kurulum bulundu, GitHub'dan güncel kod çekiliyor..."
     git -C "${INSTALL_DIR}" fetch --all --tags
@@ -84,13 +86,14 @@ clone_or_update_repo() {
 
   rm -rf "${INSTALL_DIR}"
   git clone "${REPO_URL}" "${INSTALL_DIR}"
+  git config --global --add safe.directory "${INSTALL_DIR}" >/dev/null 2>&1 || true
 }
 
 prompt_value() {
   local prompt_text="$1"
   local default_value="$2"
   local result=""
-  read -r -p "${prompt_text} [${default_value}]: " result
+  read -r -p "${prompt_text} [${default_value}]: " result </dev/tty
   if [[ -z "${result}" ]]; then
     result="${default_value}"
   fi
@@ -101,8 +104,8 @@ prompt_secret() {
   local prompt_text="$1"
   local result=""
   while [[ -z "${result}" ]]; do
-    read -r -s -p "${prompt_text}: " result
-    echo
+    read -r -s -p "${prompt_text}: " result </dev/tty
+    printf '\n' >/dev/tty
   done
   printf '%s' "${result}"
 }
@@ -142,14 +145,26 @@ TSA_URL=${tsa_url}
 TIMEZONE=${timezone}
 EOF
 
+  if grep -qv '=' "${ENV_FILE}"; then
+    echo ".env oluşturulurken geçersiz satır tespit edildi. Lütfen scripti tekrar çalıştırın."
+    exit 1
+  fi
+
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${ENV_FILE}"
   chmod 640 "${ENV_FILE}"
 }
 
 build_binary() {
+  local go_bin
+  go_bin="$(command -v go)"
+  if [[ -z "${go_bin}" ]]; then
+    echo "Go binary bulunamadı, derleme yapılamıyor."
+    exit 1
+  fi
+
   cd "${INSTALL_DIR}"
-  /usr/local/bin/go mod tidy
-  /usr/local/bin/go build -o "${BIN_PATH}" .
+  "${go_bin}" mod tidy
+  "${go_bin}" build -buildvcs=false -o "${BIN_PATH}" .
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${BIN_PATH}"
   chmod 750 "${BIN_PATH}"
 }
