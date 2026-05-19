@@ -405,7 +405,7 @@ func (a *App) Run(ctx context.Context) error {
 		n, addr, err := pc.ReadFrom(buffer)
 		if err != nil {
 			if ctx.Err() != nil {
-				if closeErr := a.logger.CloseCurrent(); closeErr != nil {
+				if closeErr := a.logger.CloseCurrent(false); closeErr != nil {
 					log.Printf("final log close failed: %v", closeErr)
 				}
 				return ctx.Err()
@@ -1055,10 +1055,10 @@ func (h *HourlyLogger) Write(record FlowRecord) error {
 	return nil
 }
 
-func (h *HourlyLogger) CloseCurrent() error {
+func (h *HourlyLogger) CloseCurrent(seal bool) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.closeCurrentLocked()
+	return h.closeCurrentLocked(seal)
 }
 
 func (h *HourlyLogger) rotateLocked(targetHour time.Time) error {
@@ -1068,7 +1068,7 @@ func (h *HourlyLogger) rotateLocked(targetHour time.Time) error {
 	if h.currentHour.Equal(targetHour) {
 		return nil
 	}
-	if err := h.closeCurrentLocked(); err != nil {
+	if err := h.closeCurrentLocked(true); err != nil {
 		return err
 	}
 	return h.openLocked(targetHour)
@@ -1092,7 +1092,7 @@ func (h *HourlyLogger) openLocked(targetHour time.Time) error {
 	return nil
 }
 
-func (h *HourlyLogger) closeCurrentLocked() error {
+func (h *HourlyLogger) closeCurrentLocked(seal bool) error {
 	if h.file == nil {
 		return nil
 	}
@@ -1111,8 +1111,10 @@ func (h *HourlyLogger) closeCurrentLocked() error {
 	if err := currentFile.Close(); err != nil {
 		return fmt.Errorf("close current log failed: %w", err)
 	}
-	if err := h.sealHourlyLog(currentPath); err != nil {
-		return err
+	if seal {
+		if err := h.sealHourlyLog(currentPath); err != nil {
+			return err
+		}
 	}
 
 	return nil
