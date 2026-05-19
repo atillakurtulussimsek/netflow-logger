@@ -10,9 +10,8 @@ LOG_DIR="${INSTALL_DIR}/logs"
 ENV_FILE="${INSTALL_DIR}/.env"
 BIN_PATH="${INSTALL_DIR}/netflow-logger"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-GO_VERSION="1.22.14"
-GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
-GO_URL="https://go.dev/dl/${GO_TARBALL}"
+GO_APT_PACKAGE="golang-go"
+GO_FALLBACK_API="https://go.dev/dl/?mode=json"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Bu kurulum aracı root olarak çalıştırılmalıdır."
@@ -30,7 +29,7 @@ require_command() {
 ensure_base_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y git curl tar ca-certificates
+  apt-get install -y git curl tar ca-certificates python3
 }
 
 ensure_go() {
@@ -38,13 +37,23 @@ ensure_go() {
     return 0
   fi
 
-  echo "Go bulunamadı, ${GO_VERSION} kuruluyor..."
-  local tmp_dir
+  echo "Go bulunamadı, önce apt paketi deneniyor..."
+  apt-get install -y "${GO_APT_PACKAGE}"
+  if command -v go >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Apt paketi ile Go kurulamadı, go.dev üzerinden güncel stable sürüm indiriliyor..."
+  local tmp_dir go_tarball go_url
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "${tmp_dir}"' RETURN
-  curl -fsSL "${GO_URL}" -o "${tmp_dir}/${GO_TARBALL}"
+
+  go_tarball="$(curl -fsSL "${GO_FALLBACK_API}" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(f["filename"] for r in data if r.get("stable") for f in r.get("files", []) if f.get("os")=="linux" and f.get("arch")=="amd64" and f.get("kind")=="archive"))')"
+  go_url="https://go.dev/dl/${go_tarball}"
+
+  curl -fsSL "${go_url}" -o "${tmp_dir}/${go_tarball}"
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf "${tmp_dir}/${GO_TARBALL}"
+  tar -C /usr/local -xzf "${tmp_dir}/${go_tarball}"
   ln -sf /usr/local/go/bin/go /usr/local/bin/go
   ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 }
