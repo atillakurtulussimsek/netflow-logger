@@ -2069,10 +2069,13 @@ const dashboardHTML = `<!DOCTYPE html>
       currentPage = 1;
       hourSelectEl.value = '';
       if (!dateSelectEl.value) {
+        currentMode = 'live';
         await fetchState();
         startLivePolling();
         return;
       }
+      stopLiveStream();
+      currentMode = 'historical';
       await fetchState();
       setConnectionState('Saat seçimi bekleniyor', null);
       applyMode('historical');
