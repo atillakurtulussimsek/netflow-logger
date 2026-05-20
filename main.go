@@ -919,6 +919,9 @@ func mapFlowRecord(header netflow9.PacketHeader, dataRecord netflow9.DataRecord,
 
 	srcIP := firstString(values, "sourceIPv4Address", "sourceIPv6Address")
 	dstIP := firstString(values, "destinationIPv4Address", "destinationIPv6Address")
+	if strings.Contains(srcIP, ":") || strings.Contains(dstIP, ":") {
+		return FlowRecord{}, false
+	}
 	srcPort, okSrcPort := firstUint16(values, "sourceTransportPort")
 	dstPort, okDstPort := firstUint16(values, "destinationTransportPort")
 	protocolNumber, okProtocol := firstUint8(values, "protocolIdentifier")
