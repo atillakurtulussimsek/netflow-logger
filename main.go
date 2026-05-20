@@ -113,6 +113,7 @@ type DashboardState struct {
 	Page           int      `json:"page"`
 	TotalRecords   int      `json:"total_records"`
 	TotalPages     int      `json:"total_pages"`
+	FileSize       string   `json:"file_size"`
 	AvailableDates []string `json:"available_dates"`
 	AvailableHours []string `json:"available_hours"`
 	ActiveFile     string   `json:"active_file,omitempty"`
@@ -488,6 +489,7 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.Records = paginateLiveRecords(state.Records, page, limit)
+	state.FileSize = formatFileSizeByPath(state.ActiveFile)
 	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -613,7 +615,7 @@ func buildHistoricalDashboardState(logRoot string, selectedDate string, selected
 	if err != nil {
 		return DashboardState{}, err
 	}
-	records, updatedAt, total, err := readHistoricalLogRecords(logRoot, selectedDate, selectedHour, limit, page)
+	records, updatedAt, total, fileSize, err := readHistoricalLogRecords(logRoot, selectedDate, selectedHour, limit, page)
 	if err != nil {
 		return DashboardState{}, err
 	}
@@ -627,6 +629,7 @@ func buildHistoricalDashboardState(logRoot string, selectedDate string, selected
 		Page:           page,
 		TotalRecords:   total,
 		TotalPages:     totalPages(total, limit),
+		FileSize:       fileSize,
 		AvailableDates: availableDates,
 		AvailableHours: availableHours,
 	}
@@ -699,25 +702,25 @@ func availableLogHours(logRoot string, selectedDate string) ([]string, error) {
 	return hours, nil
 }
 
-func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour string, limit int, page int) ([]string, time.Time, int, error) {
+func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour string, limit int, page int) ([]string, time.Time, int, string, error) {
 	parts := strings.Split(selectedDate, "-")
 	if len(parts) != 3 {
-		return nil, time.Time{}, 0, fmt.Errorf("invalid date format: %s", selectedDate)
+		return nil, time.Time{}, 0, "", fmt.Errorf("invalid date format: %s", selectedDate)
 	}
 	if len(selectedHour) != 2 {
-		return nil, time.Time{}, 0, fmt.Errorf("invalid hour format: %s", selectedHour)
+		return nil, time.Time{}, 0, "", fmt.Errorf("invalid hour format: %s", selectedHour)
 	}
 
 	logPath := filepath.Join(logRoot, parts[0], parts[1], parts[2], selectedHour+".log")
 	file, err := os.Open(logPath)
 	if err != nil {
-		return nil, time.Time{}, 0, fmt.Errorf("open selected log file failed: %w", err)
+		return nil, time.Time{}, 0, "", fmt.Errorf("open selected log file failed: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, time.Time{}, 0, fmt.Errorf("stat selected log file failed: %w", err)
+		return nil, time.Time{}, 0, "", fmt.Errorf("stat selected log file failed: %w", err)
 	}
 
 	allRecords := make([]string, 0)
@@ -730,11 +733,35 @@ func readHistoricalLogRecords(logRoot string, selectedDate string, selectedHour 
 		allRecords = append(allRecords, line)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, time.Time{}, 0, fmt.Errorf("read selected log file failed: %w", err)
+		return nil, time.Time{}, 0, "", fmt.Errorf("read selected log file failed: %w", err)
 	}
 
 	paged := paginateRecords(allRecords, page, limit)
-	return paged, info.ModTime(), len(allRecords), nil
+	return paged, info.ModTime(), len(allRecords), formatByteSize(info.Size()), nil
+}
+
+func formatFileSizeByPath(path string) string {
+	if path == "" {
+		return "-"
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "-"
+	}
+	return formatByteSize(info.Size())
+}
+
+func formatByteSize(size int64) string {
+	if size >= 1024*1024*1024 {
+		return fmt.Sprintf("%.2f GB", float64(size)/(1024*1024*1024))
+	}
+	if size >= 1024*1024 {
+		return fmt.Sprintf("%.2f MB", float64(size)/(1024*1024))
+	}
+	if size >= 1024 {
+		return fmt.Sprintf("%.1f KB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%d B", size)
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
@@ -1750,8 +1777,8 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="status-value" id="updated-at">-</div>
       </div>
       <div class="status-card">
-        <div class="status-label">Toplam kayıt</div>
-        <div class="status-value" id="total-records">0</div>
+        <div class="status-label">Dosya boyutu</div>
+        <div class="status-value" id="file-size">-</div>
       </div>
       <div class="status-card">
         <div class="status-label">Sayfa</div>
@@ -1828,7 +1855,7 @@ const dashboardHTML = `<!DOCTYPE html>
     const prevPageEl = document.getElementById('prev-page');
     const nextPageEl = document.getElementById('next-page');
     const pageInfoEl = document.getElementById('page-info');
-    const totalRecordsEl = document.getElementById('total-records');
+    const fileSizeEl = document.getElementById('file-size');
     const pageSummaryEl = document.getElementById('page-summary');
 
     let eventSource = null;
@@ -1970,7 +1997,7 @@ const dashboardHTML = `<!DOCTYPE html>
       updatedAtEl.textContent = formatTime(state.updated_at || '');
       pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
       pageSummaryEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
-      totalRecordsEl.textContent = String(state.total_records || 0);
+      fileSizeEl.textContent = state.file_size || '-';
       prevPageEl.disabled = (state.page || 1) <= 1;
       nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
       renderRows(state.records || []);
