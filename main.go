@@ -104,21 +104,24 @@ type DashboardHub struct {
 }
 
 type DashboardState struct {
-	Mode           string   `json:"mode"`
-	Records        []string `json:"records"`
-	UpdatedAt      string   `json:"updated_at"`
-	SelectedDate   string   `json:"selected_date"`
-	SelectedHour   string   `json:"selected_hour"`
-	Limit          int      `json:"limit"`
-	Page           int      `json:"page"`
-	TotalRecords   int      `json:"total_records"`
-	TotalPages     int      `json:"total_pages"`
-	FileSize       string   `json:"file_size"`
-	AvailableDates []string `json:"available_dates"`
-	AvailableHours []string `json:"available_hours"`
-	ActiveFile     string   `json:"active_file,omitempty"`
-	LastSHA256     string   `json:"last_sha256,omitempty"`
-	LastTSAStatus  string   `json:"last_tsa_status,omitempty"`
+	Mode            string   `json:"mode"`
+	Records         []string `json:"records"`
+	UpdatedAt       string   `json:"updated_at"`
+	SelectedDate    string   `json:"selected_date"`
+	SelectedHour    string   `json:"selected_hour"`
+	Limit           int      `json:"limit"`
+	Page            int      `json:"page"`
+	TotalRecords    int      `json:"total_records"`
+	TotalPages      int      `json:"total_pages"`
+	FileSize        string   `json:"file_size"`
+	FileSizeDaily   string   `json:"file_size_daily"`
+	FileSizeMonthly string   `json:"file_size_monthly"`
+	FileSizeTotal   string   `json:"file_size_total"`
+	AvailableDates  []string `json:"available_dates"`
+	AvailableHours  []string `json:"available_hours"`
+	ActiveFile      string   `json:"active_file,omitempty"`
+	LastSHA256      string   `json:"last_sha256,omitempty"`
+	LastTSAStatus   string   `json:"last_tsa_status,omitempty"`
 }
 
 type tsRequest struct {
@@ -490,6 +493,9 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	}
 	state.Records = paginateLiveRecords(state.Records, page, limit)
 	state.FileSize = formatFileSizeByPath(state.ActiveFile)
+	state.FileSizeDaily = calculateLogSizeByDay(a.cfg.LogRoot, selectedDate)
+	state.FileSizeMonthly = calculateLogSizeByMonth(a.cfg.LogRoot, selectedDate)
+	state.FileSizeTotal = calculateTotalLogSize(a.cfg.LogRoot)
 	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -621,17 +627,20 @@ func buildHistoricalDashboardState(logRoot string, selectedDate string, selected
 	}
 
 	state := DashboardState{
-		Mode:           "historical",
-		Records:        records,
-		SelectedDate:   selectedDate,
-		SelectedHour:   selectedHour,
-		Limit:          limit,
-		Page:           page,
-		TotalRecords:   total,
-		TotalPages:     totalPages(total, limit),
-		FileSize:       fileSize,
-		AvailableDates: availableDates,
-		AvailableHours: availableHours,
+		Mode:            "historical",
+		Records:         records,
+		SelectedDate:    selectedDate,
+		SelectedHour:    selectedHour,
+		Limit:           limit,
+		Page:            page,
+		TotalRecords:    total,
+		TotalPages:      totalPages(total, limit),
+		FileSize:        fileSize,
+		FileSizeDaily:   calculateLogSizeByDay(logRoot, selectedDate),
+		FileSizeMonthly: calculateLogSizeByMonth(logRoot, selectedDate),
+		FileSizeTotal:   calculateTotalLogSize(logRoot),
+		AvailableDates:  availableDates,
+		AvailableHours:  availableHours,
 	}
 	if !updatedAt.IsZero() {
 		state.UpdatedAt = updatedAt.Format(time.RFC3339)
@@ -762,6 +771,54 @@ func formatByteSize(size int64) string {
 		return fmt.Sprintf("%.1f KB", float64(size)/1024)
 	}
 	return fmt.Sprintf("%d B", size)
+}
+
+func sumLogFilesRecursive(dir string) (int64, error) {
+	var total int64
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(info.Name(), ".log") {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
+func calculateLogSizeByDay(logRoot string, date string) string {
+	parts := strings.Split(date, "-")
+	if len(parts) != 3 {
+		return "-"
+	}
+	dayPath := filepath.Join(logRoot, parts[0], parts[1], parts[2])
+	total, err := sumLogFilesRecursive(dayPath)
+	if err != nil {
+		return "-"
+	}
+	return formatByteSize(total)
+}
+
+func calculateLogSizeByMonth(logRoot string, date string) string {
+	parts := strings.Split(date, "-")
+	if len(parts) < 2 {
+		return "-"
+	}
+	monthPath := filepath.Join(logRoot, parts[0], parts[1])
+	total, err := sumLogFilesRecursive(monthPath)
+	if err != nil {
+		return "-"
+	}
+	return formatByteSize(total)
+}
+
+func calculateTotalLogSize(logRoot string) string {
+	total, err := sumLogFilesRecursive(logRoot)
+	if err != nil {
+		return "-"
+	}
+	return formatByteSize(total)
 }
 
 func (a *App) handlePacket(packetBytes []byte, addr net.Addr) error {
@@ -1359,7 +1416,7 @@ func buildTSQ(digest []byte) ([]byte, error) {
 		Version: 1,
 		MessageImprint: messageImprint{
 			HashAlgorithm: algorithmIdentifier{
-				Algorithm: oidSHA256,
+				Algorithm:  oidSHA256,
 				Parameters: asn1.RawValue{Class: 0, Tag: 5},
 			},
 			HashedMessage: digest,
@@ -1750,6 +1807,36 @@ const dashboardHTML = `<!DOCTYPE html>
       margin-bottom: 8px;
     }
 
+    .file-sizes-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .file-size-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .file-size-item .size-label {
+      color: var(--muted-2);
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .file-size-item .size-value {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+
+    .file-size-item .size-value.total {
+      color: var(--accent);
+    }
+
     @media (max-width: 1100px) {
       body { padding: 18px; }
     }
@@ -1761,6 +1848,8 @@ const dashboardHTML = `<!DOCTYPE html>
       .table-card-header { padding: 20px 20px 16px 20px; }
       .toolbar { width: 100%; }
       .field { width: 100%; }
+      .hero-stats { grid-template-columns: 1fr 1fr; }
+      .file-sizes-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -1780,8 +1869,27 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="status-value" id="updated-at">-</div>
       </div>
       <div class="status-card">
-        <div class="status-label">Dosya boyutu</div>
-        <div class="status-value" id="file-size">-</div>
+        <div class="status-label">Dosya boyutları</div>
+        <div class="status-value">
+          <div class="file-sizes-grid">
+            <div class="file-size-item">
+              <span class="size-label">Saatlik</span>
+              <span class="size-value" id="file-size-hourly">-</span>
+            </div>
+            <div class="file-size-item">
+              <span class="size-label">Günlük</span>
+              <span class="size-value" id="file-size-daily">-</span>
+            </div>
+            <div class="file-size-item">
+              <span class="size-label">Aylık</span>
+              <span class="size-value" id="file-size-monthly">-</span>
+            </div>
+            <div class="file-size-item">
+              <span class="size-label">Toplam</span>
+              <span class="size-value total" id="file-size-total">-</span>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="status-card">
         <div class="status-label">Sayfa</div>
@@ -1858,7 +1966,10 @@ const dashboardHTML = `<!DOCTYPE html>
     const prevPageEl = document.getElementById('prev-page');
     const nextPageEl = document.getElementById('next-page');
     const pageInfoEl = document.getElementById('page-info');
-    const fileSizeEl = document.getElementById('file-size');
+    const fileSizeHourlyEl = document.getElementById('file-size-hourly');
+    const fileSizeDailyEl = document.getElementById('file-size-daily');
+    const fileSizeMonthlyEl = document.getElementById('file-size-monthly');
+    const fileSizeTotalEl = document.getElementById('file-size-total');
     const pageSummaryEl = document.getElementById('page-summary');
 
     let eventSource = null;
@@ -2000,7 +2111,10 @@ const dashboardHTML = `<!DOCTYPE html>
       updatedAtEl.textContent = formatTime(state.updated_at || '');
       pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
       pageSummaryEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
-      fileSizeEl.textContent = state.file_size || '-';
+      fileSizeHourlyEl.textContent = state.file_size || '-';
+      fileSizeDailyEl.textContent = state.file_size_daily || '-';
+      fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
+      fileSizeTotalEl.textContent = state.file_size_total || '-';
       prevPageEl.disabled = (state.page || 1) <= 1;
       nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
       renderRows(state.records || []);
