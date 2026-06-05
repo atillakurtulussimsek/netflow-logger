@@ -1557,46 +1557,39 @@ const dashboardHTML = `<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 28px;
       box-shadow: var(--shadow);
-      padding: 28px 30px;
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 20px;
-      flex-wrap: wrap;
+      padding: 16px 24px;
     }
 
     .hero-stats {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 16px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
       align-items: stretch;
-    }
-
-    .file-size-card {
-      grid-column: span 2;
     }
 
     .status-card {
       background: rgba(255,255,255,0.03);
       border: 1px solid var(--border-soft);
-      border-radius: 18px;
-      padding: 16px 18px;
+      border-radius: 14px;
+      padding: 10px 14px;
     }
 
     .status-label {
       color: var(--muted-2);
-      font-size: 12px;
-      margin-bottom: 8px;
+      font-size: 10px;
+      margin-bottom: 4px;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.06em;
+      white-space: nowrap;
     }
 
     .status-value {
       display: flex;
       align-items: center;
-      gap: 10px;
-      font-size: 14px;
+      gap: 8px;
+      font-size: 13px;
       color: var(--text);
+      white-space: nowrap;
     }
 
     .status-badge,
@@ -1820,40 +1813,37 @@ const dashboardHTML = `<!DOCTYPE html>
     .file-sizes-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
-      gap: 6px;
+      gap: 3px;
       width: 100%;
+      min-width: 0;
     }
 
     .file-size-item {
       display: flex;
       flex-direction: column;
-      gap: 3px;
-      padding: 8px 10px;
-      border-radius: 12px;
+      gap: 1px;
+      padding: 4px 6px;
+      border-radius: 8px;
       background: rgba(255,255,255,0.02);
       border: 1px solid rgba(148,163,184,0.06);
-      transition: background 0.2s ease, border-color 0.2s ease;
-    }
-
-    .file-size-item:hover {
-      background: rgba(255,255,255,0.04);
-      border-color: rgba(148,163,184,0.12);
+      min-width: 0;
     }
 
     .file-size-item .size-label {
       display: flex;
       align-items: center;
-      gap: 5px;
+      gap: 3px;
       color: var(--muted-2);
-      font-size: 10px;
+      font-size: 8px;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.04em;
       font-weight: 600;
+      white-space: nowrap;
     }
 
     .file-size-item .size-dot {
-      width: 7px;
-      height: 7px;
+      width: 5px;
+      height: 5px;
       border-radius: 50%;
       display: inline-block;
       flex-shrink: 0;
@@ -1865,11 +1855,14 @@ const dashboardHTML = `<!DOCTYPE html>
     .file-size-item .size-dot.total { background: #a78bfa; }
 
     .file-size-item .size-value {
-      font-size: 16px;
-      font-weight: 800;
-      letter-spacing: -0.02em;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
       color: var(--text);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .file-size-item .size-value.hourly { color: #93c5fd; }
@@ -1877,20 +1870,30 @@ const dashboardHTML = `<!DOCTYPE html>
     .file-size-item .size-value.monthly { color: #fde68a; }
     .file-size-item .size-value.total { color: #c4b5fd; }
 
+    .file-size-value-wrap {
+      display: block;
+      width: 100%;
+    }
+
     @media (max-width: 1100px) {
       body { padding: 18px; }
     }
 
-    @media (max-width: 720px) {
+    @media (max-width: 920px) {
       body { padding: 12px; }
       .hero, .table-card { border-radius: 22px; }
       .hero { padding: 22px; }
       .table-card-header { padding: 20px 20px 16px 20px; }
       .toolbar { width: 100%; }
       .field { width: 100%; }
-      .hero-stats { grid-template-columns: 1fr 1fr; }
-      .file-size-card { grid-column: span 2; }
-      .file-sizes-grid { grid-template-columns: 1fr 1fr; }
+      .hero-stats {
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+    }
+
+    @media (max-width: 920px) {
+      .file-sizes-grid { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
@@ -1909,7 +1912,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="status-label">Son güncelleme</div>
         <div class="status-value" id="updated-at">-</div>
       </div>
-      <div class="status-card file-size-card">
+      <div class="status-card">
         <div class="status-label">Dosya boyutları</div>
         <div class="status-value" style="width:100%">
           <div class="file-sizes-grid">
