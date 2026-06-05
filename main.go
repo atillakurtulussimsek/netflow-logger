@@ -493,8 +493,14 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	}
 	state.Records = paginateLiveRecords(state.Records, page, limit)
 	state.FileSize = formatFileSizeByPath(state.ActiveFile)
-	state.FileSizeDaily = calculateLogSizeByDay(a.cfg.LogRoot, selectedDate)
-	state.FileSizeMonthly = calculateLogSizeByMonth(a.cfg.LogRoot, selectedDate)
+
+	// Use today's date for daily/monthly/total when no specific date is selected
+	refDate := selectedDate
+	if refDate == "" {
+		refDate = time.Now().In(a.cfg.Location).Format("2006-01-02")
+	}
+	state.FileSizeDaily = calculateLogSizeByDay(a.cfg.LogRoot, refDate)
+	state.FileSizeMonthly = calculateLogSizeByMonth(a.cfg.LogRoot, refDate)
 	state.FileSizeTotal = calculateTotalLogSize(a.cfg.LogRoot)
 	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1810,32 +1816,62 @@ const dashboardHTML = `<!DOCTYPE html>
     .file-sizes-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
+      gap: 6px;
+      width: 100%;
     }
 
     .file-size-item {
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      gap: 3px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(148,163,184,0.06);
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+
+    .file-size-item:hover {
+      background: rgba(255,255,255,0.04);
+      border-color: rgba(148,163,184,0.12);
     }
 
     .file-size-item .size-label {
+      display: flex;
+      align-items: center;
+      gap: 5px;
       color: var(--muted-2);
-      font-size: 9px;
+      font-size: 10px;
       text-transform: uppercase;
       letter-spacing: 0.06em;
+      font-weight: 600;
     }
+
+    .file-size-item .size-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    .file-size-item .size-dot.hourly { background: #60a5fa; }
+    .file-size-item .size-dot.daily { background: #34d399; }
+    .file-size-item .size-dot.monthly { background: #fbbf24; }
+    .file-size-item .size-dot.total { background: #a78bfa; }
 
     .file-size-item .size-value {
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
       color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
 
-    .file-size-item .size-value.total {
-      color: var(--accent);
-    }
+    .file-size-item .size-value.hourly { color: #93c5fd; }
+    .file-size-item .size-value.daily { color: #86efac; }
+    .file-size-item .size-value.monthly { color: #fde68a; }
+    .file-size-item .size-value.total { color: #c4b5fd; }
 
     @media (max-width: 1100px) {
       body { padding: 18px; }
@@ -1870,22 +1906,22 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
       <div class="status-card">
         <div class="status-label">Dosya boyutları</div>
-        <div class="status-value">
+        <div class="status-value" style="width:100%">
           <div class="file-sizes-grid">
             <div class="file-size-item">
-              <span class="size-label">Saatlik</span>
-              <span class="size-value" id="file-size-hourly">-</span>
+              <span class="size-label"><span class="size-dot hourly"></span>Saatlik</span>
+              <span class="size-value hourly" id="file-size-hourly">-</span>
             </div>
             <div class="file-size-item">
-              <span class="size-label">Günlük</span>
-              <span class="size-value" id="file-size-daily">-</span>
+              <span class="size-label"><span class="size-dot daily"></span>Günlük</span>
+              <span class="size-value daily" id="file-size-daily">-</span>
             </div>
             <div class="file-size-item">
-              <span class="size-label">Aylık</span>
-              <span class="size-value" id="file-size-monthly">-</span>
+              <span class="size-label"><span class="size-dot monthly"></span>Aylık</span>
+              <span class="size-value monthly" id="file-size-monthly">-</span>
             </div>
             <div class="file-size-item">
-              <span class="size-label">Toplam</span>
+              <span class="size-label"><span class="size-dot total"></span>Toplam</span>
               <span class="size-value total" id="file-size-total">-</span>
             </div>
           </div>
