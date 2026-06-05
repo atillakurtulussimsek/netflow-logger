@@ -1567,9 +1567,13 @@ const dashboardHTML = `<!DOCTYPE html>
 
     .hero-stats {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(4, 1fr);
       gap: 16px;
       align-items: stretch;
+    }
+
+    .file-size-card {
+      grid-column: span 2;
     }
 
     .status-card {
@@ -1885,6 +1889,7 @@ const dashboardHTML = `<!DOCTYPE html>
       .toolbar { width: 100%; }
       .field { width: 100%; }
       .hero-stats { grid-template-columns: 1fr 1fr; }
+      .file-size-card { grid-column: span 2; }
       .file-sizes-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
@@ -1904,7 +1909,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="status-label">Son güncelleme</div>
         <div class="status-value" id="updated-at">-</div>
       </div>
-      <div class="status-card">
+      <div class="status-card file-size-card">
         <div class="status-label">Dosya boyutları</div>
         <div class="status-value" style="width:100%">
           <div class="file-sizes-grid">
@@ -1926,10 +1931,6 @@ const dashboardHTML = `<!DOCTYPE html>
             </div>
           </div>
         </div>
-      </div>
-      <div class="status-card">
-        <div class="status-label">Sayfa</div>
-        <div class="status-value" id="page-summary">1 / 1</div>
       </div>
     </section>
 
@@ -2006,7 +2007,6 @@ const dashboardHTML = `<!DOCTYPE html>
     const fileSizeDailyEl = document.getElementById('file-size-daily');
     const fileSizeMonthlyEl = document.getElementById('file-size-monthly');
     const fileSizeTotalEl = document.getElementById('file-size-total');
-    const pageSummaryEl = document.getElementById('page-summary');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -2146,7 +2146,6 @@ const dashboardHTML = `<!DOCTYPE html>
       limitSelectEl.value = String(state.limit || 50);
       updatedAtEl.textContent = formatTime(state.updated_at || '');
       pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
-      pageSummaryEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
       fileSizeHourlyEl.textContent = state.file_size || '-';
       fileSizeDailyEl.textContent = state.file_size_daily || '-';
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
