@@ -2077,6 +2077,24 @@ const dashboardHTML = `<!DOCTYPE html>
       box-shadow: inset 0 0 18px rgba(34,211,238,0.06);
     }
 
+    @keyframes rowEnter {
+      0%   { opacity: 0; }
+      100% { opacity: 1; }
+    }
+
+    @keyframes rowFlash {
+      0%   { background: rgba(34,211,238,0.20); box-shadow: inset 3px 0 0 var(--neon-cyan), inset 0 0 24px rgba(34,211,238,0.18); }
+      100% { background: transparent; box-shadow: inset 3px 0 0 transparent, inset 0 0 24px transparent; }
+    }
+
+    tbody tr.row-enter { animation: rowEnter 0.4s ease-out; }
+    tbody tr.row-enter td { animation: rowFlash 1.4s ease-out; }
+
+    @media (prefers-reduced-motion: reduce) {
+      tbody tr.row-enter,
+      tbody tr.row-enter td { animation: none; }
+    }
+
     .mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
@@ -2394,6 +2412,9 @@ const dashboardHTML = `<!DOCTYPE html>
     let rateEma = 0;
     let currentSha = '';
 
+    let liveRowsInit = false;
+    let lastRowsTotal = null;
+
     const numberFmt = new Intl.NumberFormat('tr-TR');
 
     function formatRate(value) {
@@ -2528,17 +2549,97 @@ const dashboardHTML = `<!DOCTYPE html>
       ].join('');
     }
 
+    const emptyRowsMarkup = '<tr><td colspan="7" class="empty"><div class="empty-title">Kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
+
+    // Statik (geçmiş / canlı olmayan) görünüm: tam yeniden çizim, sunucu sırasıyla.
     function renderRows(records) {
+      liveRowsInit = false;
+      lastRowsTotal = null;
       if (!records.length) {
-        recordsEl.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-title">Kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
+        recordsEl.innerHTML = emptyRowsMarkup;
         return;
       }
-
       const rows = new Array(records.length);
       for (let i = 0; i < records.length; i += 1) {
         rows[i] = buildRowMarkup(records[i]);
       }
       recordsEl.innerHTML = rows.join('');
+    }
+
+    // Giriş animasyonu sınıfını ekler ve bittikten sonra kendi kendine temizler
+    // (sınıfların satırlarda birikmesini önler).
+    function markEntered(rowEls) {
+      for (let i = 0; i < rowEls.length; i += 1) {
+        rowEls[i].classList.add('row-enter');
+      }
+      setTimeout(() => {
+        for (let i = 0; i < rowEls.length; i += 1) {
+          rowEls[i].classList.remove('row-enter');
+        }
+      }, 1500);
+    }
+
+    // Canlı görünüm: en yeni kayıtlar üstte; yalnızca yeni gelenler animasyonla eklenir.
+    function renderLiveRows(state) {
+      const records = state.records || [];
+      const total = Number(state.processed_total);
+      const reversed = records.slice().reverse(); // en yeni en üstte
+
+      if (!reversed.length) {
+        recordsEl.innerHTML = emptyRowsMarkup;
+        liveRowsInit = false;
+        lastRowsTotal = Number.isFinite(total) ? total : null;
+        return;
+      }
+
+      // İki yoklama arasında gelen yeni kayıt sayısı (monoton sayaçtan).
+      let newCount;
+      if (!liveRowsInit || lastRowsTotal === null || !Number.isFinite(total)) {
+        newCount = reversed.length; // ilk yükleme / belirsizlik → tam çizim
+      } else {
+        newCount = total - lastRowsTotal;
+        if (newCount < 0) newCount = reversed.length; // sayaç tutarsızsa tam çizim
+      }
+      if (newCount > reversed.length) newCount = reversed.length;
+
+      // Taşınacak (yeniden kullanılacak) satırlar için DOM'da yeterli satır yoksa
+      // (limit büyümesi, atlanan yoklama vb.) güvenli tarafta kalıp tam yeniden çizeriz.
+      // Fazla satırlar zaten alttan kırpıldığı için yalnızca "yetersizlik" durumu önemlidir.
+      const firstInit = !liveRowsInit;
+      if (newCount !== reversed.length && recordsEl.childElementCount < reversed.length - newCount) {
+        newCount = reversed.length;
+      }
+
+      if (newCount === 0) {
+        // Yeni kayıt yok → DOM'a dokunma (titreme olmaz).
+      } else if (newCount === reversed.length) {
+        const rows = new Array(reversed.length);
+        for (let i = 0; i < reversed.length; i += 1) {
+          rows[i] = buildRowMarkup(reversed[i]);
+        }
+        recordsEl.innerHTML = rows.join('');
+        if (!firstInit) {
+          const animateN = Math.min(recordsEl.childElementCount, 14);
+          markEntered(Array.prototype.slice.call(recordsEl.children, 0, animateN));
+        }
+      } else {
+        // Yalnızca yeni gelenleri en üste ekle, eskileri alttan kırp.
+        let html = '';
+        for (let i = 0; i < newCount; i += 1) {
+          html += buildRowMarkup(reversed[i]);
+        }
+        recordsEl.insertAdjacentHTML('afterbegin', html);
+        const added = Array.prototype.slice.call(recordsEl.children, 0, newCount);
+        while (recordsEl.childElementCount > reversed.length) {
+          recordsEl.removeChild(recordsEl.lastElementChild);
+        }
+        markEntered(added);
+      }
+
+      liveRowsInit = true;
+      if (Number.isFinite(total)) {
+        lastRowsTotal = total;
+      }
     }
 
     function setConnectionState(text, mode) {
@@ -2583,7 +2684,7 @@ const dashboardHTML = `<!DOCTYPE html>
         tableSubtitleEl.textContent = 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
       } else {
         liveToggleEl.classList.add('live');
-        tableSubtitleEl.textContent = 'Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.';
+        tableSubtitleEl.textContent = 'Canlı modda yeni kayıtlar üste eklenir, eskiler aşağı kayar. En yeni 1000 kayıt sayfalı tutulur.';
       }
     }
 
@@ -2606,14 +2707,19 @@ const dashboardHTML = `<!DOCTYPE html>
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
       updateIntegrity(state);
-      if ((state.mode || 'live') === 'live') {
+      const isLive = (state.mode || 'live') === 'live';
+      if (isLive) {
         updateThroughput(state);
       } else {
         resetThroughput();
       }
       prevPageEl.disabled = (state.page || 1) <= 1;
       nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
-      renderRows(state.records || []);
+      if (isLive && (state.page || 1) === 1) {
+        renderLiveRows(state);
+      } else {
+        renderRows(state.records || []);
+      }
     }
 
     function render(state) {
