@@ -1927,6 +1927,79 @@ const dashboardHTML = `<!DOCTYPE html>
       box-shadow: 0 0 10px rgba(255,93,122,0.45);
     }
 
+    .alert-banner {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 20px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255,176,32,0.12), rgba(255,93,122,0.06));
+      border: 1px solid rgba(255,176,32,0.40);
+      box-shadow: 0 0 22px rgba(255,176,32,0.16), inset 0 0 18px rgba(255,176,32,0.06);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      animation: alertIn 0.32s ease-out;
+    }
+
+    .alert-banner[hidden] { display: none; }
+
+    @keyframes alertIn {
+      0%   { opacity: 0; transform: translateY(-8px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
+
+    .alert-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      flex-shrink: 0;
+      border-radius: 12px;
+      color: var(--neon-amber);
+      background: rgba(255,176,32,0.12);
+      border: 1px solid rgba(255,176,32,0.4);
+      box-shadow: 0 0 16px rgba(255,176,32,0.3);
+    }
+
+    .alert-icon svg { width: 22px; height: 22px; }
+
+    .alert-text { flex: 1; min-width: 0; }
+
+    .alert-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #ffd98a;
+      text-shadow: 0 0 10px rgba(255,176,32,0.4);
+    }
+
+    .alert-detail {
+      margin-top: 2px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    .alert-pulse {
+      width: 12px;
+      height: 12px;
+      flex-shrink: 0;
+      border-radius: 50%;
+      background: var(--neon-amber);
+      box-shadow: 0 0 0 0 rgba(255,176,32,0.55), 0 0 12px rgba(255,176,32,0.85);
+      animation: alertPulse 1.5s ease-out infinite;
+    }
+
+    @keyframes alertPulse {
+      0%   { box-shadow: 0 0 0 0 rgba(255,176,32,0.5), 0 0 12px rgba(255,176,32,0.85); }
+      70%  { box-shadow: 0 0 0 9px rgba(255,176,32,0), 0 0 12px rgba(255,176,32,0.85); }
+      100% { box-shadow: 0 0 0 0 rgba(255,176,32,0), 0 0 12px rgba(255,176,32,0.85); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .alert-banner { animation: none; }
+      .alert-pulse { animation: none; }
+    }
+
     .table-card {
       position: relative;
       background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
@@ -2320,6 +2393,20 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
     </section>
 
+    <div class="alert-banner" id="no-data-alert" role="alert" hidden>
+      <span class="alert-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 9v4"/><path d="M12 17h.01"/>
+          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
+        </svg>
+      </span>
+      <div class="alert-text">
+        <div class="alert-title">Log verisi gelmiyor</div>
+        <div class="alert-detail" id="no-data-detail">Dinlenen porta NetFlow kaydı ulaşmıyor — arka planda kontrol ediliyor…</div>
+      </div>
+      <span class="alert-pulse" aria-hidden="true"></span>
+    </div>
+
     <section class="table-card">
       <div class="table-card-header">
         <div>
@@ -2401,6 +2488,8 @@ const dashboardHTML = `<!DOCTYPE html>
     const sealShaEl = document.getElementById('seal-sha');
     const sealDetailEl = document.getElementById('seal-detail');
     const copyShaEl = document.getElementById('copy-sha');
+    const noDataEl = document.getElementById('no-data-alert');
+    const noDataDetailEl = document.getElementById('no-data-detail');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -2414,6 +2503,11 @@ const dashboardHTML = `<!DOCTYPE html>
 
     let liveRowsInit = false;
     let lastRowsTotal = null;
+
+    // "Log gelmiyor" tespiti: processed_total bu süre boyunca artmazsa uyarı gösterilir.
+    const IDLE_THRESHOLD_MS = 15000;
+    let lastDataValue = null;
+    let lastDataAt = performance.now();
 
     const numberFmt = new Intl.NumberFormat('tr-TR');
 
@@ -2455,6 +2549,56 @@ const dashboardHTML = `<!DOCTYPE html>
       rateEma = 0;
       rateDotEl.classList.remove('active');
       throughputRateEl.textContent = '—';
+    }
+
+    // Canlı durum her geldiğinde toplam kayıt sayısını izler; arttıysa "veri akıyor"
+    // zaman damgasını günceller (uyarıyı tetikleyen boşta kalma süresini sıfırlar).
+    function noteDataActivity(state) {
+      const total = Number(state.processed_total);
+      if (!Number.isFinite(total)) {
+        return;
+      }
+      if (lastDataValue === null || total > lastDataValue) {
+        lastDataAt = performance.now();
+      }
+      lastDataValue = total;
+    }
+
+    // Canlı izlemeyi sıfırla: yeni başlatıldığında bir tolerans süresi tanı
+    // (hemen uyarı çıkmasın).
+    function resetDataFlowWatch() {
+      lastDataValue = null;
+      lastDataAt = performance.now();
+      hideNoDataAlert();
+    }
+
+    function showNoDataAlert(idleMs) {
+      const secs = Math.max(0, Math.round(idleMs / 1000));
+      noDataDetailEl.textContent =
+        'Dinlenen porta ' + secs + ' sn’dir NetFlow kaydı ulaşmıyor — arka planda kontrol ediliyor…';
+      if (noDataEl.hidden) {
+        noDataEl.hidden = false;
+      }
+    }
+
+    function hideNoDataAlert() {
+      if (!noDataEl.hidden) {
+        noDataEl.hidden = true;
+      }
+    }
+
+    // Arka planda sürekli çalışır: yalnızca canlı + 1. sayfada anlamlıdır.
+    function evaluateDataFlow() {
+      if (currentMode !== 'live' || currentPage !== 1) {
+        hideNoDataAlert();
+        return;
+      }
+      const idle = performance.now() - lastDataAt;
+      if (idle > IDLE_THRESHOLD_MS) {
+        showNoDataAlert(idle);
+      } else {
+        hideNoDataAlert();
+      }
     }
 
     function updateIntegrity(state) {
@@ -2710,6 +2854,7 @@ const dashboardHTML = `<!DOCTYPE html>
       const isLive = (state.mode || 'live') === 'live';
       if (isLive) {
         updateThroughput(state);
+        noteDataActivity(state);
       } else {
         resetThroughput();
       }
@@ -2720,6 +2865,7 @@ const dashboardHTML = `<!DOCTYPE html>
       } else {
         renderRows(state.records || []);
       }
+      evaluateDataFlow();
     }
 
     function render(state) {
