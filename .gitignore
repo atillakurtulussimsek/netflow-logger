@@ -1,0 +1,10 @@
+# Ortam dosyası (parola içerir)
+.env
+
+# Derlenmiş binary
+/netflow-logger
+
+# Üretilen loglar ve mühür artefaktları
+/logs/
+*.tsr
+*.sha256

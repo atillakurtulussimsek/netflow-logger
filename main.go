@@ -89,18 +89,20 @@ type HourlyLogger struct {
 	currentHour time.Time
 	currentPath string
 	file        *os.File
+	sealWG      sync.WaitGroup
 }
 
 type DashboardHub struct {
 	maxRecords int
 
-	mu            sync.RWMutex
-	records       []string
-	activeFile    string
-	lastSHA256    string
-	lastTSAStatus string
-	updatedAt     time.Time
-	clients       map[chan []byte]struct{}
+	mu             sync.RWMutex
+	records        []string
+	processedTotal uint64
+	activeFile     string
+	lastSHA256     string
+	lastTSAStatus  string
+	updatedAt      time.Time
+	clients        map[chan []byte]struct{}
 }
 
 type DashboardState struct {
@@ -122,6 +124,7 @@ type DashboardState struct {
 	ActiveFile      string   `json:"active_file,omitempty"`
 	LastSHA256      string   `json:"last_sha256,omitempty"`
 	LastTSAStatus   string   `json:"last_tsa_status,omitempty"`
+	ProcessedTotal  uint64   `json:"processed_total"`
 }
 
 type tsRequest struct {
@@ -277,6 +280,7 @@ func (h *DashboardHub) AddRecord(record string) {
 	if len(h.records) > h.maxRecords {
 		h.records = append([]string(nil), h.records[len(h.records)-h.maxRecords:]...)
 	}
+	h.processedTotal++
 	h.updatedAt = time.Now()
 	snapshot := h.snapshotLocked()
 	h.mu.Unlock()
@@ -311,15 +315,16 @@ func (h *DashboardHub) Snapshot() DashboardState {
 func (h *DashboardHub) snapshotLocked() DashboardState {
 	records := append([]string(nil), h.records...)
 	state := DashboardState{
-		Mode:          "live",
-		Records:       records,
-		ActiveFile:    h.activeFile,
-		LastSHA256:    h.lastSHA256,
-		LastTSAStatus: h.lastTSAStatus,
-		Limit:         len(records),
-		Page:          1,
-		TotalRecords:  len(records),
-		TotalPages:    1,
+		Mode:           "live",
+		Records:        records,
+		ActiveFile:     h.activeFile,
+		LastSHA256:     h.lastSHA256,
+		LastTSAStatus:  h.lastTSAStatus,
+		ProcessedTotal: h.processedTotal,
+		Limit:          len(records),
+		Page:           1,
+		TotalRecords:   len(records),
+		TotalPages:     1,
 	}
 	if !h.updatedAt.IsZero() {
 		state.UpdatedAt = h.updatedAt.Format(time.RFC3339)
@@ -485,6 +490,7 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	state.TotalPages = totalPages(len(state.Records), limit)
 	state.AvailableDates = availableLogDates(a.cfg.LogRoot)
 	if selectedDate != "" {
+		state.Mode = "historical"
 		availableHours, err := availableLogHours(a.cfg.LogRoot, selectedDate)
 		if err == nil {
 			state.SelectedDate = selectedDate
@@ -1338,12 +1344,25 @@ func (h *HourlyLogger) closeCurrentLocked(seal bool) error {
 		return fmt.Errorf("close current log failed: %w", err)
 	}
 	if seal {
-		if err := h.sealHourlyLog(currentPath); err != nil {
-			return err
-		}
+		// Seal asynchronously: SHA-256 + TSA round-trip can take seconds and
+		// must not block the packet-receive loop while h.mu is held.
+		// sealHourlyLog operates only on the closed file path, so it is safe
+		// to run without the lock.
+		h.sealWG.Add(1)
+		go func(path string) {
+			defer h.sealWG.Done()
+			if err := h.sealHourlyLog(path); err != nil {
+				log.Printf("seal hourly log failed for %s: %v", path, err)
+			}
+		}(currentPath)
 	}
 
 	return nil
+}
+
+// WaitForSeals blocks until all in-flight asynchronous seal operations finish.
+func (h *HourlyLogger) WaitForSeals() {
+	h.sealWG.Wait()
 }
 
 func (h *HourlyLogger) sealHourlyLog(logPath string) error {
@@ -1514,20 +1533,29 @@ const dashboardHTML = `<!DOCTYPE html>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0b1220;
-      --panel: #111827;
-      --panel-2: #0f172a;
-      --border: rgba(148, 163, 184, 0.16);
-      --border-soft: rgba(148, 163, 184, 0.10);
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --muted-2: #64748b;
-      --accent: #60a5fa;
-      --accent-soft: rgba(96,165,250,0.12);
-      --accent-2: #22c55e;
-      --warn: #f59e0b;
-      --danger: #f87171;
-      --shadow: 0 20px 60px rgba(2, 6, 23, 0.45);
+      --bg: #04050a;
+      --panel: rgba(13, 18, 32, 0.72);
+      --panel-2: rgba(9, 13, 24, 0.78);
+      --border: rgba(34, 211, 238, 0.20);
+      --border-soft: rgba(56, 189, 248, 0.12);
+      --text: #e9f1ff;
+      --muted: #93a7cc;
+      --muted-2: #5f76a0;
+      --accent: #22d3ee;
+      --accent-soft: rgba(34, 211, 238, 0.14);
+      --accent-2: #2bff88;
+      --neon-cyan: #22d3ee;
+      --neon-blue: #38bdf8;
+      --neon-pink: #ff3d9a;
+      --neon-purple: #b06bff;
+      --neon-green: #2bff88;
+      --neon-amber: #ffb020;
+      --warn: #ffb020;
+      --danger: #ff5d7a;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+      --glow-cyan: 0 0 10px rgba(34,211,238,0.55), 0 0 26px rgba(34,211,238,0.28);
+      --glow-pink: 0 0 10px rgba(255,61,154,0.55), 0 0 26px rgba(255,61,154,0.28);
+      --glow-green: 0 0 10px rgba(43,255,136,0.55), 0 0 26px rgba(43,255,136,0.26);
       --radius: 22px;
     }
 
@@ -1537,13 +1565,31 @@ const dashboardHTML = `<!DOCTYPE html>
       margin: 0;
       min-height: 100vh;
       background:
-        radial-gradient(circle at top left, rgba(96,165,250,0.16), transparent 28%),
-        radial-gradient(circle at top right, rgba(34,197,94,0.10), transparent 22%),
-        linear-gradient(180deg, #0b1120 0%, #09101b 100%);
+        radial-gradient(900px circle at 0% -5%, rgba(34,211,238,0.16), transparent 42%),
+        radial-gradient(900px circle at 100% 0%, rgba(255,61,154,0.14), transparent 40%),
+        radial-gradient(1200px circle at 50% 120%, rgba(176,107,255,0.14), transparent 45%),
+        linear-gradient(180deg, #06070f 0%, #04050a 100%);
+      background-attachment: fixed;
       color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       padding: 32px;
     }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(34,211,238,0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(34,211,238,0.045) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 75%);
+      -webkit-mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 75%);
+      z-index: 0;
+    }
+
+    .layout { position: relative; z-index: 1; }
 
     .layout {
       width: min(1440px, 100%);
@@ -1553,26 +1599,262 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .hero {
-      background: linear-gradient(180deg, rgba(17,24,39,0.96), rgba(15,23,42,0.96));
+      position: relative;
+      background: linear-gradient(180deg, rgba(13,18,32,0.78), rgba(8,11,22,0.82));
       border: 1px solid var(--border);
       border-radius: 28px;
-      box-shadow: var(--shadow);
-      padding: 16px 24px;
+      box-shadow: var(--shadow), 0 0 36px rgba(34,211,238,0.10), inset 0 1px 0 rgba(255,255,255,0.04);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      padding: 18px 24px 20px 24px;
+      display: grid;
+      gap: 16px;
+      overflow: hidden;
     }
 
-    .hero-stats {
+    .hero::before {
+      content: "";
+      position: absolute;
+      top: -1px; left: 24px; right: 24px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--neon-cyan), var(--neon-pink), transparent);
+      opacity: 0.7;
+    }
+
+    .hero-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 42px;
+      height: 42px;
+      flex-shrink: 0;
+      border-radius: 13px;
+      color: var(--neon-cyan);
+      background: var(--accent-soft);
+      border: 1px solid rgba(34,211,238,0.40);
+      box-shadow: 0 0 18px rgba(34,211,238,0.30), inset 0 0 14px rgba(34,211,238,0.12);
+      filter: drop-shadow(0 0 4px rgba(34,211,238,0.5));
+    }
+
+    .brand-mark svg { width: 24px; height: 24px; }
+
+    .brand-title {
+      margin: 0;
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #fff;
+      text-shadow: 0 0 12px rgba(34,211,238,0.45), 0 0 26px rgba(34,211,238,0.22);
+    }
+
+    .brand-subtitle {
+      margin: 2px 0 0 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .hero-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .hero-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
+      gap: 12px;
       align-items: stretch;
     }
 
-    .status-card {
-      background: rgba(255,255,255,0.03);
+    .stat-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.015));
       border: 1px solid var(--border-soft);
-      border-radius: 14px;
-      padding: 10px 14px;
+      border-radius: 16px;
+      padding: 13px 15px;
+      min-width: 0;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
     }
+
+    .stat-card:hover {
+      border-color: rgba(34,211,238,0.34);
+      box-shadow: 0 0 24px rgba(34,211,238,0.14);
+      transform: translateY(-2px);
+    }
+
+    .stat-card.accent {
+      background: linear-gradient(160deg, rgba(34,211,238,0.14), rgba(176,107,255,0.06));
+      border-color: rgba(34,211,238,0.34);
+      box-shadow: inset 0 0 22px rgba(34,211,238,0.08), 0 0 22px rgba(34,211,238,0.10);
+    }
+
+    .stat-card.integrity:hover {
+      border-color: rgba(255,61,154,0.34);
+      box-shadow: 0 0 24px rgba(255,61,154,0.14);
+    }
+
+    .stat-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px 8px;
+      flex-wrap: wrap;
+    }
+
+    .stat-main {
+      display: flex;
+      align-items: baseline;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .stat-number {
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #fff;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.1;
+    }
+
+    .stat-card.accent .stat-number {
+      color: var(--neon-cyan);
+      text-shadow: var(--glow-cyan);
+    }
+
+    .stat-number.sm {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--neon-blue);
+      text-shadow: 0 0 10px rgba(56,189,248,0.45);
+    }
+
+    .stat-unit { font-size: 12px; color: var(--muted); font-weight: 600; }
+
+    .stat-foot {
+      font-size: 11px;
+      color: var(--muted-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .stat-foot span { color: var(--muted); font-weight: 600; }
+
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted-2);
+      flex-shrink: 0;
+    }
+
+    .live-dot.active {
+      background: var(--neon-green);
+      box-shadow: 0 0 0 0 rgba(43,255,136,0.5), 0 0 12px rgba(43,255,136,0.8);
+      animation: pulse 1.6s ease-out infinite;
+    }
+
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(43,255,136,0.5), 0 0 12px rgba(43,255,136,0.8); }
+      70%  { box-shadow: 0 0 0 8px rgba(43,255,136,0), 0 0 12px rgba(43,255,136,0.8); }
+      100% { box-shadow: 0 0 0 0 rgba(43,255,136,0), 0 0 12px rgba(43,255,136,0.8); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .live-dot.active { animation: none; }
+    }
+
+    .seal-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      background: rgba(148,163,184,0.10);
+      border: 1px solid rgba(148,163,184,0.18);
+      white-space: nowrap;
+    }
+
+    .seal-badge.ok {
+      color: #052e16;
+      background: var(--neon-green);
+      border-color: var(--neon-green);
+      box-shadow: var(--glow-green);
+    }
+
+    .seal-badge.error {
+      color: #fff;
+      background: rgba(255,93,122,0.22);
+      border-color: var(--danger);
+      box-shadow: 0 0 10px rgba(255,93,122,0.45);
+    }
+
+    .seal-sha-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .seal-sha {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px;
+      color: var(--neon-pink);
+      text-shadow: 0 0 8px rgba(255,61,154,0.4);
+      background: rgba(5,7,14,0.7);
+      border: 1px solid rgba(255,61,154,0.22);
+      border-radius: 9px;
+      padding: 5px 9px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .copy-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      flex-shrink: 0;
+      border-radius: 9px;
+      background: rgba(148,163,184,0.10);
+      border: 1px solid var(--border-soft);
+      color: var(--muted);
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+
+    .copy-btn svg { width: 15px; height: 15px; }
+    .copy-btn:hover:not(:disabled) { color: var(--neon-cyan); border-color: rgba(34,211,238,0.45); background: var(--accent-soft); box-shadow: 0 0 14px rgba(34,211,238,0.25); }
+    .copy-btn:disabled { opacity: 0.4; cursor: default; }
+    .copy-btn.copied { color: #052e16; border-color: var(--neon-green); background: var(--neon-green); box-shadow: var(--glow-green); }
+
+    .stat-card.sizes { gap: 10px; }
 
     .status-label {
       color: var(--muted-2);
@@ -1600,8 +1882,8 @@ const dashboardHTML = `<!DOCTYPE html>
       min-height: 36px;
       padding: 0 14px;
       border-radius: 999px;
-      background: rgba(148,163,184,0.10);
-      border: 1px solid rgba(148,163,184,0.16);
+      background: rgba(148,163,184,0.08);
+      border: 1px solid rgba(148,163,184,0.18);
       color: var(--text);
       font-size: 13px;
       font-weight: 600;
@@ -1611,36 +1893,58 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .mode-button:hover {
-      border-color: rgba(96,165,250,0.35);
+      border-color: rgba(34,211,238,0.5);
       background: var(--accent-soft);
-      color: #dbeafe;
+      color: #ccfbff;
+      box-shadow: var(--glow-cyan);
     }
 
     .status-badge.live,
     .mode-button.live {
-      color: #86efac;
-      border-color: rgba(34,197,94,0.24);
-      background: rgba(34,197,94,0.10);
+      color: #052e16;
+      border-color: var(--neon-green);
+      background: var(--neon-green);
+      box-shadow: var(--glow-green);
+    }
+
+    .mode-button.live:hover {
+      color: #052e16;
+      background: var(--neon-green);
+      box-shadow: var(--glow-green);
     }
 
     .status-badge.retry {
-      color: #fcd34d;
-      border-color: rgba(245,158,11,0.24);
-      background: rgba(245,158,11,0.10);
+      color: #1c1407;
+      border-color: var(--neon-amber);
+      background: var(--neon-amber);
+      box-shadow: 0 0 10px rgba(255,176,32,0.5), 0 0 24px rgba(255,176,32,0.25);
     }
 
     .status-badge.error {
-      color: #fca5a5;
-      border-color: rgba(248,113,113,0.24);
-      background: rgba(248,113,113,0.10);
+      color: #fff;
+      border-color: var(--danger);
+      background: rgba(255,93,122,0.22);
+      box-shadow: 0 0 10px rgba(255,93,122,0.45);
     }
 
     .table-card {
-      background: linear-gradient(180deg, rgba(17,24,39,0.98), rgba(15,23,42,0.98));
+      position: relative;
+      background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
       border: 1px solid var(--border);
       border-radius: 28px;
-      box-shadow: var(--shadow);
+      box-shadow: var(--shadow), 0 0 30px rgba(176,107,255,0.08);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
       overflow: hidden;
+    }
+
+    .table-card::before {
+      content: "";
+      position: absolute;
+      top: -1px; left: 28px; right: 28px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--neon-purple), var(--neon-cyan), transparent);
+      opacity: 0.6;
     }
 
     .table-card-header {
@@ -1658,6 +1962,8 @@ const dashboardHTML = `<!DOCTYPE html>
       font-size: 20px;
       font-weight: 700;
       letter-spacing: -0.02em;
+      color: #fff;
+      text-shadow: 0 0 12px rgba(176,107,255,0.4);
     }
 
     .table-subtitle {
@@ -1690,11 +1996,18 @@ const dashboardHTML = `<!DOCTYPE html>
       min-height: 42px;
       border-radius: 14px;
       border: 1px solid var(--border);
-      background: rgba(15,23,42,0.9);
+      background: rgba(7,10,20,0.9);
       color: var(--text);
       padding: 0 14px;
       font-size: 14px;
       outline: none;
+      transition: 0.18s ease;
+    }
+
+    .select:hover { border-color: rgba(34,211,238,0.4); }
+    .select:focus {
+      border-color: var(--neon-cyan);
+      box-shadow: 0 0 0 3px rgba(34,211,238,0.18), var(--glow-cyan);
     }
 
     .table-wrap {
@@ -1712,49 +2025,56 @@ const dashboardHTML = `<!DOCTYPE html>
     thead th {
       text-align: left;
       padding: 16px 18px;
-      color: var(--muted);
+      color: var(--neon-cyan);
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      font-weight: 600;
+      letter-spacing: 0.10em;
+      font-weight: 700;
       position: sticky;
       top: 0;
-      background: rgba(15,23,42,0.96);
+      background: rgba(7,10,20,0.96);
       backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border-soft);
+      border-bottom: 1px solid rgba(34,211,238,0.25);
+      text-shadow: 0 0 8px rgba(34,211,238,0.35);
       z-index: 1;
     }
 
     tbody td {
       padding: 16px 18px;
-      border-bottom: 1px solid rgba(148,163,184,0.08);
+      border-bottom: 1px solid rgba(34,211,238,0.07);
       font-size: 14px;
       color: var(--text);
       vertical-align: middle;
     }
 
     .cell-ip-src {
-      color: #7dd3fc;
+      color: #7dffea;
       font-weight: 600;
+      text-shadow: 0 0 8px rgba(34,211,238,0.35);
     }
 
     .cell-ip-dst {
-      color: #93c5fd;
+      color: #79c0ff;
       font-weight: 600;
+      text-shadow: 0 0 8px rgba(56,189,248,0.3);
     }
 
     .cell-port-src {
-      color: #fbbf24;
+      color: #ffd24a;
       font-weight: 700;
+      text-shadow: 0 0 8px rgba(255,176,32,0.35);
     }
 
     .cell-port-dst {
-      color: #fb7185;
+      color: #ff6ba6;
       font-weight: 700;
+      text-shadow: 0 0 8px rgba(255,61,154,0.35);
     }
 
+    tbody tr { transition: box-shadow 0.15s ease; }
     tbody tr:hover td {
-      background: rgba(148,163,184,0.04);
+      background: rgba(34,211,238,0.06);
+      box-shadow: inset 0 0 18px rgba(34,211,238,0.06);
     }
 
     .mono {
@@ -1779,21 +2099,27 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .proto.tcp {
-      color: #93c5fd;
-      background: rgba(59,130,246,0.12);
-      border-color: rgba(59,130,246,0.22);
+      color: var(--neon-cyan);
+      background: rgba(34,211,238,0.12);
+      border-color: rgba(34,211,238,0.45);
+      box-shadow: 0 0 12px rgba(34,211,238,0.25), inset 0 0 8px rgba(34,211,238,0.10);
+      text-shadow: 0 0 8px rgba(34,211,238,0.5);
     }
 
     .proto.udp {
-      color: #86efac;
-      background: rgba(34,197,94,0.12);
-      border-color: rgba(34,197,94,0.22);
+      color: var(--neon-green);
+      background: rgba(43,255,136,0.10);
+      border-color: rgba(43,255,136,0.45);
+      box-shadow: 0 0 12px rgba(43,255,136,0.22), inset 0 0 8px rgba(43,255,136,0.10);
+      text-shadow: 0 0 8px rgba(43,255,136,0.5);
     }
 
     .proto.icmp {
-      color: #fcd34d;
-      background: rgba(245,158,11,0.12);
-      border-color: rgba(245,158,11,0.22);
+      color: var(--neon-amber);
+      background: rgba(255,176,32,0.10);
+      border-color: rgba(255,176,32,0.45);
+      box-shadow: 0 0 12px rgba(255,176,32,0.22), inset 0 0 8px rgba(255,176,32,0.10);
+      text-shadow: 0 0 8px rgba(255,176,32,0.5);
     }
 
     .empty {
@@ -1849,10 +2175,10 @@ const dashboardHTML = `<!DOCTYPE html>
       flex-shrink: 0;
     }
 
-    .file-size-item .size-dot.hourly { background: #60a5fa; }
-    .file-size-item .size-dot.daily { background: #34d399; }
-    .file-size-item .size-dot.monthly { background: #fbbf24; }
-    .file-size-item .size-dot.total { background: #a78bfa; }
+    .file-size-item .size-dot.hourly { background: var(--neon-cyan); box-shadow: 0 0 6px rgba(34,211,238,0.9); }
+    .file-size-item .size-dot.daily { background: var(--neon-green); box-shadow: 0 0 6px rgba(43,255,136,0.9); }
+    .file-size-item .size-dot.monthly { background: var(--neon-amber); box-shadow: 0 0 6px rgba(255,176,32,0.9); }
+    .file-size-item .size-dot.total { background: var(--neon-purple); box-shadow: 0 0 6px rgba(176,107,255,0.9); }
 
     .file-size-item .size-value {
       font-size: 12px;
@@ -1865,10 +2191,10 @@ const dashboardHTML = `<!DOCTYPE html>
       text-overflow: ellipsis;
     }
 
-    .file-size-item .size-value.hourly { color: #93c5fd; }
-    .file-size-item .size-value.daily { color: #86efac; }
-    .file-size-item .size-value.monthly { color: #fde68a; }
-    .file-size-item .size-value.total { color: #c4b5fd; }
+    .file-size-item .size-value.hourly { color: #7dffea; text-shadow: 0 0 7px rgba(34,211,238,0.35); }
+    .file-size-item .size-value.daily { color: #7dffb0; text-shadow: 0 0 7px rgba(43,255,136,0.35); }
+    .file-size-item .size-value.monthly { color: #ffd98a; text-shadow: 0 0 7px rgba(255,176,32,0.35); }
+    .file-size-item .size-value.total { color: #cfa9ff; text-shadow: 0 0 7px rgba(176,107,255,0.35); }
 
     .file-size-value-wrap {
       display: block;
@@ -1877,44 +2203,83 @@ const dashboardHTML = `<!DOCTYPE html>
 
     @media (max-width: 1100px) {
       body { padding: 18px; }
+      .hero-grid { grid-template-columns: 1fr 1fr; }
     }
 
     @media (max-width: 920px) {
       body { padding: 12px; }
       .hero, .table-card { border-radius: 22px; }
-      .hero { padding: 22px; }
+      .hero { padding: 18px; }
       .table-card-header { padding: 20px 20px 16px 20px; }
       .toolbar { width: 100%; }
       .field { width: 100%; }
-      .hero-stats {
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-      }
+      .hero-controls { width: 100%; }
     }
 
-    @media (max-width: 920px) {
+    @media (max-width: 560px) {
+      .hero-grid { grid-template-columns: 1fr; }
       .file-sizes-grid { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
 <body>
   <div class="layout">
-    <section class="hero hero-stats">
-      <div class="status-card">
-        <div class="status-label">Bağlantı durumu</div>
-        <div class="status-value"><span class="status-badge" id="connection">Bağlanıyor</span></div>
+    <section class="hero">
+      <div class="hero-top">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12h4l2 6 4-14 2 8h6"/>
+            </svg>
+          </span>
+          <div class="brand-text">
+            <h1 class="brand-title">NetFlow Logger</h1>
+            <p class="brand-subtitle">NetFlow v9 · saatlik mühürlü kayıt paneli</p>
+          </div>
+        </div>
+        <div class="hero-controls">
+          <span class="status-badge" id="connection" role="status" aria-live="polite">Bağlanıyor</span>
+          <button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button>
+        </div>
       </div>
-      <div class="status-card">
-        <div class="status-label">Görüntü modu</div>
-        <div class="status-value"><button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button></div>
-      </div>
-      <div class="status-card">
-        <div class="status-label">Son güncelleme</div>
-        <div class="status-value" id="updated-at">-</div>
-      </div>
-      <div class="status-card">
-        <div class="status-label">Dosya boyutları</div>
-        <div class="status-value" style="width:100%">
+
+      <div class="hero-grid">
+        <div class="stat-card accent">
+          <div class="stat-head">
+            <span class="status-label">Akış hızı</span>
+            <span class="live-dot" id="rate-dot" aria-hidden="true"></span>
+          </div>
+          <div class="stat-main">
+            <span class="stat-number" id="throughput-rate">0</span>
+            <span class="stat-unit">kayıt/sn</span>
+          </div>
+          <div class="stat-foot"><span id="throughput-total">0</span> toplam işlenen kayıt</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-head"><span class="status-label">Son güncelleme</span></div>
+          <div class="stat-main"><span class="stat-number sm mono" id="updated-at">-</span></div>
+          <div class="stat-foot" id="active-file" title="Aktif log dosyası">Aktif dosya: -</div>
+        </div>
+
+        <div class="stat-card integrity">
+          <div class="stat-head">
+            <span class="status-label">Bütünlük mührü</span>
+            <span class="seal-badge" id="seal-badge">Bekliyor</span>
+          </div>
+          <div class="seal-sha-row">
+            <code class="seal-sha mono" id="seal-sha" title="Son SHA-256 özeti">SHA-256 henüz yok</code>
+            <button type="button" class="copy-btn" id="copy-sha" title="SHA-256 kopyala" disabled aria-label="SHA-256 özetini kopyala">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>
+              </svg>
+            </button>
+          </div>
+          <div class="stat-foot" id="seal-detail" title="Son TSA durumu">TSA: bekleniyor</div>
+        </div>
+
+        <div class="stat-card sizes">
+          <div class="stat-head"><span class="status-label">Dosya boyutları</span></div>
           <div class="file-sizes-grid">
             <div class="file-size-item">
               <span class="size-label"><span class="size-dot hourly"></span>Saatlik</span>
@@ -2010,11 +2375,98 @@ const dashboardHTML = `<!DOCTYPE html>
     const fileSizeDailyEl = document.getElementById('file-size-daily');
     const fileSizeMonthlyEl = document.getElementById('file-size-monthly');
     const fileSizeTotalEl = document.getElementById('file-size-total');
+    const throughputRateEl = document.getElementById('throughput-rate');
+    const throughputTotalEl = document.getElementById('throughput-total');
+    const rateDotEl = document.getElementById('rate-dot');
+    const activeFileEl = document.getElementById('active-file');
+    const sealBadgeEl = document.getElementById('seal-badge');
+    const sealShaEl = document.getElementById('seal-sha');
+    const sealDetailEl = document.getElementById('seal-detail');
+    const copyShaEl = document.getElementById('copy-sha');
 
     let eventSource = null;
     let livePollTimer = null;
     let currentMode = 'live';
     let currentPage = 1;
+
+    let lastProcessed = null;
+    let lastProcessedAt = 0;
+    let rateEma = 0;
+    let currentSha = '';
+
+    const numberFmt = new Intl.NumberFormat('tr-TR');
+
+    function formatRate(value) {
+      if (value >= 100) return numberFmt.format(Math.round(value));
+      if (value >= 10) return value.toFixed(1);
+      return value.toFixed(value > 0 ? 2 : 0);
+    }
+
+    function basename(path) {
+      if (!path) return '';
+      const clean = String(path).replace(/[\\/]+$/, '');
+      const idx = Math.max(clean.lastIndexOf('/'), clean.lastIndexOf('\\'));
+      return idx >= 0 ? clean.slice(idx + 1) : clean;
+    }
+
+    function updateThroughput(state) {
+      const total = Number(state.processed_total);
+      if (!Number.isFinite(total)) return;
+      throughputTotalEl.textContent = numberFmt.format(total);
+
+      const now = performance.now();
+      if (lastProcessed !== null && now > lastProcessedAt) {
+        const dt = (now - lastProcessedAt) / 1000;
+        const delta = total - lastProcessed;
+        if (dt >= 0.4 && delta >= 0) {
+          const instant = delta / dt;
+          rateEma = rateEma === 0 ? instant : rateEma * 0.6 + instant * 0.4;
+        }
+      }
+      lastProcessed = total;
+      lastProcessedAt = now;
+      throughputRateEl.textContent = formatRate(rateEma);
+      rateDotEl.classList.toggle('active', rateEma >= 0.05);
+    }
+
+    function resetThroughput() {
+      lastProcessed = null;
+      rateEma = 0;
+      rateDotEl.classList.remove('active');
+      throughputRateEl.textContent = '—';
+    }
+
+    function updateIntegrity(state) {
+      const file = state.active_file || '';
+      activeFileEl.textContent = 'Aktif dosya: ' + (basename(file) || '-');
+      activeFileEl.title = file || 'Aktif log dosyası';
+
+      const sha = state.last_sha256 || '';
+      currentSha = sha;
+      if (sha) {
+        sealShaEl.textContent = sha.slice(0, 12) + '…' + sha.slice(-12);
+        sealShaEl.title = sha;
+        copyShaEl.disabled = false;
+      } else {
+        sealShaEl.textContent = 'SHA-256 henüz yok';
+        sealShaEl.title = 'Son SHA-256 özeti';
+        copyShaEl.disabled = true;
+      }
+
+      const status = state.last_tsa_status || '';
+      sealDetailEl.textContent = 'TSA: ' + (status || 'bekleniyor');
+      sealDetailEl.title = status || 'Son TSA durumu';
+      sealBadgeEl.className = 'seal-badge';
+      if (!status) {
+        sealBadgeEl.textContent = 'Bekliyor';
+      } else if (/^OK/i.test(status)) {
+        sealBadgeEl.textContent = 'Mühürlendi';
+        sealBadgeEl.classList.add('ok');
+      } else {
+        sealBadgeEl.textContent = 'Hata';
+        sealBadgeEl.classList.add('error');
+      }
+    }
 
     function formatTime(value) {
       if (!value) return '-';
@@ -2153,6 +2605,12 @@ const dashboardHTML = `<!DOCTYPE html>
       fileSizeDailyEl.textContent = state.file_size_daily || '-';
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
+      updateIntegrity(state);
+      if ((state.mode || 'live') === 'live') {
+        updateThroughput(state);
+      } else {
+        resetThroughput();
+      }
       prevPageEl.disabled = (state.page || 1) <= 1;
       nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
       renderRows(state.records || []);
@@ -2304,6 +2762,26 @@ const dashboardHTML = `<!DOCTYPE html>
 
     nextPageEl.addEventListener('click', async () => {
       await changePage(currentPage + 1);
+    });
+
+    copyShaEl.addEventListener('click', async () => {
+      if (!currentSha) {
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(currentSha);
+      } catch (error) {
+        const helper = document.createElement('textarea');
+        helper.value = currentSha;
+        helper.style.position = 'fixed';
+        helper.style.opacity = '0';
+        document.body.appendChild(helper);
+        helper.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(helper);
+      }
+      copyShaEl.classList.add('copied');
+      setTimeout(() => copyShaEl.classList.remove('copied'), 1200);
     });
 
     fetchState().then((state) => {
