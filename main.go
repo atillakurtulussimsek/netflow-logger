@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ const (
 	defaultEnvPath          = ".env"
 	maxPacketSize           = 65535
 	dashboardMaxRecords     = 1000
+	templateCacheFile       = "templates.json"
 )
 
 var (
@@ -173,7 +175,7 @@ func main() {
 	dashboard := NewDashboardHub(dashboardMaxRecords)
 	app := &App{
 		cfg:       cfg,
-		session:   flowsession.New(),
+		session:   newPersistentSession(cfg.LogRoot),
 		dashboard: dashboard,
 		logger: &HourlyLogger{
 			cfg:        cfg,
@@ -187,6 +189,123 @@ func main() {
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("application stopped with error: %v", err)
+	}
+}
+
+// templateSnapshot, diske yazılan/diskten okunan NetFlow v9 şablon kümesidir.
+type templateSnapshot struct {
+	Regular map[uint16]*netflow9.TemplateRecord       `json:"regular"`
+	Options map[uint16]*netflow9.OptionTemplateRecord `json:"options"`
+}
+
+// persistentSession, alınan NetFlow v9 şablonlarını diske kaydeden ve açılışta
+// geri yükleyen bir oturum sarmalayıcısıdır. NetFlow v9'da veri kayıtları ancak
+// ilgili şablon (template) geldikten sonra çözülebilir; router şablonları
+// dakikalarca aralıkla gönderdiği için collector ilk açılışta şablon gelene
+// kadar gelen veriyi çözemez ("bir süre hiç log gelmiyor" sorunu). Şablonları
+// kalıcı tutarak yeniden başlatmalarda veri anında çözülür.
+type persistentSession struct {
+	flowsession.Session
+	mu   sync.Mutex
+	path string
+	snap templateSnapshot
+}
+
+func newPersistentSession(logRoot string) *persistentSession {
+	ps := &persistentSession{
+		Session: flowsession.New(),
+		path:    filepath.Join(logRoot, templateCacheFile),
+		snap: templateSnapshot{
+			Regular: make(map[uint16]*netflow9.TemplateRecord),
+			Options: make(map[uint16]*netflow9.OptionTemplateRecord),
+		},
+	}
+	ps.load()
+	return ps
+}
+
+// load, daha önce kaydedilmiş şablonları okuyup oturuma ekler.
+func (p *persistentSession) load() {
+	data, err := os.ReadFile(p.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("template cache read failed: %v", err)
+		}
+		return
+	}
+
+	var snap templateSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		log.Printf("template cache parse failed: %v", err)
+		return
+	}
+
+	count := 0
+	for id, tr := range snap.Regular {
+		if tr == nil {
+			continue
+		}
+		tr.TemplateID = id
+		p.snap.Regular[id] = tr
+		p.Session.AddTemplate(tr)
+		count++
+	}
+	for id, otr := range snap.Options {
+		if otr == nil {
+			continue
+		}
+		otr.TemplateID = id
+		p.snap.Options[id] = otr
+		p.Session.AddTemplate(otr)
+		count++
+	}
+	if count > 0 {
+		log.Printf("loaded %d cached NetFlow v9 template(s) from %s", count, p.path)
+	}
+}
+
+// AddTemplate, oturuma şablon eklerken yeni veya değişmiş şablonları diske de yazar.
+func (p *persistentSession) AddTemplate(t flowsession.Template) {
+	p.Session.AddTemplate(t)
+
+	p.mu.Lock()
+	changed := false
+	switch v := t.(type) {
+	case *netflow9.TemplateRecord:
+		if existing, ok := p.snap.Regular[v.ID()]; !ok || !reflect.DeepEqual(existing, v) {
+			p.snap.Regular[v.ID()] = v
+			changed = true
+		}
+	case *netflow9.OptionTemplateRecord:
+		if existing, ok := p.snap.Options[v.ID()]; !ok || !reflect.DeepEqual(existing, v) {
+			p.snap.Options[v.ID()] = v
+			changed = true
+		}
+	}
+	if changed {
+		p.persistLocked()
+	}
+	p.mu.Unlock()
+}
+
+// persistLocked, anlık şablon kümesini atomik biçimde diske yazar (p.mu kilitli olmalı).
+func (p *persistentSession) persistLocked() {
+	data, err := json.MarshalIndent(p.snap, "", "  ")
+	if err != nil {
+		log.Printf("template cache marshal failed: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p.path), 0o755); err != nil {
+		log.Printf("template cache dir create failed: %v", err)
+		return
+	}
+	tmp := p.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("template cache write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, p.path); err != nil {
+		log.Printf("template cache rename failed: %v", err)
 	}
 }
 
@@ -520,6 +639,8 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	limit := normalizeDashboardLimit(r.URL.Query().Get("limit"))
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -529,19 +650,109 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 
 	keepAlive := time.NewTicker(15 * time.Second)
 	defer keepAlive.Stop()
+	// Ağır dosya/istatistik hesapları boştayken de güncel kalsın diye periyodik
+	// tazeleme (dosya büyür, gece yarısı tarih döner). Yeni kayıt akışı bundan
+	// bağımsız olarak anında itilir.
+	statsRefresh := time.NewTicker(2 * time.Second)
+	defer statsRefresh.Stop()
+
+	// Ağır istatistikler (dosya boyutları + tarih listesi) önbelleğe alınır; her
+	// pakette dosya sistemi taranmasın diye yalnızca statsRefresh ile yenilenir.
+	type heavyStats struct {
+		availableDates  []string
+		fileSize        string
+		fileSizeDaily   string
+		fileSizeMonthly string
+		fileSizeTotal   string
+	}
+	var cache heavyStats
+	cacheValid := false
+
+	refreshStats := func(activeFile string) {
+		refDate := time.Now().In(a.cfg.Location).Format("2006-01-02")
+		cache = heavyStats{
+			availableDates:  availableLogDates(a.cfg.LogRoot),
+			fileSize:        formatFileSizeByPath(activeFile),
+			fileSizeDaily:   calculateLogSizeByDay(a.cfg.LogRoot, refDate),
+			fileSizeMonthly: calculateLogSizeByMonth(a.cfg.LogRoot, refDate),
+			fileSizeTotal:   calculateTotalLogSize(a.cfg.LogRoot),
+		}
+		cacheValid = true
+	}
+
+	send := func(forceStats bool) bool {
+		state := a.dashboard.Snapshot()
+		if forceStats || !cacheValid {
+			refreshStats(state.ActiveFile)
+		}
+		state.Limit = limit
+		state.Page = 1
+		state.TotalRecords = len(state.Records)
+		state.TotalPages = totalPages(len(state.Records), limit)
+		state.Records = paginateLiveRecords(state.Records, 1, limit)
+		state.AvailableDates = cache.availableDates
+		state.FileSize = cache.fileSize
+		state.FileSizeDaily = cache.fileSizeDaily
+		state.FileSizeMonthly = cache.fileSizeMonthly
+		state.FileSizeTotal = cache.fileSizeTotal
+
+		payload, err := json.Marshal(state)
+		if err != nil {
+			return true // bu güncellemeyi atla ama bağlantıyı koru
+		}
+		if _, err := fmt.Fprintf(w, "event: state\ndata: %s\n\n", payload); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	// İlk durum tam istatistiklerle hemen gönderilir.
+	if !send(true) {
+		return
+	}
+
+	// Yüksek paket hızında her pakette JSON üretmeyi sınırlamak için kısa bir
+	// kısıtlama (throttle): ilk güncelleme anında gider, ardışık güncellemeler en
+	// fazla minInterval'de bir gönderilir — yine de "anlık" hissiyat korunur.
+	const minInterval = 150 * time.Millisecond
+	lastSent := time.Now()
+	flushTimer := time.NewTimer(time.Hour)
+	flushTimer.Stop()
+	flushPending := false
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case payload, ok := <-updates:
+		case _, ok := <-updates:
 			if !ok {
 				return
 			}
-			if _, err := fmt.Fprintf(w, "event: state\ndata: %s\n\n", payload); err != nil {
+			if flushPending {
+				// Zaten bir gönderim planlandı; en güncel durumu o yollayacak.
+				continue
+			}
+			if since := time.Since(lastSent); since >= minInterval {
+				if !send(false) {
+					return
+				}
+				lastSent = time.Now()
+			} else {
+				flushTimer.Reset(minInterval - since)
+				flushPending = true
+			}
+		case <-flushTimer.C:
+			flushPending = false
+			if !send(false) {
 				return
 			}
-			flusher.Flush()
+			lastSent = time.Now()
+		case <-statsRefresh.C:
+			if !send(true) {
+				return
+			}
+			lastSent = time.Now()
 		case <-keepAlive.C:
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
 				return
@@ -2928,7 +3139,7 @@ const dashboardHTML = `<!DOCTYPE html>
       }
       await fetchState();
       if (currentPage === 1) {
-        startLivePolling();
+        startLiveStream();
       } else {
         stopLiveStream();
         setConnectionState('Canlı akış yalnızca 1. sayfada aktif', null);
@@ -2946,6 +3157,45 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
+    // Canlı akış: SSE ile sunucudan anlık itme. Yeni NetFlow kaydı geldiği anda
+    // tablo güncellenir (sabit aralıklı yoklama yerine olay tabanlı).
+    function startLiveStream() {
+      stopLiveStream();
+      setConnectionState('Canlı', 'live');
+
+      // SSE desteklenmiyorsa saniyelik yoklamaya düş.
+      if (typeof window.EventSource === 'undefined') {
+        startLivePolling();
+        return;
+      }
+
+      const params = new URLSearchParams();
+      params.set('limit', limitSelectEl.value || '50');
+      eventSource = new EventSource('/events?' + params.toString());
+
+      eventSource.addEventListener('state', (event) => {
+        if (currentMode !== 'live' || currentPage !== 1) {
+          return;
+        }
+        let state;
+        try {
+          state = JSON.parse(event.data);
+        } catch (err) {
+          return;
+        }
+        state.mode = 'live';
+        render(state);
+        setConnectionState('Canlı', 'live');
+      });
+
+      // EventSource bağlantı koptuğunda kendiliğinden yeniden bağlanır; bu sırada
+      // durumu kullanıcıya bildiririz.
+      eventSource.onerror = () => {
+        setConnectionState('Yeniden bağlanıyor', 'retry');
+      };
+    }
+
+    // Yedek yol: SSE yoksa saniyelik yoklama.
     function startLivePolling() {
       stopLiveStream();
       setConnectionState('Canlı', 'live');
@@ -2963,7 +3213,7 @@ const dashboardHTML = `<!DOCTYPE html>
       if (!dateSelectEl.value) {
         currentMode = 'live';
         await fetchState();
-        startLivePolling();
+        startLiveStream();
         return;
       }
       stopLiveStream();
@@ -2989,7 +3239,7 @@ const dashboardHTML = `<!DOCTYPE html>
       }
       if (!dateSelectEl.value && !hourSelectEl.value) {
         await fetchState();
-        startLivePolling();
+        startLiveStream();
         return;
       }
       await fetchState();
@@ -3002,7 +3252,7 @@ const dashboardHTML = `<!DOCTYPE html>
       hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
       hourSelectEl.disabled = true;
       await fetchState();
-      startLivePolling();
+      startLiveStream();
     });
 
     prevPageEl.addEventListener('click', async () => {
@@ -3038,7 +3288,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     fetchState().then((state) => {
       if ((state.mode || 'live') === 'live') {
-        startLivePolling();
+        startLiveStream();
       }
     }).catch((error) => {
       setConnectionState(error.message, 'error');
