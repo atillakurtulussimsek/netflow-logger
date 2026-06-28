@@ -100,6 +100,7 @@ type DashboardHub struct {
 	mu             sync.RWMutex
 	records        []string
 	processedTotal uint64
+	packetsTotal   uint64
 	activeFile     string
 	lastSHA256     string
 	lastTSAStatus  string
@@ -127,6 +128,7 @@ type DashboardState struct {
 	LastSHA256      string   `json:"last_sha256,omitempty"`
 	LastTSAStatus   string   `json:"last_tsa_status,omitempty"`
 	ProcessedTotal  uint64   `json:"processed_total"`
+	PacketsTotal    uint64   `json:"packets_total"`
 }
 
 type tsRequest struct {
@@ -393,14 +395,26 @@ func NewDashboardHub(maxRecords int) *DashboardHub {
 	}
 }
 
-func (h *DashboardHub) AddRecord(record string) {
+func (h *DashboardHub) AddRecord(record string, packets uint64) {
 	h.mu.Lock()
 	h.records = append(h.records, record)
 	if len(h.records) > h.maxRecords {
 		h.records = append([]string(nil), h.records[len(h.records)-h.maxRecords:]...)
 	}
 	h.processedTotal++
+	h.packetsTotal += packets
 	h.updatedAt = time.Now()
+	snapshot := h.snapshotLocked()
+	h.mu.Unlock()
+	h.broadcastSnapshot(snapshot)
+}
+
+// ResetHourly, saatlik log rotasyonunda çağrılır ve pps grafiğini besleyen saatlik
+// paket sayacını sıfırlar. processedTotal (boşta kalma tespiti için kullanılan
+// monoton sayaç) bilinçli olarak korunur.
+func (h *DashboardHub) ResetHourly() {
+	h.mu.Lock()
+	h.packetsTotal = 0
 	snapshot := h.snapshotLocked()
 	h.mu.Unlock()
 	h.broadcastSnapshot(snapshot)
@@ -440,6 +454,7 @@ func (h *DashboardHub) snapshotLocked() DashboardState {
 		LastSHA256:     h.lastSHA256,
 		LastTSAStatus:  h.lastTSAStatus,
 		ProcessedTotal: h.processedTotal,
+		PacketsTotal:   h.packetsTotal,
 		Limit:          len(records),
 		Page:           1,
 		TotalRecords:   len(records),
@@ -1494,7 +1509,7 @@ func (h *HourlyLogger) Write(record FlowRecord) error {
 		return fmt.Errorf("sync log file failed: %w", err)
 	}
 
-	h.dashboard.AddRecord(line)
+	h.dashboard.AddRecord(line, record.Packets)
 	return nil
 }
 
@@ -1514,6 +1529,8 @@ func (h *HourlyLogger) rotateLocked(targetHour time.Time) error {
 	if err := h.closeCurrentLocked(true); err != nil {
 		return err
 	}
+	// Yeni saate geçişte pps grafiğini besleyen saatlik paket sayacını sıfırla.
+	h.dashboard.ResetHourly()
 	return h.openLocked(targetHour)
 }
 
@@ -2582,14 +2599,13 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
           <div class="stat-main">
             <span class="stat-number" id="throughput-rate">0</span>
-            <span class="stat-unit">kayıt/sn</span>
+            <span class="stat-unit">pps</span>
           </div>
-          <div class="rate-chart" title="Son 2 dakikalık akış hızı">
+          <div class="rate-chart" title="Son 2 dakikalık paket akış hızı (paket/sn)">
             <canvas id="rate-spark"></canvas>
             <span class="rate-chart-peak" id="rate-peak">tepe 0</span>
             <span class="rate-chart-span">son 2 dk</span>
           </div>
-          <div class="stat-foot"><span id="throughput-total">0</span> toplam işlenen kayıt</div>
         </div>
 
         <div class="stat-card">
@@ -2726,7 +2742,6 @@ const dashboardHTML = `<!DOCTYPE html>
     const fileSizeMonthlyEl = document.getElementById('file-size-monthly');
     const fileSizeTotalEl = document.getElementById('file-size-total');
     const throughputRateEl = document.getElementById('throughput-rate');
-    const throughputTotalEl = document.getElementById('throughput-total');
     const rateDotEl = document.getElementById('rate-dot');
     const rateSparkEl = document.getElementById('rate-spark');
     const ratePeakEl = document.getElementById('rate-peak');
@@ -2766,10 +2781,9 @@ const dashboardHTML = `<!DOCTYPE html>
 
     const numberFmt = new Intl.NumberFormat('tr-TR');
 
+    // pps her zaman tam sayı olarak gösterilir; binlik ayırıcıyla biçimlenir.
     function formatRate(value) {
-      if (value >= 100) return numberFmt.format(Math.round(value));
-      if (value >= 10) return value.toFixed(1);
-      return value.toFixed(value > 0 ? 2 : 0);
+      return numberFmt.format(Math.max(0, Math.round(value)));
     }
 
     function basename(path) {
@@ -2779,12 +2793,20 @@ const dashboardHTML = `<!DOCTYPE html>
       return idx >= 0 ? clean.slice(idx + 1) : clean;
     }
 
+    // Akış hızı, saatlik sıfırlanan toplam paket sayacının (packets_total) türevinden
+    // pps (paket/sn) olarak hesaplanır. Saat dönümünde sayaç sıfırlandığında (total
+    // düşer) baz değer yenilenir; o örnek atlanır, böylece sahte bir sıçrama olmaz.
     function updateThroughput(state) {
-      const total = Number(state.processed_total);
+      const total = Number(state.packets_total);
       if (!Number.isFinite(total)) return;
-      throughputTotalEl.textContent = numberFmt.format(total);
 
       const now = performance.now();
+      if (lastProcessed !== null && total < lastProcessed) {
+        // Saatlik sıfırlama: bazı yeniden hizala, hızı koru.
+        lastProcessed = total;
+        lastProcessedAt = now;
+        return;
+      }
       if (lastProcessed !== null && now > lastProcessedAt) {
         const dt = (now - lastProcessedAt) / 1000;
         const delta = total - lastProcessed;
@@ -2796,7 +2818,7 @@ const dashboardHTML = `<!DOCTYPE html>
       lastProcessed = total;
       lastProcessedAt = now;
       throughputRateEl.textContent = formatRate(rateEma);
-      rateDotEl.classList.toggle('active', rateEma >= 0.05);
+      rateDotEl.classList.toggle('active', rateEma >= 1);
     }
 
     function resetThroughput() {
