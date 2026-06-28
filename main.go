@@ -1961,6 +1961,35 @@ const dashboardHTML = `<!DOCTYPE html>
 
     .stat-unit { font-size: 12px; color: var(--muted); font-weight: 600; }
 
+    .rate-chart {
+      position: relative;
+      width: 100%;
+      height: 46px;
+      margin-top: 2px;
+    }
+
+    .rate-chart canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .rate-chart-peak,
+    .rate-chart-span {
+      position: absolute;
+      top: 0;
+      font-size: 9.5px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--muted-2);
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+      text-shadow: 0 0 6px rgba(4,5,10,0.9);
+    }
+
+    .rate-chart-peak { left: 0; color: var(--neon-cyan); opacity: 0.85; }
+    .rate-chart-span { right: 0; }
+
     .stat-foot {
       font-size: 11px;
       color: var(--muted-2);
@@ -2555,6 +2584,11 @@ const dashboardHTML = `<!DOCTYPE html>
             <span class="stat-number" id="throughput-rate">0</span>
             <span class="stat-unit">kayıt/sn</span>
           </div>
+          <div class="rate-chart" title="Son 2 dakikalık akış hızı">
+            <canvas id="rate-spark"></canvas>
+            <span class="rate-chart-peak" id="rate-peak">tepe 0</span>
+            <span class="rate-chart-span">son 2 dk</span>
+          </div>
           <div class="stat-foot"><span id="throughput-total">0</span> toplam işlenen kayıt</div>
         </div>
 
@@ -2694,6 +2728,8 @@ const dashboardHTML = `<!DOCTYPE html>
     const throughputRateEl = document.getElementById('throughput-rate');
     const throughputTotalEl = document.getElementById('throughput-total');
     const rateDotEl = document.getElementById('rate-dot');
+    const rateSparkEl = document.getElementById('rate-spark');
+    const ratePeakEl = document.getElementById('rate-peak');
     const activeFileEl = document.getElementById('active-file');
     const sealBadgeEl = document.getElementById('seal-badge');
     const sealShaEl = document.getElementById('seal-sha');
@@ -2711,6 +2747,14 @@ const dashboardHTML = `<!DOCTYPE html>
     let lastProcessedAt = 0;
     let rateEma = 0;
     let currentSha = '';
+
+    // Canlı akış mini grafiği: rateEma değeri sabit aralıkla örneklenir ve son
+    // 2 dakikalık pencere (120 örnek) bir halka tamponunda tutulur. Böylece grafik
+    // zaman ekseni, olay sıklığından bağımsız ve düzgün olur.
+    const RATE_SAMPLE_MS = 1000;
+    const RATE_WINDOW = 120;
+    const rateSamples = [];
+    let rateSampleTimer = null;
 
     let liveRowsInit = false;
     let lastRowsTotal = null;
@@ -2760,7 +2804,111 @@ const dashboardHTML = `<!DOCTYPE html>
       rateEma = 0;
       rateDotEl.classList.remove('active');
       throughputRateEl.textContent = '—';
+      rateSamples.length = 0;
+      drawRateChart();
     }
+
+    // Canvas'ı yüksek DPI ekranlara göre ölçekler ve mevcut çizim bağlamını döndürür.
+    function prepareRateCanvas() {
+      if (!rateSparkEl) return null;
+      const dpr = window.devicePixelRatio || 1;
+      const w = rateSparkEl.clientWidth || rateSparkEl.parentElement.clientWidth || 220;
+      const h = rateSparkEl.clientHeight || 46;
+      const pw = Math.round(w * dpr);
+      const ph = Math.round(h * dpr);
+      if (rateSparkEl.width !== pw || rateSparkEl.height !== ph) {
+        rateSparkEl.width = pw;
+        rateSparkEl.height = ph;
+      }
+      const ctx = rateSparkEl.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { ctx, w, h };
+    }
+
+    // Son 2 dakikalık akış hızını neon alan grafiği olarak çizer.
+    function drawRateChart() {
+      const env = prepareRateCanvas();
+      if (!env) return;
+      const { ctx, w, h } = env;
+      ctx.clearRect(0, 0, w, h);
+
+      const pad = 4;
+      const baseY = h - pad;
+      const topY = pad + 8;
+
+      // Eksen tabanı.
+      ctx.strokeStyle = 'rgba(56,189,248,0.14)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, baseY + 0.5);
+      ctx.lineTo(w, baseY + 0.5);
+      ctx.stroke();
+
+      const n = rateSamples.length;
+      const peak = n ? Math.max(...rateSamples) : 0;
+      ratePeakEl.textContent = 'tepe ' + formatRate(peak);
+
+      if (n < 2 || peak <= 0) return;
+
+      // X ekseni her zaman tam pencereyi temsil eder; veri sağdan sola akar.
+      const stepX = w / (RATE_WINDOW - 1);
+      const scaleY = (baseY - topY) / peak;
+      const offset = RATE_WINDOW - n;
+      const xAt = (i) => (offset + i) * stepX;
+      const yAt = (v) => baseY - v * scaleY;
+
+      // Dolgu alanı.
+      const grad = ctx.createLinearGradient(0, topY, 0, baseY);
+      grad.addColorStop(0, 'rgba(34,211,238,0.42)');
+      grad.addColorStop(1, 'rgba(34,211,238,0.02)');
+      ctx.beginPath();
+      ctx.moveTo(xAt(0), baseY);
+      for (let i = 0; i < n; i++) ctx.lineTo(xAt(i), yAt(rateSamples[i]));
+      ctx.lineTo(xAt(n - 1), baseY);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // Çizgi + neon parıltı.
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const x = xAt(i), y = yAt(rateSamples[i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.lineWidth = 1.8;
+      ctx.strokeStyle = '#22d3ee';
+      ctx.shadowColor = 'rgba(34,211,238,0.8)';
+      ctx.shadowBlur = 6;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // Son noktayı vurgula.
+      const lx = xAt(n - 1), ly = yAt(rateSamples[n - 1]);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = '#eafcff';
+      ctx.shadowColor = 'rgba(34,211,238,0.9)';
+      ctx.shadowBlur = 8;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // Sabit aralıkla mevcut hızı örnekler; yalnızca canlı modda akar.
+    function sampleRate() {
+      if (currentMode !== 'live') return;
+      rateSamples.push(rateEma > 0 ? rateEma : 0);
+      if (rateSamples.length > RATE_WINDOW) rateSamples.shift();
+      drawRateChart();
+    }
+
+    function startRateSampler() {
+      if (rateSampleTimer) return;
+      rateSampleTimer = setInterval(sampleRate, RATE_SAMPLE_MS);
+    }
+
+    window.addEventListener('resize', drawRateChart);
 
     // Canlı durum her geldiğinde toplam kayıt sayısını izler; arttıysa "veri akıyor"
     // zaman damgasını günceller (uyarıyı tetikleyen boşta kalma süresini sıfırlar).
@@ -3285,6 +3433,9 @@ const dashboardHTML = `<!DOCTYPE html>
       copyShaEl.classList.add('copied');
       setTimeout(() => copyShaEl.classList.remove('copied'), 1200);
     });
+
+    drawRateChart();
+    startRateSampler();
 
     fetchState().then((state) => {
       if ((state.mode || 'live') === 'live') {
