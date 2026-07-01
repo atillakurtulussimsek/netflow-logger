@@ -2544,32 +2544,14 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .cell-proto { white-space: nowrap; }
-    .cell-proto .proto { min-width: 52px; }
-
-    .svc {
-      display: inline-flex;
-      align-items: center;
-      margin-left: 6px;
-      padding: 5px 9px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.03em;
-      color: var(--neon-purple);
-      background: rgba(176,107,255,0.10);
-      border: 1px solid rgba(176,107,255,0.38);
-      box-shadow: 0 0 10px rgba(176,107,255,0.16), inset 0 0 6px rgba(176,107,255,0.08);
-      text-shadow: 0 0 8px rgba(176,107,255,0.4);
-      vertical-align: middle;
-      cursor: default;
-    }
-
-    .svc.secure {
-      color: var(--neon-green);
-      background: rgba(43,255,136,0.10);
-      border-color: rgba(43,255,136,0.40);
-      box-shadow: 0 0 10px rgba(43,255,136,0.16), inset 0 0 6px rgba(43,255,136,0.08);
-      text-shadow: 0 0 8px rgba(43,255,136,0.4);
+    .proto { cursor: default; }
+    .proto.svc { min-width: 64px; }
+    .proto .lock {
+      width: 11px;
+      height: 11px;
+      margin-right: 4px;
+      flex-shrink: 0;
+      opacity: 0.9;
     }
 
     .empty {
@@ -3242,6 +3224,16 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function buildRowMarkup(record) {
       const item = parseRecord(record);
+      // Yaygın port eşleşmesi varsa TCP/UDP yerine servis adı gösterilir;
+      // yoksa taşıma protokolü gösterilir. Renk taşıma protokolüne göre kalır.
+      const protoLabel = item.service || item.proto;
+      const protoTitle = item.service
+        ? item.proto + ' · Port ' + item.servicePort + ' · ' + item.service
+        : item.proto;
+      const lock = (item.service && item.serviceSecure)
+        ? '<svg class="lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'
+        : '';
+      const protoClass = item.protoClass + (item.service ? ' svc' : '');
       return [
         '<tr>',
         '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
@@ -3250,8 +3242,7 @@ const dashboardHTML = `<!DOCTYPE html>
         '<td class="mono cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>',
         '<td class="mono cell-port-dst">' + escapeHtml(item.dstPort) + '</td>',
         '<td class="cell-proto">'
-          + '<span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span>'
-          + (item.service ? '<span class="svc' + (item.serviceSecure ? ' secure' : '') + '" title="Port ' + escapeHtml(item.servicePort) + ' · ' + escapeHtml(item.service) + '">' + escapeHtml(item.service) + '</span>' : '')
+          + '<span class="proto ' + escapeHtml(protoClass) + '" title="' + escapeHtml(protoTitle) + '">' + lock + escapeHtml(protoLabel) + '</span>'
           + '</td>',
         '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>',
         '</tr>'
