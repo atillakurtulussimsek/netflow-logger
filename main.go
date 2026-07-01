@@ -43,6 +43,29 @@ const (
 	templateCacheFile       = "templates.json"
 )
 
+// Tehdit tespiti eşikleri. Kayan zaman penceresi içinde tek kaynak IP'nin
+// davranışına bakılır (NetFlow akış verisi payload içermez, bu yüzden tespit
+// hız/desen tabanlıdır).
+const (
+	threatWindow          = 60 * time.Second // değerlendirme penceresi
+	threatBruteforceMin   = 15               // hassas porta bu kadar akış → brute-force
+	threatPortScanMin     = 20               // tek hedefte bu kadar farklı port → dikey tarama
+	threatHostSweepMin    = 25               // tek portta bu kadar farklı hedef → yatay tarama
+	threatAlertTTL        = 5 * time.Minute  // güncellenmeyen uyarının panelde kalma süresi
+	threatMaxAlerts       = 200              // panelde tutulan azami uyarı sayısı
+	threatMaxSources      = 4096             // izlenen azami kaynak IP sayısı
+	threatMaxEventsPerSrc = 2000             // kaynak başına tutulan azami olay sayısı
+)
+
+// Brute-force açısından hassas kabul edilen servis portları.
+var sensitiveServicePorts = map[uint16]string{
+	21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 110: "POP3",
+	135: "RPC", 139: "NetBIOS", 143: "IMAP", 389: "LDAP", 445: "SMB",
+	1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
+	5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 9200: "Elastic",
+	11211: "Memcached", 27017: "MongoDB",
+}
+
 var (
 	oidTSTInfo    = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 1, 4}
 	oidSignedData = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
@@ -65,6 +88,7 @@ type App struct {
 	session   flowsession.Session
 	logger    *HourlyLogger
 	dashboard *DashboardHub
+	analyzer  *ThreatAnalyzer
 }
 
 type FlowRecord struct {
@@ -86,6 +110,7 @@ type HourlyLogger struct {
 	cfg        Config
 	httpClient *http.Client
 	dashboard  *DashboardHub
+	analyzer   *ThreatAnalyzer
 
 	mu          sync.Mutex
 	currentHour time.Time
@@ -105,30 +130,47 @@ type DashboardHub struct {
 	lastSHA256     string
 	lastTSAStatus  string
 	updatedAt      time.Time
+	threats        []ThreatAlert
 	clients        map[chan []byte]struct{}
 }
 
 type DashboardState struct {
-	Mode            string   `json:"mode"`
-	Records         []string `json:"records"`
-	UpdatedAt       string   `json:"updated_at"`
-	SelectedDate    string   `json:"selected_date"`
-	SelectedHour    string   `json:"selected_hour"`
-	Limit           int      `json:"limit"`
-	Page            int      `json:"page"`
-	TotalRecords    int      `json:"total_records"`
-	TotalPages      int      `json:"total_pages"`
-	FileSize        string   `json:"file_size"`
-	FileSizeDaily   string   `json:"file_size_daily"`
-	FileSizeMonthly string   `json:"file_size_monthly"`
-	FileSizeTotal   string   `json:"file_size_total"`
-	AvailableDates  []string `json:"available_dates"`
-	AvailableHours  []string `json:"available_hours"`
-	ActiveFile      string   `json:"active_file,omitempty"`
-	LastSHA256      string   `json:"last_sha256,omitempty"`
-	LastTSAStatus   string   `json:"last_tsa_status,omitempty"`
-	ProcessedTotal  uint64   `json:"processed_total"`
-	PacketsTotal    uint64   `json:"packets_total"`
+	Mode            string        `json:"mode"`
+	Records         []string      `json:"records"`
+	UpdatedAt       string        `json:"updated_at"`
+	SelectedDate    string        `json:"selected_date"`
+	SelectedHour    string        `json:"selected_hour"`
+	Limit           int           `json:"limit"`
+	Page            int           `json:"page"`
+	TotalRecords    int           `json:"total_records"`
+	TotalPages      int           `json:"total_pages"`
+	FileSize        string        `json:"file_size"`
+	FileSizeDaily   string        `json:"file_size_daily"`
+	FileSizeMonthly string        `json:"file_size_monthly"`
+	FileSizeTotal   string        `json:"file_size_total"`
+	AvailableDates  []string      `json:"available_dates"`
+	AvailableHours  []string      `json:"available_hours"`
+	ActiveFile      string        `json:"active_file,omitempty"`
+	LastSHA256      string        `json:"last_sha256,omitempty"`
+	LastTSAStatus   string        `json:"last_tsa_status,omitempty"`
+	ProcessedTotal  uint64        `json:"processed_total"`
+	PacketsTotal    uint64        `json:"packets_total"`
+	Threats         []ThreatAlert `json:"threats"`
+}
+
+// ThreatAlert, panele gönderilen JSON uyarı DTO'sudur.
+type ThreatAlert struct {
+	Rule      string `json:"rule"`
+	Severity  string `json:"severity"`
+	Title     string `json:"title"`
+	SrcIP     string `json:"src_ip"`
+	Target    string `json:"target"`
+	Port      uint16 `json:"port,omitempty"`
+	Service   string `json:"service,omitempty"`
+	Count     int    `json:"count"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+	Detail    string `json:"detail"`
 }
 
 type tsRequest struct {
@@ -175,14 +217,17 @@ func main() {
 	}
 
 	dashboard := NewDashboardHub(dashboardMaxRecords)
+	analyzer := NewThreatAnalyzer(dashboard)
 	app := &App{
 		cfg:       cfg,
 		session:   newPersistentSession(cfg.LogRoot),
 		dashboard: dashboard,
+		analyzer:  analyzer,
 		logger: &HourlyLogger{
 			cfg:        cfg,
 			httpClient: &http.Client{Timeout: 30 * time.Second},
 			dashboard:  dashboard,
+			analyzer:   analyzer,
 		},
 	}
 
@@ -459,11 +504,30 @@ func (h *DashboardHub) snapshotLocked() DashboardState {
 		Page:           1,
 		TotalRecords:   len(records),
 		TotalPages:     1,
+		Threats:        append([]ThreatAlert(nil), h.threats...),
 	}
 	if !h.updatedAt.IsZero() {
 		state.UpdatedAt = h.updatedAt.Format(time.RFC3339)
 	}
 	return state
+}
+
+// SetThreats, uyarı listesini saklar ancak yayın yapmaz; bir sonraki AddRecord
+// yayını güncel uyarıları taşıyacağı için akış sırasında tekrar yayını önler.
+func (h *DashboardHub) SetThreats(alerts []ThreatAlert) {
+	h.mu.Lock()
+	h.threats = alerts
+	h.mu.Unlock()
+}
+
+// PublishThreats, uyarı listesini saklar ve hemen yayınlar; trafik olmasa bile
+// (ör. uyarı zaman aşımıyla düştüğünde) panelin güncellenmesini sağlar.
+func (h *DashboardHub) PublishThreats(alerts []ThreatAlert) {
+	h.mu.Lock()
+	h.threats = alerts
+	snapshot := h.snapshotLocked()
+	h.mu.Unlock()
+	h.broadcastSnapshot(snapshot)
 }
 
 func (h *DashboardHub) Subscribe() (chan []byte, func()) {
@@ -511,6 +575,352 @@ func (h *DashboardHub) broadcastSnapshot(state DashboardState) {
 	}
 }
 
+// flowEvent, tek bir akış gözlemidir (kayan pencere için).
+type flowEvent struct {
+	ts      time.Time
+	dstIP   string
+	dstPort uint16
+}
+
+// sourceActivity, bir kaynak IP'nin penceredeki güncel olaylarını tutar.
+type sourceActivity struct {
+	events   []flowEvent
+	lastSeen time.Time
+}
+
+// threatAlert, analizcinin dahili uyarı kaydıdır (zaman bilgisiyle).
+type threatAlert struct {
+	id        string
+	rule      string
+	severity  string
+	title     string
+	srcIP     string
+	target    string
+	port      uint16
+	service   string
+	count     int
+	firstSeen time.Time
+	lastSeen  time.Time
+	detail    string
+}
+
+// ThreatAnalyzer, akışları arka planda sürekli analiz ederek brute-force ve
+// port/host tarama gibi şüpheli desenleri tespit eder.
+type ThreatAnalyzer struct {
+	hub *DashboardHub
+
+	mu      sync.Mutex
+	sources map[string]*sourceActivity
+	alerts  map[string]*threatAlert
+}
+
+func NewThreatAnalyzer(hub *DashboardHub) *ThreatAnalyzer {
+	return &ThreatAnalyzer{
+		hub:     hub,
+		sources: make(map[string]*sourceActivity),
+		alerts:  make(map[string]*threatAlert),
+	}
+}
+
+// Observe, her akış kaydında çağrılır; kaydı kayan pencereye ekler ve kuralları
+// değerlendirir. Uyarılar değiştiyse hub'a saklar (yayını eşlik eden AddRecord yapar).
+func (t *ThreatAnalyzer) Observe(record FlowRecord) {
+	if t == nil || record.SrcIP == "" {
+		return
+	}
+	src := record.SrcIP
+	now := time.Now()
+
+	t.mu.Lock()
+	sa := t.sources[src]
+	if sa == nil {
+		if len(t.sources) >= threatMaxSources {
+			t.evictIdleSourceLocked(now)
+		}
+		sa = &sourceActivity{}
+		t.sources[src] = sa
+	}
+	sa.events = append(sa.events, flowEvent{ts: now, dstIP: record.DstIP, dstPort: record.DstPort})
+	sa.lastSeen = now
+	pruneEvents(sa, now)
+	if len(sa.events) > threatMaxEventsPerSrc {
+		sa.events = append([]flowEvent(nil), sa.events[len(sa.events)-threatMaxEventsPerSrc:]...)
+	}
+
+	changed := t.evaluateLocked(src, sa, now)
+	var snapshot []ThreatAlert
+	if changed {
+		snapshot = t.snapshotAlertsLocked()
+	}
+	t.mu.Unlock()
+
+	if changed {
+		t.hub.SetThreats(snapshot)
+	}
+}
+
+// Maintain, arka planda periyodik olarak çağrılır; boşta kalan kaynakları ve
+// zaman aşımına uğrayan uyarıları temizler, değişiklik varsa hemen yayınlar.
+func (t *ThreatAnalyzer) Maintain() {
+	if t == nil {
+		return
+	}
+	now := time.Now()
+
+	t.mu.Lock()
+	for src, sa := range t.sources {
+		pruneEvents(sa, now)
+		if len(sa.events) == 0 && now.Sub(sa.lastSeen) > threatWindow {
+			delete(t.sources, src)
+		}
+	}
+	changed := false
+	for id, a := range t.alerts {
+		if now.Sub(a.lastSeen) > threatAlertTTL {
+			delete(t.alerts, id)
+			changed = true
+		}
+	}
+	var snapshot []ThreatAlert
+	if changed {
+		snapshot = t.snapshotAlertsLocked()
+	}
+	t.mu.Unlock()
+
+	if changed {
+		t.hub.PublishThreats(snapshot)
+	}
+}
+
+// evaluateLocked, kaynağın penceredeki olaylarını üç kural açısından değerlendirir.
+func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time.Time) bool {
+	type portAgg struct {
+		count   int
+		ipCount map[string]int
+	}
+	portMap := make(map[uint16]*portAgg)            // hedef port → toplam akış + farklı hedef IP'ler
+	portsPerDst := make(map[string]map[uint16]bool) // hedef IP → farklı portlar
+
+	for _, e := range sa.events {
+		pa := portMap[e.dstPort]
+		if pa == nil {
+			pa = &portAgg{ipCount: make(map[string]int)}
+			portMap[e.dstPort] = pa
+		}
+		pa.count++
+		pa.ipCount[e.dstIP]++
+
+		ps := portsPerDst[e.dstIP]
+		if ps == nil {
+			ps = make(map[uint16]bool)
+			portsPerDst[e.dstIP] = ps
+		}
+		ps[e.dstPort] = true
+	}
+
+	windowSec := int(threatWindow.Seconds())
+	changed := false
+
+	// Kural 1 — Brute-force / servis flood: hassas bir porta çok sayıda akış.
+	for port, pa := range portMap {
+		svc, sensitive := sensitiveServicePorts[port]
+		if !sensitive || pa.count < threatBruteforceMin {
+			continue
+		}
+		target, hostN := dominantTarget(pa.ipCount)
+		var detail string
+		if hostN > 1 {
+			detail = fmt.Sprintf("%s son %d sn içinde %d hedefte %s (%d) portuna %d bağlantı denemesi yaptı.",
+				src, windowSec, hostN, svc, port, pa.count)
+		} else {
+			detail = fmt.Sprintf("%s son %d sn içinde %s:%d hedefine %d bağlantı denemesi yaptı.",
+				src, windowSec, target, port, pa.count)
+		}
+		if t.upsertLocked(&threatAlert{
+			id:       src + "|bruteforce|" + strconv.Itoa(int(port)),
+			rule:     "bruteforce",
+			severity: "high",
+			title:    svc + " brute-force denemesi",
+			srcIP:    src,
+			target:   target,
+			port:     port,
+			service:  svc,
+			count:    pa.count,
+			detail:   detail,
+		}, now) {
+			changed = true
+		}
+	}
+
+	// Kural 2 — Dikey port tarama: tek hedefte çok sayıda farklı port.
+	for dstIP, ports := range portsPerDst {
+		if len(ports) < threatPortScanMin {
+			continue
+		}
+		if t.upsertLocked(&threatAlert{
+			id:       src + "|portscan|" + dstIP,
+			rule:     "portscan",
+			severity: "medium",
+			title:    "Dikey port tarama",
+			srcIP:    src,
+			target:   dstIP,
+			count:    len(ports),
+			detail: fmt.Sprintf("%s son %d sn içinde %s üzerinde %d farklı porta erişti.",
+				src, windowSec, dstIP, len(ports)),
+		}, now) {
+			changed = true
+		}
+	}
+
+	// Kural 3 — Yatay host tarama: tek portu çok sayıda farklı hedefte deneme.
+	for port, pa := range portMap {
+		if len(pa.ipCount) < threatHostSweepMin {
+			continue
+		}
+		svc := sensitiveServicePorts[port]
+		if t.upsertLocked(&threatAlert{
+			id:       src + "|hostsweep|" + strconv.Itoa(int(port)),
+			rule:     "hostsweep",
+			severity: "medium",
+			title:    "Yatay host tarama",
+			srcIP:    src,
+			target:   strconv.Itoa(len(pa.ipCount)) + " host",
+			port:     port,
+			service:  svc,
+			count:    len(pa.ipCount),
+			detail: fmt.Sprintf("%s son %d sn içinde %s portunu %d farklı hedefte taradı.",
+				src, windowSec, portLabel(port), len(pa.ipCount)),
+		}, now) {
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// upsertLocked, uyarıyı ekler ya da mevcut olanı günceller. Yeni uyarı veya
+// sayacın artması "değişiklik" sayılır (yayın tetikler).
+func (t *ThreatAnalyzer) upsertLocked(a *threatAlert, now time.Time) bool {
+	if existing := t.alerts[a.id]; existing != nil {
+		grew := a.count > existing.count
+		existing.count = a.count
+		existing.target = a.target
+		existing.detail = a.detail
+		existing.severity = a.severity
+		existing.lastSeen = now
+		return grew
+	}
+	a.firstSeen = now
+	a.lastSeen = now
+	if len(t.alerts) >= threatMaxAlerts {
+		t.evictOldestAlertLocked()
+	}
+	t.alerts[a.id] = a
+	return true
+}
+
+func (t *ThreatAnalyzer) snapshotAlertsLocked() []ThreatAlert {
+	list := make([]*threatAlert, 0, len(t.alerts))
+	for _, a := range t.alerts {
+		list = append(list, a)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].severity != list[j].severity {
+			return severityRank(list[i].severity) > severityRank(list[j].severity)
+		}
+		return list[i].lastSeen.After(list[j].lastSeen)
+	})
+	out := make([]ThreatAlert, 0, len(list))
+	for _, a := range list {
+		out = append(out, ThreatAlert{
+			Rule:      a.rule,
+			Severity:  a.severity,
+			Title:     a.title,
+			SrcIP:     a.srcIP,
+			Target:    a.target,
+			Port:      a.port,
+			Service:   a.service,
+			Count:     a.count,
+			FirstSeen: a.firstSeen.Format(time.RFC3339),
+			LastSeen:  a.lastSeen.Format(time.RFC3339),
+			Detail:    a.detail,
+		})
+	}
+	return out
+}
+
+func (t *ThreatAnalyzer) evictOldestAlertLocked() {
+	var oldestID string
+	var oldest time.Time
+	for id, a := range t.alerts {
+		if oldestID == "" || a.lastSeen.Before(oldest) {
+			oldestID = id
+			oldest = a.lastSeen
+		}
+	}
+	if oldestID != "" {
+		delete(t.alerts, oldestID)
+	}
+}
+
+func (t *ThreatAnalyzer) evictIdleSourceLocked(now time.Time) {
+	var oldestSrc string
+	var oldest time.Time
+	for src, sa := range t.sources {
+		if oldestSrc == "" || sa.lastSeen.Before(oldest) {
+			oldestSrc = src
+			oldest = sa.lastSeen
+		}
+	}
+	if oldestSrc != "" {
+		delete(t.sources, oldestSrc)
+	}
+}
+
+func pruneEvents(sa *sourceActivity, now time.Time) {
+	cutoff := now.Add(-threatWindow)
+	idx := 0
+	for idx < len(sa.events) && sa.events[idx].ts.Before(cutoff) {
+		idx++
+	}
+	if idx > 0 {
+		sa.events = append([]flowEvent(nil), sa.events[idx:]...)
+	}
+}
+
+// dominantTarget, en çok hedeflenen IP'yi ve farklı hedef sayısını döndürür.
+func dominantTarget(ipCount map[string]int) (string, int) {
+	best := ""
+	bestN := -1
+	for ip, n := range ipCount {
+		if n > bestN {
+			best = ip
+			bestN = n
+		}
+	}
+	return best, len(ipCount)
+}
+
+func portLabel(port uint16) string {
+	if svc, ok := sensitiveServicePorts[port]; ok {
+		return fmt.Sprintf("%s (%d)", svc, port)
+	}
+	return strconv.Itoa(int(port))
+}
+
+func severityRank(sev string) int {
+	switch sev {
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	httpListener, err := net.Listen("tcp", a.cfg.DashboardAddress)
 	if err != nil {
@@ -540,6 +950,21 @@ func (a *App) Run(ctx context.Context) error {
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 		_ = pc.Close()
+	}()
+
+	// Tehdit analizcisinin bakım döngüsü: boşta kalan kaynakları ve süresi dolan
+	// uyarıları arka planda periyodik olarak temizler.
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.analyzer.Maintain()
+			}
+		}
 	}()
 
 	log.Printf("listening for NetFlow v9 on %s", a.cfg.ListenAddress)
@@ -1501,6 +1926,8 @@ func (h *HourlyLogger) Write(record FlowRecord) error {
 		return err
 	}
 
+	h.analyzer.Observe(record)
+
 	line := formatFlowRecord(record)
 	if _, err := h.file.WriteString(line + "\n"); err != nil {
 		return fmt.Errorf("write log line failed: %w", err)
@@ -2330,6 +2757,278 @@ const dashboardHTML = `<!DOCTYPE html>
       .alert-pulse { animation: none; }
     }
 
+    /* Ribbon tehdit rozeti */
+    .threat-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 24px;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--neon-green);
+      background: rgba(43,255,136,0.12);
+      border: 1px solid rgba(43,255,136,0.4);
+      transition: 0.2s ease;
+    }
+
+    .threat-badge.active {
+      color: #fff;
+      background: rgba(255,93,122,0.22);
+      border-color: var(--danger);
+      box-shadow: 0 0 10px rgba(255,93,122,0.5), 0 0 22px rgba(255,93,122,0.28);
+      animation: threatPulse 1.5s ease-out infinite;
+    }
+
+    @keyframes threatPulse {
+      0%   { box-shadow: 0 0 0 0 rgba(255,93,122,0.5), 0 0 12px rgba(255,93,122,0.7); }
+      70%  { box-shadow: 0 0 0 8px rgba(255,93,122,0), 0 0 12px rgba(255,93,122,0.7); }
+      100% { box-shadow: 0 0 0 0 rgba(255,93,122,0), 0 0 12px rgba(255,93,122,0.7); }
+    }
+
+    /* Güvenlik izleme paneli */
+    .threat-card {
+      position: relative;
+      background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
+      border: 1px solid var(--border-soft);
+      border-radius: 22px;
+      box-shadow: var(--shadow), 0 0 24px rgba(43,255,136,0.06);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      padding: 18px 22px 20px 22px;
+      transition: border-color 0.25s ease, box-shadow 0.25s ease;
+    }
+
+    .threat-card.has-threats {
+      border-color: rgba(255,93,122,0.42);
+      box-shadow: var(--shadow), 0 0 30px rgba(255,93,122,0.14);
+    }
+
+    .threat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .threat-heading {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .threat-mark {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 38px;
+      height: 38px;
+      flex-shrink: 0;
+      border-radius: 12px;
+      color: var(--neon-green);
+      background: rgba(43,255,136,0.10);
+      border: 1px solid rgba(43,255,136,0.32);
+      box-shadow: inset 0 0 12px rgba(43,255,136,0.10);
+    }
+
+    .threat-card.has-threats .threat-mark {
+      color: var(--danger);
+      background: rgba(255,93,122,0.12);
+      border-color: rgba(255,93,122,0.38);
+      box-shadow: inset 0 0 12px rgba(255,93,122,0.12);
+    }
+
+    .threat-mark svg { width: 21px; height: 21px; }
+
+    .threat-title {
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: #fff;
+    }
+
+    .threat-count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+      background: rgba(255,93,122,0.22);
+      border: 1px solid var(--danger);
+      box-shadow: 0 0 10px rgba(255,93,122,0.4);
+    }
+
+    .threat-subtitle {
+      margin: 3px 0 0 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .threat-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .threat-status.ok {
+      color: var(--neon-green);
+      background: rgba(43,255,136,0.10);
+      border: 1px solid rgba(43,255,136,0.35);
+    }
+
+    .threat-status.alert {
+      color: #fff;
+      background: rgba(255,93,122,0.20);
+      border: 1px solid var(--danger);
+      box-shadow: 0 0 12px rgba(255,93,122,0.35);
+    }
+
+    .threat-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .threat-empty {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 4px 6px 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .threat-empty svg { width: 20px; height: 20px; color: var(--neon-green); flex-shrink: 0; }
+    .threat-empty[hidden], .threat-count[hidden] { display: none; }
+
+    .threat-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(148,163,184,0.10);
+      border-left-width: 3px;
+    }
+
+    .threat-item.high {
+      border-color: rgba(255,93,122,0.16);
+      border-left-color: var(--danger);
+      background: linear-gradient(180deg, rgba(255,93,122,0.07), rgba(255,255,255,0.01));
+    }
+
+    .threat-item.medium {
+      border-color: rgba(255,176,32,0.16);
+      border-left-color: var(--neon-amber);
+      background: linear-gradient(180deg, rgba(255,176,32,0.06), rgba(255,255,255,0.01));
+    }
+
+    .threat-sev {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      min-width: 58px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .threat-item.high .threat-sev {
+      color: #fff;
+      background: rgba(255,93,122,0.22);
+      border: 1px solid var(--danger);
+      box-shadow: 0 0 10px rgba(255,93,122,0.35);
+    }
+
+    .threat-item.medium .threat-sev {
+      color: #1c1407;
+      background: var(--neon-amber);
+      border: 1px solid var(--neon-amber);
+      box-shadow: 0 0 10px rgba(255,176,32,0.35);
+    }
+
+    .threat-body { min-width: 0; flex: 1; }
+
+    .threat-item-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .threat-hits {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--neon-amber);
+      font-variant-numeric: tabular-nums;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: rgba(255,176,32,0.10);
+      border: 1px solid rgba(255,176,32,0.30);
+    }
+
+    .threat-item.high .threat-hits {
+      color: #ffb4c2;
+      background: rgba(255,93,122,0.12);
+      border-color: rgba(255,93,122,0.32);
+    }
+
+    .threat-meta {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .threat-meta .mono {
+      color: var(--neon-blue);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .threat-time {
+      flex-shrink: 0;
+      font-size: 11px;
+      color: var(--muted-2);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      padding-top: 2px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .threat-badge.active { animation: none; }
+    }
+
+    @media (max-width: 560px) {
+      .threat-item { flex-wrap: wrap; }
+      .threat-time { width: 100%; padding-top: 0; }
+    }
+
     .table-card {
       position: relative;
       background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
@@ -2708,6 +3407,14 @@ const dashboardHTML = `<!DOCTYPE html>
           <span class="ribbon-label">Bütünlük</span>
           <span class="seal-badge" id="seal-badge">Bekliyor</span>
         </span>
+        <span class="ribbon-sep" aria-hidden="true"></span>
+        <span class="ribbon-item">
+          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+          </svg>
+          <span class="ribbon-label">Tehdit</span>
+          <span class="threat-badge" id="threat-badge">0</span>
+        </span>
       </div>
 
       <div class="hero-grid">
@@ -2779,6 +3486,33 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
       <span class="alert-pulse" aria-hidden="true"></span>
     </div>
+
+    <section class="threat-card" id="threat-card">
+      <div class="threat-header">
+        <div class="threat-heading">
+          <span class="threat-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+            </svg>
+          </span>
+          <div>
+            <h2 class="threat-title">Güvenlik izleme
+              <span class="threat-count" id="threat-count" hidden>0</span>
+            </h2>
+            <p class="threat-subtitle">Akış trafiği arka planda sürekli analiz edilir; brute-force ve port/host tarama denemeleri tespit edilir.</p>
+          </div>
+        </div>
+        <span class="threat-status ok" id="threat-status">Şüpheli aktivite yok</span>
+      </div>
+      <div class="threat-list" id="threat-list">
+        <div class="threat-empty" id="threat-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M9 12l2 2 4-4"/>
+          </svg>
+          <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
+        </div>
+      </div>
+    </section>
 
     <section class="table-card">
       <div class="table-card-header">
@@ -2864,6 +3598,12 @@ const dashboardHTML = `<!DOCTYPE html>
     const copyShaEl = document.getElementById('copy-sha');
     const noDataEl = document.getElementById('no-data-alert');
     const noDataDetailEl = document.getElementById('no-data-detail');
+    const threatCardEl = document.getElementById('threat-card');
+    const threatListEl = document.getElementById('threat-list');
+    const threatEmptyEl = document.getElementById('threat-empty');
+    const threatCountEl = document.getElementById('threat-count');
+    const threatStatusEl = document.getElementById('threat-status');
+    const threatBadgeEl = document.getElementById('threat-badge');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -3388,6 +4128,65 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
+    const THREAT_RULE_LABELS = {
+      bruteforce: 'Brute-force',
+      portscan: 'Port tarama',
+      hostsweep: 'Host tarama'
+    };
+    let lastThreatSig = null;
+
+    // Güvenlik panelini ve ribbon tehdit rozetini gelen uyarı listesine göre günceller.
+    function updateThreats(threats) {
+      const list = Array.isArray(threats) ? threats : [];
+      const count = list.length;
+
+      if (threatBadgeEl) {
+        threatBadgeEl.textContent = String(count);
+        threatBadgeEl.classList.toggle('active', count > 0);
+      }
+      threatCardEl.classList.toggle('has-threats', count > 0);
+      if (threatCountEl) {
+        threatCountEl.textContent = String(count);
+        threatCountEl.hidden = count === 0;
+      }
+      if (threatStatusEl) {
+        threatStatusEl.textContent = count > 0 ? (count + ' aktif uyarı') : 'Şüpheli aktivite yok';
+        threatStatusEl.className = 'threat-status ' + (count > 0 ? 'alert' : 'ok');
+      }
+
+      // Gereksiz DOM yenilemesini önlemek için imza karşılaştırması.
+      const sig = JSON.stringify(list);
+      if (sig === lastThreatSig) {
+        return;
+      }
+      lastThreatSig = sig;
+
+      Array.prototype.slice.call(threatListEl.querySelectorAll('.threat-item')).forEach(function(n){ n.remove(); });
+
+      if (count === 0) {
+        if (threatEmptyEl) threatEmptyEl.hidden = false;
+        return;
+      }
+      if (threatEmptyEl) threatEmptyEl.hidden = true;
+
+      const rows = list.map(function(a){
+        const sev = a.severity === 'high' ? 'high' : 'medium';
+        const sevLabel = sev === 'high' ? 'Yüksek' : 'Orta';
+        const rule = THREAT_RULE_LABELS[a.rule] || 'Şüpheli';
+        const hits = a.count ? '<span class="threat-hits">' + escapeHtml(String(a.count)) + '×</span>' : '';
+        const detail = a.detail ? escapeHtml(a.detail) : (rule + ' tespit edildi.');
+        return '<div class="threat-item ' + sev + '">'
+          + '<span class="threat-sev">' + sevLabel + '</span>'
+          + '<div class="threat-body">'
+          +   '<div class="threat-item-title">' + escapeHtml(a.title || rule) + hits + '</div>'
+          +   '<div class="threat-meta">' + detail + '</div>'
+          + '</div>'
+          + '<span class="threat-time">' + escapeHtml(formatTime(a.last_seen || '')) + '</span>'
+          + '</div>';
+      }).join('');
+      threatListEl.insertAdjacentHTML('beforeend', rows);
+    }
+
     let renderFrame = null;
     let pendingState = null;
 
@@ -3407,6 +4206,9 @@ const dashboardHTML = `<!DOCTYPE html>
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
       updateIntegrity(state);
+      if (Array.isArray(state.threats)) {
+        updateThreats(state.threats);
+      }
       const isLive = (state.mode || 'live') === 'live';
       if (isLive) {
         updateThroughput(state);
