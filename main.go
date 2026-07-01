@@ -1903,6 +1903,79 @@ const dashboardHTML = `<!DOCTYPE html>
       flex-wrap: wrap;
     }
 
+    .status-ribbon {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 4px 2px;
+      padding: 8px 12px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(8,12,22,0.7), rgba(6,9,18,0.78));
+      border: 1px solid var(--border-soft);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    }
+
+    .ribbon-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      padding: 2px 8px;
+    }
+
+    .ribbon-conn { padding-left: 2px; }
+
+    .ribbon-item .status-badge,
+    .ribbon-item .seal-badge {
+      min-height: 26px;
+    }
+
+    .ribbon-item .status-badge {
+      padding: 0 12px;
+      font-size: 12px;
+    }
+
+    .ribbon-ico {
+      width: 15px;
+      height: 15px;
+      flex-shrink: 0;
+      color: var(--accent);
+      opacity: 0.82;
+    }
+
+    .ribbon-label {
+      color: var(--muted-2);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .ribbon-value {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .ribbon-file { flex: 1 1 auto; min-width: 100px; }
+    .ribbon-file .ribbon-value {
+      max-width: 100%;
+      color: var(--neon-blue);
+      text-shadow: 0 0 8px rgba(56,189,248,0.3);
+    }
+
+    .ribbon-sep {
+      width: 1px;
+      height: 18px;
+      flex-shrink: 0;
+      background: linear-gradient(180deg, transparent, rgba(148,163,184,0.28), transparent);
+    }
+
     .hero-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2111,7 +2184,7 @@ const dashboardHTML = `<!DOCTYPE html>
     .copy-btn:disabled { opacity: 0.4; cursor: default; }
     .copy-btn.copied { color: #052e16; border-color: var(--neon-green); background: var(--neon-green); box-shadow: var(--glow-green); }
 
-    .stat-card.sizes { gap: 10px; }
+    .stat-card.sizes { gap: 10px; grid-column: span 2; }
 
     .status-label {
       color: var(--muted-2);
@@ -2562,11 +2635,17 @@ const dashboardHTML = `<!DOCTYPE html>
       .toolbar { width: 100%; }
       .field { width: 100%; }
       .hero-controls { width: 100%; }
+      .ribbon-file { flex-basis: 100%; }
     }
 
     @media (max-width: 560px) {
       .hero-grid { grid-template-columns: 1fr; }
+      .stat-card.sizes { grid-column: auto; }
       .file-sizes-grid { grid-template-columns: repeat(2, 1fr); }
+      .status-ribbon { gap: 6px 4px; }
+      .ribbon-sep { display: none; }
+      .ribbon-item { flex-basis: calc(50% - 4px); }
+      .ribbon-conn { flex-basis: 100%; }
     }
   </style>
 </head>
@@ -2586,9 +2665,38 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
         </div>
         <div class="hero-controls">
-          <span class="status-badge" id="connection" role="status" aria-live="polite">Bağlanıyor</span>
           <button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button>
         </div>
+      </div>
+
+      <div class="status-ribbon" role="status" aria-live="polite">
+        <span class="ribbon-item ribbon-conn">
+          <span class="status-badge" id="connection">Bağlanıyor</span>
+        </span>
+        <span class="ribbon-sep" aria-hidden="true"></span>
+        <span class="ribbon-item">
+          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
+          </svg>
+          <span class="ribbon-label">Son güncelleme</span>
+          <span class="ribbon-value mono" id="updated-at">-</span>
+        </span>
+        <span class="ribbon-sep" aria-hidden="true"></span>
+        <span class="ribbon-item ribbon-file">
+          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 3v5h5"/><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+          </svg>
+          <span class="ribbon-label">Aktif dosya</span>
+          <span class="ribbon-value mono" id="active-file" title="Aktif log dosyası">-</span>
+        </span>
+        <span class="ribbon-sep" aria-hidden="true"></span>
+        <span class="ribbon-item">
+          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>
+          </svg>
+          <span class="ribbon-label">Bütünlük</span>
+          <span class="seal-badge" id="seal-badge">Bekliyor</span>
+        </span>
       </div>
 
       <div class="hero-grid">
@@ -2608,16 +2716,9 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="stat-card">
-          <div class="stat-head"><span class="status-label">Son güncelleme</span></div>
-          <div class="stat-main"><span class="stat-number sm mono" id="updated-at">-</span></div>
-          <div class="stat-foot" id="active-file" title="Aktif log dosyası">Aktif dosya: -</div>
-        </div>
-
         <div class="stat-card integrity">
           <div class="stat-head">
             <span class="status-label">Bütünlük mührü</span>
-            <span class="seal-badge" id="seal-badge">Bekliyor</span>
           </div>
           <div class="seal-sha-row">
             <code class="seal-sha mono" id="seal-sha" title="Son SHA-256 özeti">SHA-256 henüz yok</code>
@@ -2984,7 +3085,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function updateIntegrity(state) {
       const file = state.active_file || '';
-      activeFileEl.textContent = 'Aktif dosya: ' + (basename(file) || '-');
+      activeFileEl.textContent = basename(file) || '-';
       activeFileEl.title = file || 'Aktif log dosyası';
 
       const sha = state.last_sha256 || '';
