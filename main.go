@@ -2543,6 +2543,35 @@ const dashboardHTML = `<!DOCTYPE html>
       text-shadow: 0 0 8px rgba(255,176,32,0.5);
     }
 
+    .cell-proto { white-space: nowrap; }
+    .cell-proto .proto { min-width: 52px; }
+
+    .svc {
+      display: inline-flex;
+      align-items: center;
+      margin-left: 6px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      color: var(--neon-purple);
+      background: rgba(176,107,255,0.10);
+      border: 1px solid rgba(176,107,255,0.38);
+      box-shadow: 0 0 10px rgba(176,107,255,0.16), inset 0 0 6px rgba(176,107,255,0.08);
+      text-shadow: 0 0 8px rgba(176,107,255,0.4);
+      vertical-align: middle;
+      cursor: default;
+    }
+
+    .svc.secure {
+      color: var(--neon-green);
+      background: rgba(43,255,136,0.10);
+      border-color: rgba(43,255,136,0.40);
+      box-shadow: 0 0 10px rgba(43,255,136,0.16), inset 0 0 6px rgba(43,255,136,0.08);
+      text-shadow: 0 0 8px rgba(43,255,136,0.4);
+    }
+
     .empty {
       padding: 44px 28px 54px 28px;
       text-align: center;
@@ -3145,17 +3174,68 @@ const dashboardHTML = `<!DOCTYPE html>
         .replaceAll("'", '&#39;');
     }
 
+    // Yaygın (well-known) portlar → servis adı eşlemesi. Yalnızca arayüzde
+    // gösterim amaçlı; log dosyalarına yazılmaz.
+    const PORT_SERVICES = {
+      20: 'FTP', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP',
+      43: 'WHOIS', 53: 'DNS', 67: 'DHCP', 68: 'DHCP', 69: 'TFTP',
+      80: 'HTTP', 88: 'Kerberos', 110: 'POP3', 111: 'RPC', 119: 'NNTP',
+      123: 'NTP', 135: 'RPC', 137: 'NetBIOS', 138: 'NetBIOS', 139: 'NetBIOS',
+      143: 'IMAP', 161: 'SNMP', 162: 'SNMP', 179: 'BGP', 194: 'IRC',
+      389: 'LDAP', 443: 'HTTPS', 445: 'SMB', 465: 'SMTPS', 500: 'IKE',
+      514: 'Syslog', 515: 'LPD', 520: 'RIP', 546: 'DHCPv6', 547: 'DHCPv6',
+      587: 'SMTP', 623: 'IPMI', 636: 'LDAPS', 853: 'DoT', 873: 'rsync',
+      989: 'FTPS', 990: 'FTPS', 993: 'IMAPS', 995: 'POP3S', 1080: 'SOCKS',
+      1194: 'OpenVPN', 1433: 'MSSQL', 1521: 'Oracle', 1701: 'L2TP',
+      1723: 'PPTP', 1812: 'RADIUS', 1813: 'RADIUS', 1883: 'MQTT',
+      1900: 'SSDP', 2049: 'NFS', 3128: 'Proxy', 3268: 'LDAP', 3306: 'MySQL',
+      3389: 'RDP', 3478: 'STUN', 4500: 'IPsec', 5060: 'SIP', 5061: 'SIP-TLS',
+      5222: 'XMPP', 5353: 'mDNS', 5432: 'PostgreSQL', 5900: 'VNC',
+      5938: 'TeamViewer', 6379: 'Redis', 6443: 'K8s-API', 8000: 'HTTP-Alt',
+      8080: 'HTTP-Alt', 8443: 'HTTPS-Alt', 8883: 'MQTT-TLS', 8888: 'HTTP-Alt',
+      9092: 'Kafka', 9200: 'Elastic', 9300: 'Elastic', 10000: 'Webmin',
+      11211: 'Memcached', 27017: 'MongoDB', 51820: 'WireGuard'
+    };
+
+    // Şifreli/güvenli servisler (yeşil rozetle vurgulanır).
+    const SECURE_SERVICES = {
+      'SSH': 1, 'HTTPS': 1, 'HTTPS-Alt': 1, 'SMTPS': 1, 'IMAPS': 1,
+      'POP3S': 1, 'LDAPS': 1, 'FTPS': 1, 'DoT': 1, 'SIP-TLS': 1,
+      'MQTT-TLS': 1, 'OpenVPN': 1, 'WireGuard': 1, 'IPsec': 1, 'IKE': 1
+    };
+
+    // Kaynak ve hedef portlardan servisi tespit eder. Sunucu portu genelde
+    // küçük/bilinen olandır; iki port da eşleşiyorsa küçük port numarasını baz alır.
+    function lookupService(srcPort, dstPort) {
+      const s = PORT_SERVICES[srcPort];
+      const d = PORT_SERVICES[dstPort];
+      let name = '', port = '';
+      if (s && d) {
+        if (parseInt(srcPort, 10) <= parseInt(dstPort, 10)) { name = s; port = srcPort; }
+        else { name = d; port = dstPort; }
+      } else if (d) { name = d; port = dstPort; }
+      else if (s) { name = s; port = srcPort; }
+      if (!name) return null;
+      return { name, port, secure: !!SECURE_SERVICES[name] };
+    }
+
     function parseRecord(record) {
       const parts = String(record || '').split('|');
       const proto = (parts[5] || '-').toUpperCase();
+      const srcPort = parts[3] || '-';
+      const dstPort = parts[4] || '-';
+      const svc = lookupService(srcPort, dstPort);
       return {
         time: formatTime(parts[0] || ''),
         srcIp: parts[1] || '-',
-        srcPort: parts[3] || '-',
+        srcPort,
         dstIp: parts[2] || '-',
-        dstPort: parts[4] || '-',
+        dstPort,
         proto,
         protoClass: proto.toLowerCase(),
+        service: svc ? svc.name : '',
+        servicePort: svc ? svc.port : '',
+        serviceSecure: svc ? svc.secure : false,
         size: formatBytes(parts[7] || '0')
       };
     }
@@ -3169,7 +3249,10 @@ const dashboardHTML = `<!DOCTYPE html>
         '<td class="mono cell-port-src">' + escapeHtml(item.srcPort) + '</td>',
         '<td class="mono cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>',
         '<td class="mono cell-port-dst">' + escapeHtml(item.dstPort) + '</td>',
-        '<td><span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span></td>',
+        '<td class="cell-proto">'
+          + '<span class="proto ' + escapeHtml(item.protoClass) + '">' + escapeHtml(item.proto) + '</span>'
+          + (item.service ? '<span class="svc' + (item.serviceSecure ? ' secure' : '') + '" title="Port ' + escapeHtml(item.servicePort) + ' · ' + escapeHtml(item.service) + '">' + escapeHtml(item.service) + '</span>' : '')
+          + '</td>',
         '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>',
         '</tr>'
       ].join('');
