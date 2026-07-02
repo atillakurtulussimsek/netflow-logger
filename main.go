@@ -3020,8 +3020,126 @@ const dashboardHTML = `<!DOCTYPE html>
       padding-top: 2px;
     }
 
+    /* Güvenlik uyarıları — üst kontrol butonu */
+    .threat-toggle {
+      gap: 8px;
+      position: relative;
+    }
+
+    .threat-toggle svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .threat-toggle-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      background: rgba(255,93,122,0.9);
+      border: 1px solid var(--danger);
+    }
+
+    .threat-toggle-badge[hidden] { display: none; }
+
+    .threat-toggle.active {
+      color: #fff;
+      border-color: var(--danger);
+      background: rgba(255,93,122,0.16);
+      box-shadow: 0 0 10px rgba(255,93,122,0.4);
+      animation: threatPulse 1.5s ease-out infinite;
+    }
+
+    .threat-toggle.active:hover {
+      color: #fff;
+      border-color: var(--danger);
+      background: rgba(255,93,122,0.24);
+      box-shadow: 0 0 12px rgba(255,93,122,0.5);
+    }
+
+    /* Güvenlik uyarıları — açılır modal */
+    .threat-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 120;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 7vh 20px 24px 20px;
+      overflow-y: auto;
+    }
+
+    .threat-modal[hidden] { display: none; }
+
+    .threat-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(4,7,14,0.66);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      animation: threatFade 0.2s ease;
+    }
+
+    .threat-modal-panel {
+      position: relative;
+      width: 100%;
+      max-width: 720px;
+      margin: 0 auto;
+      animation: threatPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .threat-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      color: var(--muted);
+      background: rgba(148,163,184,0.08);
+      border: 1px solid rgba(148,163,184,0.18);
+      cursor: pointer;
+      transition: 0.2s ease;
+    }
+
+    .threat-close svg { width: 16px; height: 16px; }
+
+    .threat-close:hover {
+      color: #fff;
+      border-color: rgba(255,93,122,0.5);
+      background: rgba(255,93,122,0.16);
+    }
+
+    .threat-modal .threat-list {
+      max-height: 62vh;
+      overflow-y: auto;
+    }
+
+    @keyframes threatFade {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    @keyframes threatPop {
+      from { opacity: 0; transform: translateY(-12px) scale(0.98); }
+      to   { opacity: 1; transform: none; }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       .threat-badge.active { animation: none; }
+      .threat-toggle.active { animation: none; }
+      .threat-modal-backdrop,
+      .threat-modal-panel { animation: none; }
     }
 
     @media (max-width: 560px) {
@@ -3376,6 +3494,13 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
         <div class="hero-controls">
           <button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button>
+          <button type="button" class="mode-button threat-toggle" id="threat-toggle" aria-haspopup="dialog" aria-expanded="false" title="Güvenlik uyarılarını göster">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+            </svg>
+            <span>Güvenlik uyarıları</span>
+            <span class="threat-toggle-badge" id="threat-toggle-count" hidden>0</span>
+          </button>
         </div>
       </div>
 
@@ -3487,32 +3612,40 @@ const dashboardHTML = `<!DOCTYPE html>
       <span class="alert-pulse" aria-hidden="true"></span>
     </div>
 
-    <section class="threat-card" id="threat-card">
-      <div class="threat-header">
-        <div class="threat-heading">
-          <span class="threat-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+    <div class="threat-modal" id="threat-modal" hidden>
+      <div class="threat-modal-backdrop" data-threat-close></div>
+      <section class="threat-card threat-modal-panel" id="threat-card" role="dialog" aria-modal="true" aria-labelledby="threat-modal-title">
+        <button type="button" class="threat-close" data-threat-close aria-label="Güvenlik panelini kapat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+          </svg>
+        </button>
+        <div class="threat-header">
+          <div class="threat-heading">
+            <span class="threat-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+              </svg>
+            </span>
+            <div>
+              <h2 class="threat-title" id="threat-modal-title">Güvenlik izleme
+                <span class="threat-count" id="threat-count" hidden>0</span>
+              </h2>
+              <p class="threat-subtitle">Akış trafiği arka planda sürekli analiz edilir; brute-force ve port/host tarama denemeleri tespit edilir.</p>
+            </div>
+          </div>
+          <span class="threat-status ok" id="threat-status">Şüpheli aktivite yok</span>
+        </div>
+        <div class="threat-list" id="threat-list">
+          <div class="threat-empty" id="threat-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M9 12l2 2 4-4"/>
             </svg>
-          </span>
-          <div>
-            <h2 class="threat-title">Güvenlik izleme
-              <span class="threat-count" id="threat-count" hidden>0</span>
-            </h2>
-            <p class="threat-subtitle">Akış trafiği arka planda sürekli analiz edilir; brute-force ve port/host tarama denemeleri tespit edilir.</p>
+            <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
           </div>
         </div>
-        <span class="threat-status ok" id="threat-status">Şüpheli aktivite yok</span>
-      </div>
-      <div class="threat-list" id="threat-list">
-        <div class="threat-empty" id="threat-empty">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M9 12l2 2 4-4"/>
-          </svg>
-          <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
-        </div>
-      </div>
-    </section>
+      </section>
+    </div>
 
     <section class="table-card">
       <div class="table-card-header">
@@ -3604,6 +3737,9 @@ const dashboardHTML = `<!DOCTYPE html>
     const threatCountEl = document.getElementById('threat-count');
     const threatStatusEl = document.getElementById('threat-status');
     const threatBadgeEl = document.getElementById('threat-badge');
+    const threatModalEl = document.getElementById('threat-modal');
+    const threatToggleEl = document.getElementById('threat-toggle');
+    const threatToggleCountEl = document.getElementById('threat-toggle-count');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -4144,6 +4280,16 @@ const dashboardHTML = `<!DOCTYPE html>
         threatBadgeEl.textContent = String(count);
         threatBadgeEl.classList.toggle('active', count > 0);
       }
+      if (threatToggleEl) {
+        threatToggleEl.classList.toggle('active', count > 0);
+        threatToggleEl.title = count > 0
+          ? (count + ' aktif güvenlik uyarısı — görüntülemek için tıkla')
+          : 'Güvenlik uyarılarını göster';
+      }
+      if (threatToggleCountEl) {
+        threatToggleCountEl.textContent = String(count);
+        threatToggleCountEl.hidden = count === 0;
+      }
       threatCardEl.classList.toggle('has-threats', count > 0);
       if (threatCountEl) {
         threatCountEl.textContent = String(count);
@@ -4393,6 +4539,7 @@ const dashboardHTML = `<!DOCTYPE html>
     });
 
     liveToggleEl.addEventListener('click', async () => {
+      closeThreatModal();
       currentMode = 'live';
       currentPage = 1;
       dateSelectEl.value = '';
@@ -4400,6 +4547,66 @@ const dashboardHTML = `<!DOCTYPE html>
       hourSelectEl.disabled = true;
       await fetchState();
       startLiveStream();
+    });
+
+    // Güvenlik uyarıları modalı: üst kontroldeki buton (ve ribbon rozeti) ile
+    // canlı akış ile güvenlik ekranı arasında geçiş sağlar.
+    let threatLastFocus = null;
+
+    function openThreatModal() {
+      if (!threatModalEl || !threatModalEl.hidden) return;
+      threatLastFocus = document.activeElement;
+      threatModalEl.hidden = false;
+      if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'true');
+      const closeBtn = threatModalEl.querySelector('.threat-close');
+      if (closeBtn) closeBtn.focus();
+    }
+
+    function closeThreatModal() {
+      if (!threatModalEl || threatModalEl.hidden) return;
+      threatModalEl.hidden = true;
+      if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'false');
+      if (threatLastFocus && typeof threatLastFocus.focus === 'function') {
+        threatLastFocus.focus();
+      }
+      threatLastFocus = null;
+    }
+
+    function toggleThreatModal() {
+      if (threatModalEl && threatModalEl.hidden) {
+        openThreatModal();
+      } else {
+        closeThreatModal();
+      }
+    }
+
+    if (threatToggleEl) {
+      threatToggleEl.addEventListener('click', toggleThreatModal);
+    }
+    if (threatBadgeEl) {
+      threatBadgeEl.style.cursor = 'pointer';
+      threatBadgeEl.setAttribute('role', 'button');
+      threatBadgeEl.setAttribute('tabindex', '0');
+      threatBadgeEl.setAttribute('title', 'Güvenlik uyarılarını göster');
+      threatBadgeEl.addEventListener('click', openThreatModal);
+      threatBadgeEl.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          openThreatModal();
+        }
+      });
+    }
+    if (threatModalEl) {
+      threatModalEl.addEventListener('click', (event) => {
+        if (event.target.closest('[data-threat-close]')) {
+          closeThreatModal();
+        }
+      });
+    }
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeThreatModal();
+      }
     });
 
     prevPageEl.addEventListener('click', async () => {
