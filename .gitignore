@@ -8,3 +8,6 @@
 /logs/
 *.tsr
 *.sha256
+
+# Çalışma zamanı yapılandırması (whitelist vb.)
+/config.json

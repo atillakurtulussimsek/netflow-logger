@@ -14,6 +14,8 @@ Bu proje, OPNsense üzerinden UDP `9995` portuna gönderilen NetFlow v9 kayıtla
 - HTTP Basic Auth ile korunan kontrol paneli
 - SSE ile canlı güncellenen son 200 log kaydı görünümü
 - Aktif log dosyası, son SHA-256 ve son TSA durumunu panelde izleme
+- Arka planda tehdit analizi (brute-force, dikey/yatay tarama) ve açılır güvenlik paneli
+- Tehdit analizinde görmezden gelinecek kaynak IP/CIDR whitelist'i (`config.json` içinde kalıcı)
 - Ubuntu için otomatik kurulum ve `systemd` servisleştirme desteği
 
 ## Log Satır Formatı
@@ -121,6 +123,31 @@ Kontrol paneli varsayılan olarak `http://127.0.0.1:8080` adresinde çalışır.
 - son 200 log kaydı
 
 Canlı veri akışı SSE ile sağlanır.
+
+## Güvenlik İzleme ve Whitelist
+
+Akış trafiği arka planda sürekli analiz edilir; kayan zaman penceresi içinde tek kaynak IP'nin davranışına bakılarak brute-force, dikey port tarama ve yatay host tarama denemeleri tespit edilir. Uyarılar, üstteki "Canlı SSE akışı" butonunun yanındaki **Güvenlik uyarıları** butonu ile açılan modal içinde gösterilir; aktif uyarı varken buton kırmızı yanıp söner.
+
+Aynı modal içinde bir **whitelist** bölümü bulunur. Buraya eklenen kaynak IP adresleri veya CIDR blokları (ör. `10.0.0.0/24`) tehdit analizinde tamamen yok sayılır; bu kaynaklar için hiç uyarı üretilmez ve whitelist'e eklenen bir kaynağın mevcut uyarısı da anında düşer.
+
+Whitelist girişleri çalışma dizinindeki `config.json` dosyasında kalıcı olarak saklanır ve süreç yeniden başlatıldığında geri yüklenir:
+
+```json
+{
+  "source_ip_whitelist": [
+    "192.168.1.10",
+    "10.0.0.0/24"
+  ]
+}
+```
+
+Whitelist ayrıca HTTP API ile de yönetilebilir (tümü HTTP Basic Auth ile korunur):
+
+- `GET /api/whitelist` — mevcut girişleri listeler
+- `POST /api/whitelist` — gövde `{"entry":"10.0.0.0/24"}` ile giriş ekler
+- `DELETE /api/whitelist?entry=10.0.0.0%2F24` — girişi kaldırır
+
+Girişler eklenirken doğrulanır ve kanonik biçime indirgenir (ör. `10.0.0.5/24` → `10.0.0.0/24`); geçersiz IP/CIDR değerleri `400` ile reddedilir.
 
 ## OPNsense Tarafı
 

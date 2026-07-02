@@ -41,6 +41,7 @@ const (
 	maxPacketSize           = 65535
 	dashboardMaxRecords     = 1000
 	templateCacheFile       = "templates.json"
+	configFile              = "config.json"
 )
 
 // Tehdit tespiti eşikleri. Kayan zaman penceresi içinde tek kaynak IP'nin
@@ -89,6 +90,7 @@ type App struct {
 	logger    *HourlyLogger
 	dashboard *DashboardHub
 	analyzer  *ThreatAnalyzer
+	whitelist *Whitelist
 }
 
 type FlowRecord struct {
@@ -217,12 +219,14 @@ func main() {
 	}
 
 	dashboard := NewDashboardHub(dashboardMaxRecords)
-	analyzer := NewThreatAnalyzer(dashboard)
+	whitelist := NewWhitelist(configFile)
+	analyzer := NewThreatAnalyzer(dashboard, whitelist)
 	app := &App{
 		cfg:       cfg,
 		session:   newPersistentSession(cfg.LogRoot),
 		dashboard: dashboard,
 		analyzer:  analyzer,
+		whitelist: whitelist,
 		logger: &HourlyLogger{
 			cfg:        cfg,
 			httpClient: &http.Client{Timeout: 30 * time.Second},
@@ -607,18 +611,20 @@ type threatAlert struct {
 // ThreatAnalyzer, akışları arka planda sürekli analiz ederek brute-force ve
 // port/host tarama gibi şüpheli desenleri tespit eder.
 type ThreatAnalyzer struct {
-	hub *DashboardHub
+	hub       *DashboardHub
+	whitelist *Whitelist
 
 	mu      sync.Mutex
 	sources map[string]*sourceActivity
 	alerts  map[string]*threatAlert
 }
 
-func NewThreatAnalyzer(hub *DashboardHub) *ThreatAnalyzer {
+func NewThreatAnalyzer(hub *DashboardHub, whitelist *Whitelist) *ThreatAnalyzer {
 	return &ThreatAnalyzer{
-		hub:     hub,
-		sources: make(map[string]*sourceActivity),
-		alerts:  make(map[string]*threatAlert),
+		hub:       hub,
+		whitelist: whitelist,
+		sources:   make(map[string]*sourceActivity),
+		alerts:    make(map[string]*threatAlert),
 	}
 }
 
@@ -626,6 +632,11 @@ func NewThreatAnalyzer(hub *DashboardHub) *ThreatAnalyzer {
 // değerlendirir. Uyarılar değiştiyse hub'a saklar (yayını eşlik eden AddRecord yapar).
 func (t *ThreatAnalyzer) Observe(record FlowRecord) {
 	if t == nil || record.SrcIP == "" {
+		return
+	}
+	// Whitelist'teki kaynaklar (tekil IP ya da CIDR blok) tehdit analizinde
+	// tamamen yok sayılır.
+	if t.whitelist.Contains(record.SrcIP) {
 		return
 	}
 	src := record.SrcIP
@@ -677,6 +688,37 @@ func (t *ThreatAnalyzer) Maintain() {
 	changed := false
 	for id, a := range t.alerts {
 		if now.Sub(a.lastSeen) > threatAlertTTL {
+			delete(t.alerts, id)
+			changed = true
+		}
+	}
+	var snapshot []ThreatAlert
+	if changed {
+		snapshot = t.snapshotAlertsLocked()
+	}
+	t.mu.Unlock()
+
+	if changed {
+		t.hub.PublishThreats(snapshot)
+	}
+}
+
+// PurgeWhitelisted, whitelist'e yeni eklenen bir kaynağa ait izlenen olayları ve
+// aktif uyarıları temizler; değişiklik olduysa paneli anında günceller. Böylece
+// bir IP whitelist'e alındığında mevcut uyarısı da hemen kaybolur.
+func (t *ThreatAnalyzer) PurgeWhitelisted() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	for src := range t.sources {
+		if t.whitelist.Contains(src) {
+			delete(t.sources, src)
+		}
+	}
+	changed := false
+	for id, a := range t.alerts {
+		if t.whitelist.Contains(a.srcIP) {
 			delete(t.alerts, id)
 			changed = true
 		}
@@ -888,6 +930,213 @@ func pruneEvents(sa *sourceActivity, now time.Time) {
 	}
 }
 
+// appConfig, config.json'un tamamını temsil eder. İleride yeni ayarlar
+// eklendiğinde bu yapıya alan eklenmesi yeterlidir.
+type appConfig struct {
+	SourceIPWhitelist []string `json:"source_ip_whitelist"`
+}
+
+// Whitelist, tehdit analizinde görmezden gelinecek kaynak IP adreslerini ve CIDR
+// bloklarını tutar. Girişler config.json içinde kalıcı olarak saklanır ve süreç
+// yeniden başlatıldığında geri yüklenir.
+type Whitelist struct {
+	path string
+
+	mu      sync.RWMutex
+	entries []string     // kullanıcının eklediği sırayla normalize edilmiş girişler
+	ips     map[string]struct{}
+	nets    []*net.IPNet
+}
+
+// NewWhitelist, verilen config.json yolundan whitelist'i yükler (yoksa boş başlar).
+func NewWhitelist(path string) *Whitelist {
+	w := &Whitelist{
+		path: path,
+		ips:  make(map[string]struct{}),
+	}
+	w.load()
+	return w
+}
+
+// load, config.json'daki whitelist girişlerini okuyup dahili indeksleri kurar.
+func (w *Whitelist) load() {
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("config read failed: %v", err)
+		}
+		return
+	}
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("config parse failed: %v", err)
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, raw := range cfg.SourceIPWhitelist {
+		norm, err := normalizeWhitelistEntry(raw)
+		if err != nil {
+			log.Printf("config: geçersiz whitelist girişi atlandı %q: %v", raw, err)
+			continue
+		}
+		w.addNormalizedLocked(norm)
+	}
+}
+
+// Contains, verilen IP adresinin whitelist'te (tekil ya da bir CIDR blok içinde)
+// olup olmadığını döndürür.
+func (w *Whitelist) Contains(ipStr string) bool {
+	if w == nil {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if _, ok := w.ips[ip.String()]; ok {
+		return true
+	}
+	for _, n := range w.nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// Entries, mevcut whitelist girişlerinin kopyasını (eklenme sırasıyla) döndürür.
+func (w *Whitelist) Entries() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return append([]string(nil), w.entries...)
+}
+
+// Add, bir IP adresi veya CIDR bloğunu whitelist'e ekler. Giriş normalize edilir,
+// doğrulanır ve kalıcı olarak kaydedilir. Zaten mevcutsa sessizce başarılı olur.
+func (w *Whitelist) Add(entry string) error {
+	norm, err := normalizeWhitelistEntry(entry)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.addNormalizedLocked(norm) {
+		w.persistLocked()
+	}
+	return nil
+}
+
+// Remove, bir girişi whitelist'ten kaldırır. Giriş normalize edilerek eşleştirilir.
+func (w *Whitelist) Remove(entry string) error {
+	norm, err := normalizeWhitelistEntry(entry)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	idx := -1
+	for i, e := range w.entries {
+		if e == norm {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil
+	}
+	w.entries = append(w.entries[:idx], w.entries[idx+1:]...)
+	w.rebuildLocked()
+	w.persistLocked()
+	return nil
+}
+
+// addNormalizedLocked, normalize edilmiş bir girişi ekler; yeni eklendiyse true
+// döndürür (w.mu kilitli olmalı).
+func (w *Whitelist) addNormalizedLocked(norm string) bool {
+	for _, e := range w.entries {
+		if e == norm {
+			return false
+		}
+	}
+	w.entries = append(w.entries, norm)
+	w.indexEntryLocked(norm)
+	return true
+}
+
+// indexEntryLocked, tek bir girişi arama indekslerine ekler (w.mu kilitli olmalı).
+func (w *Whitelist) indexEntryLocked(norm string) {
+	if strings.Contains(norm, "/") {
+		if _, ipnet, err := net.ParseCIDR(norm); err == nil {
+			w.nets = append(w.nets, ipnet)
+		}
+		return
+	}
+	if ip := net.ParseIP(norm); ip != nil {
+		w.ips[ip.String()] = struct{}{}
+	}
+}
+
+// rebuildLocked, arama indekslerini entries listesinden yeniden kurar (w.mu kilitli olmalı).
+func (w *Whitelist) rebuildLocked() {
+	w.ips = make(map[string]struct{})
+	w.nets = nil
+	for _, e := range w.entries {
+		w.indexEntryLocked(e)
+	}
+}
+
+// persistLocked, whitelist'i config.json'a atomik biçimde yazar (w.mu kilitli olmalı).
+func (w *Whitelist) persistLocked() {
+	cfg := appConfig{SourceIPWhitelist: append([]string(nil), w.entries...)}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		log.Printf("config marshal failed: %v", err)
+		return
+	}
+	if dir := filepath.Dir(w.path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("config dir create failed: %v", err)
+			return
+		}
+	}
+	tmp := w.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("config write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, w.path); err != nil {
+		log.Printf("config rename failed: %v", err)
+	}
+}
+
+// normalizeWhitelistEntry, bir IP veya CIDR girişini doğrular ve kanonik biçimine
+// dönüştürür. Geçersizse Türkçe bir hata döndürür.
+func normalizeWhitelistEntry(entry string) (string, error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", errors.New("boş giriş")
+	}
+	if strings.Contains(entry, "/") {
+		_, ipnet, err := net.ParseCIDR(entry)
+		if err != nil {
+			return "", fmt.Errorf("geçersiz CIDR bloğu: %s", entry)
+		}
+		return ipnet.String(), nil
+	}
+	ip := net.ParseIP(entry)
+	if ip == nil {
+		return "", fmt.Errorf("geçersiz IP adresi: %s", entry)
+	}
+	return ip.String(), nil
+}
+
 // dominantTarget, en çok hedeflenen IP'yi ve farklı hedef sayısını döndürür.
 func dominantTarget(ipCount map[string]int) (string, int) {
 	best := ""
@@ -1001,6 +1250,7 @@ func (a *App) dashboardRouter() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/", a.basicAuth(http.HandlerFunc(a.handleDashboard)))
 	mux.Handle("/api/state", a.basicAuth(http.HandlerFunc(a.handleDashboardState)))
+	mux.Handle("/api/whitelist", a.basicAuth(http.HandlerFunc(a.handleWhitelist)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
 	return mux
 }
@@ -1020,6 +1270,49 @@ func (a *App) basicAuth(next http.Handler) http.Handler {
 func (a *App) handleDashboard(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, dashboardHTML)
+}
+
+// handleWhitelist, kaynak IP whitelist'ini yönetir: GET listeler, POST tekil giriş
+// ekler, DELETE (entry sorgu parametresiyle) siler. Her değişiklik config.json'a
+// kalıcı yazılır ve tehdit analizcisi güncellenir.
+func (a *App) handleWhitelist(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.writeWhitelist(w)
+	case http.MethodPost:
+		var body struct {
+			Entry string `json:"entry"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, "geçersiz istek gövdesi", http.StatusBadRequest)
+			return
+		}
+		if err := a.whitelist.Add(body.Entry); err != nil {
+			writeJSONError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		a.analyzer.PurgeWhitelisted()
+		a.writeWhitelist(w)
+	case http.MethodDelete:
+		if err := a.whitelist.Remove(r.URL.Query().Get("entry")); err != nil {
+			writeJSONError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		a.writeWhitelist(w)
+	default:
+		writeJSONError(w, "desteklenmeyen metot", http.StatusMethodNotAllowed)
+	}
+}
+
+func (a *App) writeWhitelist(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string][]string{"entries": a.whitelist.Entries()})
+}
+
+func writeJSONError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
@@ -3135,6 +3428,153 @@ const dashboardHTML = `<!DOCTYPE html>
       to   { opacity: 1; transform: none; }
     }
 
+    /* Whitelist — görmezden gelinen kaynaklar bölümü */
+    .whitelist-section {
+      margin-top: 20px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .whitelist-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .whitelist-title svg {
+      width: 17px;
+      height: 17px;
+      color: var(--neon-green);
+      flex-shrink: 0;
+    }
+
+    .whitelist-sub {
+      margin: 5px 0 0 0;
+      font-size: 12px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+
+    .whitelist-sub .mono {
+      color: var(--neon-blue);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .whitelist-form {
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .whitelist-input {
+      flex: 1;
+      min-width: 0;
+      min-height: 42px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(7,10,20,0.9);
+      color: var(--text);
+      padding: 0 14px;
+      font-size: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      outline: none;
+      transition: 0.18s ease;
+    }
+
+    .whitelist-input::placeholder { color: var(--muted-2); }
+    .whitelist-input:hover { border-color: rgba(34,211,238,0.4); }
+    .whitelist-input:focus {
+      border-color: var(--neon-cyan);
+      box-shadow: 0 0 0 3px rgba(34,211,238,0.18), var(--glow-cyan);
+    }
+
+    .whitelist-add {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      padding: 0 18px;
+      border-radius: 14px;
+      border: 1px solid var(--neon-green);
+      background: var(--neon-green);
+      color: #052e16;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: 0.18s ease;
+    }
+
+    .whitelist-add:hover { box-shadow: var(--glow-green); }
+
+    .whitelist-error {
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      color: #ffb4c2;
+      background: rgba(255,93,122,0.1);
+      border: 1px solid rgba(255,93,122,0.32);
+    }
+
+    .whitelist-error[hidden] { display: none; }
+
+    .whitelist-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .whitelist-empty {
+      font-size: 12px;
+      color: var(--muted-2);
+    }
+
+    .whitelist-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px 6px 12px;
+      border-radius: 999px;
+      background: rgba(148,163,184,0.08);
+      border: 1px solid rgba(148,163,184,0.18);
+      font-size: 13px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      color: var(--text);
+    }
+
+    .whitelist-chip.cidr {
+      color: #ccfbff;
+      border-color: rgba(34,211,238,0.32);
+      background: rgba(34,211,238,0.08);
+    }
+
+    .whitelist-remove {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      border: none;
+      background: rgba(148,163,184,0.14);
+      color: var(--muted);
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+
+    .whitelist-remove:hover {
+      background: rgba(255,93,122,0.2);
+      color: #fff;
+    }
+
+    .whitelist-remove svg { width: 12px; height: 12px; }
+
     @media (prefers-reduced-motion: reduce) {
       .threat-badge.active { animation: none; }
       .threat-toggle.active { animation: none; }
@@ -3644,6 +4084,26 @@ const dashboardHTML = `<!DOCTYPE html>
             <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
           </div>
         </div>
+
+        <div class="whitelist-section">
+          <div class="whitelist-head">
+            <span class="whitelist-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>
+              </svg>
+              Görmezden gelinen kaynaklar
+            </span>
+            <p class="whitelist-sub">Buraya eklenen kaynak IP adresleri veya CIDR blokları (ör. <span class="mono">10.0.0.0/24</span>) tehdit analizinde tamamen yok sayılır. Ayarlar <span class="mono">config.json</span> içinde kalıcı tutulur.</p>
+          </div>
+          <form class="whitelist-form" id="whitelist-form" autocomplete="off">
+            <input type="text" class="whitelist-input" id="whitelist-input" placeholder="192.168.1.10 veya 10.0.0.0/24" spellcheck="false" aria-label="Whitelist girişi" />
+            <button type="submit" class="whitelist-add">Ekle</button>
+          </form>
+          <div class="whitelist-error" id="whitelist-error" role="alert" hidden></div>
+          <div class="whitelist-list" id="whitelist-list">
+            <div class="whitelist-empty" id="whitelist-empty">Henüz görmezden gelinen kaynak eklenmedi.</div>
+          </div>
+        </div>
       </section>
     </div>
 
@@ -3740,6 +4200,11 @@ const dashboardHTML = `<!DOCTYPE html>
     const threatModalEl = document.getElementById('threat-modal');
     const threatToggleEl = document.getElementById('threat-toggle');
     const threatToggleCountEl = document.getElementById('threat-toggle-count');
+    const whitelistFormEl = document.getElementById('whitelist-form');
+    const whitelistInputEl = document.getElementById('whitelist-input');
+    const whitelistErrorEl = document.getElementById('whitelist-error');
+    const whitelistListEl = document.getElementById('whitelist-list');
+    const whitelistEmptyEl = document.getElementById('whitelist-empty');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -4558,6 +5023,7 @@ const dashboardHTML = `<!DOCTYPE html>
       threatLastFocus = document.activeElement;
       threatModalEl.hidden = false;
       if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'true');
+      loadWhitelist();
       const closeBtn = threatModalEl.querySelector('.threat-close');
       if (closeBtn) closeBtn.focus();
     }
@@ -4608,6 +5074,103 @@ const dashboardHTML = `<!DOCTYPE html>
         closeThreatModal();
       }
     });
+
+    // Whitelist yönetimi: görmezden gelinen kaynak IP/CIDR girişlerini listeler,
+    // ekler ve siler. Değişiklikler /api/whitelist üzerinden config.json'a yazılır.
+    function showWhitelistError(msg) {
+      if (!whitelistErrorEl) return;
+      if (msg) {
+        whitelistErrorEl.textContent = msg;
+        whitelistErrorEl.hidden = false;
+      } else {
+        whitelistErrorEl.textContent = '';
+        whitelistErrorEl.hidden = true;
+      }
+    }
+
+    function renderWhitelist(entries) {
+      if (!whitelistListEl) return;
+      const list = Array.isArray(entries) ? entries : [];
+      Array.prototype.slice.call(whitelistListEl.querySelectorAll('.whitelist-chip')).forEach(function(n){ n.remove(); });
+      if (whitelistEmptyEl) whitelistEmptyEl.hidden = list.length > 0;
+      if (list.length === 0) return;
+      const html = list.map(function(entry){
+        const cidr = entry.indexOf('/') >= 0 ? ' cidr' : '';
+        return '<span class="whitelist-chip' + cidr + '">'
+          + '<span>' + escapeHtml(entry) + '</span>'
+          + '<button type="button" class="whitelist-remove" data-entry="' + escapeHtml(entry) + '" aria-label="' + escapeHtml(entry) + ' kaydını kaldır">'
+          +   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
+          + '</button>'
+          + '</span>';
+      }).join('');
+      whitelistListEl.insertAdjacentHTML('beforeend', html);
+    }
+
+    async function loadWhitelist() {
+      try {
+        const response = await fetch('/api/whitelist', { cache: 'no-store' });
+        if (!response.ok) throw new Error('liste alınamadı');
+        const data = await response.json();
+        renderWhitelist(data.entries);
+      } catch (error) {
+        showWhitelistError('Whitelist yüklenemedi.');
+      }
+    }
+
+    async function submitWhitelist(entry) {
+      showWhitelistError('');
+      try {
+        const response = await fetch('/api/whitelist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entry: entry }),
+        });
+        const data = await response.json().catch(function(){ return {}; });
+        if (!response.ok) {
+          showWhitelistError(data.error || 'Giriş eklenemedi.');
+          return false;
+        }
+        renderWhitelist(data.entries);
+        return true;
+      } catch (error) {
+        showWhitelistError('Giriş eklenemedi.');
+        return false;
+      }
+    }
+
+    async function removeWhitelist(entry) {
+      showWhitelistError('');
+      try {
+        const response = await fetch('/api/whitelist?entry=' + encodeURIComponent(entry), { method: 'DELETE' });
+        const data = await response.json().catch(function(){ return {}; });
+        if (!response.ok) {
+          showWhitelistError(data.error || 'Giriş kaldırılamadı.');
+          return;
+        }
+        renderWhitelist(data.entries);
+      } catch (error) {
+        showWhitelistError('Giriş kaldırılamadı.');
+      }
+    }
+
+    if (whitelistFormEl) {
+      whitelistFormEl.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const value = (whitelistInputEl.value || '').trim();
+        if (!value) return;
+        const ok = await submitWhitelist(value);
+        if (ok) {
+          whitelistInputEl.value = '';
+          whitelistInputEl.focus();
+        }
+      });
+    }
+    if (whitelistListEl) {
+      whitelistListEl.addEventListener('click', (event) => {
+        const btn = event.target.closest('.whitelist-remove');
+        if (btn) removeWhitelist(btn.getAttribute('data-entry'));
+      });
+    }
 
     prevPageEl.addEventListener('click', async () => {
       if (currentPage <= 1) {
