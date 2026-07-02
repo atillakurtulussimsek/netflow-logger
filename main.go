@@ -3304,6 +3304,37 @@ const dashboardHTML = `<!DOCTYPE html>
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
 
+    .threat-copy-ip {
+      margin-top: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      color: var(--neon-blue);
+      background: rgba(56,189,248,0.08);
+      border: 1px solid rgba(56,189,248,0.28);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: color .15s, background .15s, border-color .15s, box-shadow .15s;
+    }
+    .threat-copy-ip:hover {
+      color: var(--neon-cyan);
+      border-color: rgba(34,211,238,0.5);
+      background: var(--accent-soft);
+      box-shadow: 0 0 12px rgba(34,211,238,0.22);
+    }
+    .threat-copy-ip.copied {
+      color: #052e16;
+      border-color: var(--neon-green);
+      background: var(--neon-green);
+    }
+    .threat-copy-ip svg { width: 13px; height: 13px; flex-shrink: 0; }
+    .threat-copy-ip .threat-copy-label { display: inline; }
+    .threat-copy-ip.copied .threat-copy-label::after { content: " • kopyalandı"; }
+
     .threat-time {
       flex-shrink: 0;
       font-size: 11px;
@@ -4786,11 +4817,19 @@ const dashboardHTML = `<!DOCTYPE html>
         const rule = THREAT_RULE_LABELS[a.rule] || 'Şüpheli';
         const hits = a.count ? '<span class="threat-hits">' + escapeHtml(String(a.count)) + '×</span>' : '';
         const detail = a.detail ? escapeHtml(a.detail) : (rule + ' tespit edildi.');
+        const ip = a.src_ip ? String(a.src_ip) : '';
+        const copyIp = ip
+          ? '<button type="button" class="threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala (banlamak için)">'
+            + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>'
+            + '<span class="threat-copy-label">' + escapeHtml(ip) + '</span>'
+            + '</button>'
+          : '';
         return '<div class="threat-item ' + sev + '">'
           + '<span class="threat-sev">' + sevLabel + '</span>'
           + '<div class="threat-body">'
           +   '<div class="threat-item-title">' + escapeHtml(a.title || rule) + hits + '</div>'
           +   '<div class="threat-meta">' + detail + '</div>'
+          +   copyIp
           + '</div>'
           + '<span class="threat-time">' + escapeHtml(formatTime(a.last_seen || '')) + '</span>'
           + '</div>';
@@ -5183,15 +5222,12 @@ const dashboardHTML = `<!DOCTYPE html>
       await changePage(currentPage + 1);
     });
 
-    copyShaEl.addEventListener('click', async () => {
-      if (!currentSha) {
-        return;
-      }
+    async function copyToClipboard(text) {
       try {
-        await navigator.clipboard.writeText(currentSha);
+        await navigator.clipboard.writeText(text);
       } catch (error) {
         const helper = document.createElement('textarea');
-        helper.value = currentSha;
+        helper.value = text;
         helper.style.position = 'fixed';
         helper.style.opacity = '0';
         document.body.appendChild(helper);
@@ -5199,8 +5235,30 @@ const dashboardHTML = `<!DOCTYPE html>
         try { document.execCommand('copy'); } catch (e) {}
         document.body.removeChild(helper);
       }
+    }
+
+    copyShaEl.addEventListener('click', async () => {
+      if (!currentSha) {
+        return;
+      }
+      await copyToClipboard(currentSha);
       copyShaEl.classList.add('copied');
       setTimeout(() => copyShaEl.classList.remove('copied'), 1200);
+    });
+
+    // Güvenlik uyarılarındaki "IP kopyala" butonları (dinamik içerik → event delegation).
+    threatListEl.addEventListener('click', async (event) => {
+      const btn = event.target.closest('.threat-copy-ip');
+      if (!btn) {
+        return;
+      }
+      const ip = btn.getAttribute('data-ip');
+      if (!ip) {
+        return;
+      }
+      await copyToClipboard(ip);
+      btn.classList.add('copied');
+      setTimeout(() => btn.classList.remove('copied'), 1200);
     });
 
     drawRateChart();
