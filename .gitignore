@@ -11,3 +11,20 @@
 
 # Çalışma zamanı yapılandırması (whitelist vb.)
 /config.json
+
+# Go test ve coverage artefaktları
+*.test
+*.out
+coverage.*
+
+# Editör / IDE
+.idea/
+.vscode/
+*.swp
+
+# İşletim sistemi artefaktları
+.DS_Store
+Thumbs.db
+
+# Claude Code yerel ayarları (kişiye özel)
+.claude/settings.local.json
