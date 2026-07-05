@@ -176,6 +176,25 @@ Tehdit analizi bir kaynak IP'yi zararlı olarak işaretlediğinde (brute-force, 
 }
 ```
 
+### Manuel IP Ekleme
+
+Kara listeye elle IP eklemek istersen, kaydın içine **`"manual": true`** alanını yazman gerekir. Sistem `blocklist.json` dosyasını bellekten yeniden yazdığı için, bu işaret olmadan elle eklenen kayıtlar bir sonraki yazımda ezilir. Manuel kayıtlar:
+
+- Süre aşımıyla **temizlenmez** (72 saat kuralı yalnızca sistem kayıtları içindir); kalıcıdır.
+- Sistem dosyayı yeniden yazarken **korunur** (yazımdan önce dosyadaki manuel kayıtlar geri okunur).
+- Çalışma zamanında yapılan ekleme/çıkarmalar en geç ~5 saniye içinde endpoint'e yansır (süreç yeniden başlatmak gerekmez).
+- Dosyadan silinince bellekten de düşer.
+
+```json
+{
+  "entries": [
+    { "ip": "203.0.113.66", "manual": true, "rule": "manual-ban" }
+  ]
+}
+```
+
+> Not: Manuel bir kayıt whitelist ile çakışırsa dosyada kalır ama `/blocklist` çıktısında whitelist filtresi nedeniyle görünmez.
+
 ### Düz Metin Endpoint (`/blocklist`)
 
 OPNsense'in **Firewall → Aliases** ekranında **URL Table (IPs)** tipiyle çekebileceği, satır başına bir IP içeren temiz düz metin çıktısı sağlanır (HTML / JSON / boş satır yok):

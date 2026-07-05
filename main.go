@@ -747,7 +747,9 @@ func (t *ThreatAnalyzer) Maintain() {
 	}
 	now := time.Now()
 
-	// Süresi dolan kara liste kayıtlarını temizle (retention penceresi geçenler).
+	// Dosyaya elle eklenmiş/çıkarılmış manuel kayıtları belleğe yansıt, ardından
+	// süresi dolan (manuel olmayan) sistem kayıtlarını temizle.
+	t.blocklist.SyncManual()
 	t.blocklist.PurgeExpired()
 
 	t.mu.Lock()
@@ -1227,12 +1229,22 @@ func normalizeWhitelistEntry(entry string) (string, error) {
 
 // blocklistEntry, tespit edilen zararlı bir kaynak IP'nin kalıcı kaydıdır.
 type blocklistEntry struct {
-	IP        string    `json:"ip"`
-	Rule      string    `json:"rule"`
-	Hits      int       `json:"hits"`
+	IP   string `json:"ip"`
+	Rule string `json:"rule"`
+	Hits int    `json:"hits"`
+	// Manual, elle (dosyaya doğrudan ya da API ile) eklenmiş kayıtları işaretler.
+	// Manuel kayıtlar kalıcıdır: süre aşımıyla temizlenmez ve sistem dosyayı yeniden
+	// yazdığında korunur. Elle eklerken kaydın içine `"manual": true` yazılmalıdır.
+	Manual    bool      `json:"manual,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// active, kaydın kara listede geçerli sayılıp sayılmadığını döndürür. Manuel
+// kayıtlar her zaman geçerlidir; sistem kayıtları ise yalnızca süresi dolmadıysa.
+func (e *blocklistEntry) active(now time.Time) bool {
+	return e.Manual || e.ExpiresAt.After(now)
 }
 
 // blocklistFileFormat, blocklist.json'un disk biçimidir.
@@ -1288,10 +1300,14 @@ func (b *Blocklist) load() {
 	loaded := 0
 	for i := range f.Entries {
 		e := f.Entries[i]
-		if e.IP == "" || !e.ExpiresAt.After(now) {
+		// Manuel kayıtlar süresine bakılmaksızın korunur; sistem kayıtları yalnızca
+		// süresi dolmadıysa yüklenir.
+		if e.IP == "" || !e.active(now) {
 			continue
 		}
-		if b.whitelist.Contains(e.IP) {
+		// Whitelist yalnızca sistem kayıtlarını eler; manuel kayıt kullanıcının
+		// bilinçli bir kararıdır ve korunur.
+		if !e.Manual && b.whitelist.Contains(e.IP) {
 			continue
 		}
 		cp := e
@@ -1323,10 +1339,13 @@ func (b *Blocklist) Add(ip, rule string) {
 		b.entries[ip] = e
 	}
 	e.LastSeen = now
-	e.ExpiresAt = now.Add(b.retention)
 	e.Hits++
 	if rule != "" {
 		e.Rule = rule
+	}
+	// Manuel kayıtlar kalıcıdır; sistem tespiti bunların süresini/işaretini bozmaz.
+	if !e.Manual {
+		e.ExpiresAt = now.Add(b.retention)
 	}
 	// Yeni IP anında yazılır; yalnızca süre tazelemelerinde disk yazımı kısılır.
 	b.maybePersistLocked(isNew)
@@ -1342,7 +1361,7 @@ func (b *Blocklist) Snapshot() []blocklistEntry {
 	b.mu.Lock()
 	out := make([]blocklistEntry, 0, len(b.entries))
 	for _, e := range b.entries {
-		if !e.ExpiresAt.After(now) {
+		if !e.active(now) {
 			continue
 		}
 		out = append(out, *e)
@@ -1380,7 +1399,8 @@ func (b *Blocklist) PurgeExpired() {
 	b.mu.Lock()
 	changed := false
 	for ip, e := range b.entries {
-		if !e.ExpiresAt.After(now) {
+		// Manuel kayıtlar süre aşımıyla silinmez.
+		if !e.Manual && !e.ExpiresAt.After(now) {
 			delete(b.entries, ip)
 			changed = true
 		}
@@ -1398,8 +1418,11 @@ func (b *Blocklist) PurgeWhitelisted() {
 	}
 	b.mu.Lock()
 	changed := false
-	for ip := range b.entries {
-		if b.whitelist.Contains(ip) {
+	for ip, e := range b.entries {
+		// Manuel kayıtlar kullanıcının bilinçli kararıdır; whitelist ile çakışsa
+		// bile dosyadan silinmez (endpoint çıktısı IPs() içinde zaten whitelist
+		// ile filtrelenir).
+		if !e.Manual && b.whitelist.Contains(ip) {
 			delete(b.entries, ip)
 			changed = true
 		}
@@ -1418,9 +1441,68 @@ func (b *Blocklist) maybePersistLocked(force bool) {
 	}
 }
 
+// SyncManual, dosyaya elle eklenmiş/çıkarılmış manuel kayıtları belleğe yansıtır.
+// Çalışma zamanında (süreç yeniden başlatılmadan) yapılan manuel düzenlemelerin
+// endpoint'e ve sonraki yazımlara yansıması için periyodik olarak çağrılır.
+func (b *Blocklist) SyncManual() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.syncManualFromFileLocked()
+	b.mu.Unlock()
+}
+
+// syncManualFromFileLocked, blocklist.json'daki manuel (`"manual": true`) kayıtları
+// bellekle uzlaştırır: dosyada olanları ekler/günceller, dosyadan silinmiş manuel
+// kayıtları bellekten düşürür. Sistem (manuel olmayan) kayıtlarına dokunmaz; onlar
+// tamamen bellekten yönetilir. Böylece dosya, manuel kayıtlar için kaynak olur ve
+// sistem dosyayı yeniden yazarken manuel kayıtlar asla ezilmez (b.mu kilitli olmalı).
+func (b *Blocklist) syncManualFromFileLocked() {
+	data, err := os.ReadFile(b.path)
+	if err != nil {
+		return // dosya yoksa/okunamıyorsa senkron atlanır
+	}
+	var f blocklistFileFormat
+	if err := json.Unmarshal(data, &f); err != nil {
+		log.Printf("blocklist manual sync parse failed: %v", err)
+		return
+	}
+	fileManual := make(map[string]blocklistEntry)
+	for i := range f.Entries {
+		e := f.Entries[i]
+		if e.Manual && e.IP != "" {
+			fileManual[e.IP] = e
+		}
+	}
+	// Dosyadan kaldırılmış manuel kayıtları bellekten de düş.
+	for ip, e := range b.entries {
+		if e.Manual {
+			if _, ok := fileManual[ip]; !ok {
+				delete(b.entries, ip)
+			}
+		}
+	}
+	// Dosyadaki manuel kayıtları belleğe al/güncelle.
+	now := time.Now()
+	for ip, e := range fileManual {
+		cp := e
+		cp.Manual = true
+		if cp.FirstSeen.IsZero() {
+			cp.FirstSeen = now
+		}
+		if cp.LastSeen.IsZero() {
+			cp.LastSeen = now
+		}
+		b.entries[ip] = &cp
+	}
+}
+
 // persistLocked, kara listeyi IP'ye göre sıralı ve atomik biçimde diske yazar
-// (b.mu kilitli olmalı).
+// (b.mu kilitli olmalı). Yazmadan önce dosyadaki manuel kayıtları belleğe okur ki
+// çalışma zamanında elle eklenmiş kayıtlar üzerine yazılıp kaybolmasın.
 func (b *Blocklist) persistLocked() {
+	b.syncManualFromFileLocked()
 	list := make([]blocklistEntry, 0, len(b.entries))
 	for _, e := range b.entries {
 		list = append(list, *e)

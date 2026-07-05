@@ -159,3 +159,127 @@ func TestBlocklistEndpointDisabledWithoutToken(t *testing.T) {
 		t.Fatalf("token yapılandırılmamışken 403 bekleniyordu, alınan %d", rec.Code)
 	}
 }
+
+// writeBlocklistFile, testte dosyaya doğrudan (elle düzenleme simülasyonu) yazar.
+func writeBlocklistFile(t *testing.T, path string, entries ...blocklistEntry) {
+	t.Helper()
+	data, err := json.MarshalIndent(blocklistFileFormat{Entries: entries}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func readBlocklistFile(t *testing.T, path string) blocklistFileFormat {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var f blocklistFileFormat
+	if err := json.Unmarshal(data, &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return f
+}
+
+// TestBlocklistManualPreservedOnSystemRewrite, sistem yeni IP yazarken dosyaya elle
+// eklenmiş manuel kaydın ezilmediğini doğrular (kullanıcının bildirdiği hata).
+func TestBlocklistManualPreservedOnSystemRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	b := NewBlocklist(path, blocklistRetention, w)
+
+	// Sistem bir IP tespit eder → dosya oluşur.
+	b.Add("45.155.204.15", "portscan")
+
+	// Kullanıcı çalışma zamanında dosyaya elle manuel bir IP ekler.
+	f := readBlocklistFile(t, path)
+	f.Entries = append(f.Entries, blocklistEntry{
+		IP:        "185.234.12.34",
+		Rule:      "manual-ban",
+		Manual:    true,
+		FirstSeen: time.Now(),
+		LastSeen:  time.Now(),
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	})
+	writeBlocklistFile(t, path, f.Entries...)
+
+	// Sistem başka bir IP tespit eder → dosyayı yeniden yazar.
+	b.Add("203.0.113.7", "bruteforce")
+
+	// Manuel kayıt hem dosyada hem endpoint çıktısında olmalı.
+	got := b.IPs()
+	joined := strings.Join(got, ",")
+	if !strings.Contains(joined, "185.234.12.34") {
+		t.Fatalf("manuel IP ezilmiş, alınan: %v", got)
+	}
+	if !strings.Contains(joined, "45.155.204.15") || !strings.Contains(joined, "203.0.113.7") {
+		t.Errorf("sistem IP'leri kaybolmuş, alınan: %v", got)
+	}
+	onDisk := readBlocklistFile(t, path)
+	foundManual := false
+	for _, e := range onDisk.Entries {
+		if e.IP == "185.234.12.34" && e.Manual {
+			foundManual = true
+		}
+	}
+	if !foundManual {
+		t.Errorf("manuel kayıt diskte manual=true olarak korunmadı: %+v", onDisk.Entries)
+	}
+}
+
+// TestBlocklistManualNotPurged, manuel kaydın süresi geçmiş olsa bile PurgeExpired
+// tarafından silinmediğini doğrular.
+func TestBlocklistManualNotPurged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	// Süresi geçmiş bir manuel kayıt yaz.
+	writeBlocklistFile(t, path, blocklistEntry{
+		IP:        "185.234.12.34",
+		Rule:      "manual-ban",
+		Manual:    true,
+		FirstSeen: time.Now().Add(-100 * time.Hour),
+		LastSeen:  time.Now().Add(-100 * time.Hour),
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // geçmişte ama manuel → kalmalı
+	})
+
+	b := NewBlocklist(path, blocklistRetention, w)
+	if got := b.IPs(); len(got) != 1 || got[0] != "185.234.12.34" {
+		t.Fatalf("süresi geçmiş manuel kayıt yüklenmeliydi, alınan: %v", got)
+	}
+	b.PurgeExpired()
+	if got := b.IPs(); len(got) != 1 {
+		t.Fatalf("manuel kayıt PurgeExpired ile silinmemeliydi, alınan: %v", got)
+	}
+}
+
+// TestBlocklistSyncManualAddRemove, çalışma zamanında dosyaya eklenen manuel kaydın
+// belleğe alınmasını ve dosyadan silinince bellekten düşmesini doğrular.
+func TestBlocklistSyncManualAddRemove(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	b := NewBlocklist(path, blocklistRetention, w)
+
+	// Süreç çalışırken dosyaya elle manuel IP ekle.
+	writeBlocklistFile(t, path, blocklistEntry{
+		IP:        "185.234.12.34",
+		Manual:    true,
+		FirstSeen: time.Now(),
+		LastSeen:  time.Now(),
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	})
+	b.SyncManual()
+	if got := b.IPs(); len(got) != 1 || got[0] != "185.234.12.34" {
+		t.Fatalf("SyncManual manuel IP'yi almadı, alınan: %v", got)
+	}
+
+	// Kullanıcı manuel kaydı dosyadan siler → SyncManual bellekten düşürmeli.
+	writeBlocklistFile(t, path)
+	b.SyncManual()
+	if got := b.IPs(); len(got) != 0 {
+		t.Fatalf("dosyadan silinen manuel kayıt bellekte kaldı, alınan: %v", got)
+	}
+}
