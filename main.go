@@ -42,6 +42,19 @@ const (
 	dashboardMaxRecords     = 1000
 	templateCacheFile       = "templates.json"
 	configFile              = "config.json"
+	blocklistFile           = "blocklist.json"
+)
+
+// Zararlı IP kara listesi ayarları.
+const (
+	// blocklistRetention, bir IP zararlı olarak tespit edildikten sonra kara
+	// listede kalacağı asgari süredir. Her yeni tespit bu süreyi tazeler, böylece
+	// aktif bir saldırgan pencereyi sürekli uzatır; saldırı dursa bile IP son
+	// tespitten itibaren en az bu süre boyunca listede kalır.
+	blocklistRetention = 72 * time.Hour
+	// blocklistPersistThrottle, mevcut bir kaydın süresi tazelendiğinde diske
+	// yazma sıklığını sınırlar (yeni IP ve silme işlemleri her zaman anında yazılır).
+	blocklistPersistThrottle = 30 * time.Second
 )
 
 // Tehdit tespiti eşikleri. Kayan zaman penceresi içinde tek kaynak IP'nin
@@ -82,6 +95,12 @@ type Config struct {
 	LogRoot          string
 	Location         *time.Location
 	DebugFlowMapping bool
+	// BlocklistToken, /blocklist düz metin endpoint'ini korur. Boşsa endpoint
+	// tamamen devre dışıdır (403).
+	BlocklistToken string
+	// BlocklistAllowNets tanımlıysa /blocklist endpoint'ine yalnızca bu ağlardan
+	// (ör. OPNsense WAN IP'si) gelen istekler kabul edilir.
+	BlocklistAllowNets []*net.IPNet
 }
 
 type App struct {
@@ -91,6 +110,7 @@ type App struct {
 	dashboard *DashboardHub
 	analyzer  *ThreatAnalyzer
 	whitelist *Whitelist
+	blocklist *Blocklist
 }
 
 type FlowRecord struct {
@@ -220,13 +240,15 @@ func main() {
 
 	dashboard := NewDashboardHub(dashboardMaxRecords)
 	whitelist := NewWhitelist(configFile)
-	analyzer := NewThreatAnalyzer(dashboard, whitelist)
+	blocklist := NewBlocklist(blocklistFile, blocklistRetention, whitelist)
+	analyzer := NewThreatAnalyzer(dashboard, whitelist, blocklist)
 	app := &App{
 		cfg:       cfg,
 		session:   newPersistentSession(cfg.LogRoot),
 		dashboard: dashboard,
 		analyzer:  analyzer,
 		whitelist: whitelist,
+		blocklist: blocklist,
 		logger: &HourlyLogger{
 			cfg:        cfg,
 			httpClient: &http.Client{Timeout: 30 * time.Second},
@@ -376,15 +398,22 @@ func loadConfig(envPath string) (Config, error) {
 		return Config{}, fmt.Errorf("timezone load failed: %w", err)
 	}
 
+	allowNets, err := parseAllowNets(env["BLOCKLIST_ALLOW_IPS"])
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
-		ListenAddress:    firstNonEmpty(env["NETFLOW_LISTEN_ADDRESS"], defaultListenAddress),
-		DashboardAddress: firstNonEmpty(env["DASHBOARD_ADDRESS"], defaultDashboardAddress),
-		DashboardUser:    strings.TrimSpace(env["DASHBOARD_USERNAME"]),
-		DashboardPass:    strings.TrimSpace(env["DASHBOARD_PASSWORD"]),
-		TSAURL:           firstNonEmpty(env["TSA_URL"], defaultTSAURL),
-		LogRoot:          firstNonEmpty(env["LOG_ROOT"], defaultLogRoot),
-		Location:         location,
-		DebugFlowMapping: strings.EqualFold(strings.TrimSpace(env["DEBUG_FLOW_MAPPING"]), "true"),
+		ListenAddress:      firstNonEmpty(env["NETFLOW_LISTEN_ADDRESS"], defaultListenAddress),
+		DashboardAddress:   firstNonEmpty(env["DASHBOARD_ADDRESS"], defaultDashboardAddress),
+		DashboardUser:      strings.TrimSpace(env["DASHBOARD_USERNAME"]),
+		DashboardPass:      strings.TrimSpace(env["DASHBOARD_PASSWORD"]),
+		TSAURL:             firstNonEmpty(env["TSA_URL"], defaultTSAURL),
+		LogRoot:            firstNonEmpty(env["LOG_ROOT"], defaultLogRoot),
+		Location:           location,
+		DebugFlowMapping:   strings.EqualFold(strings.TrimSpace(env["DEBUG_FLOW_MAPPING"]), "true"),
+		BlocklistToken:     strings.TrimSpace(env["BLOCKLIST_TOKEN"]),
+		BlocklistAllowNets: allowNets,
 	}
 
 	if cfg.DashboardUser == "" || cfg.DashboardPass == "" {
@@ -392,6 +421,41 @@ func loadConfig(envPath string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// parseAllowNets, virgülle ayrılmış IP/CIDR listesini (BLOCKLIST_ALLOW_IPS)
+// *net.IPNet dilimine çevirir. Tekil IP'ler /32 (IPv4) veya /128 (IPv6) olur.
+// Boş girdi nil döndürür (kısıtlama yok).
+func parseAllowNets(raw string) ([]*net.IPNet, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var nets []*net.IPNet
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, "/") {
+			_, n, err := net.ParseCIDR(part)
+			if err != nil {
+				return nil, fmt.Errorf("BLOCKLIST_ALLOW_IPS geçersiz CIDR: %s", part)
+			}
+			nets = append(nets, n)
+			continue
+		}
+		ip := net.ParseIP(part)
+		if ip == nil {
+			return nil, fmt.Errorf("BLOCKLIST_ALLOW_IPS geçersiz IP: %s", part)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return nets, nil
 }
 
 func loadEnvFile(path string) (map[string]string, error) {
@@ -613,16 +677,18 @@ type threatAlert struct {
 type ThreatAnalyzer struct {
 	hub       *DashboardHub
 	whitelist *Whitelist
+	blocklist *Blocklist
 
 	mu      sync.Mutex
 	sources map[string]*sourceActivity
 	alerts  map[string]*threatAlert
 }
 
-func NewThreatAnalyzer(hub *DashboardHub, whitelist *Whitelist) *ThreatAnalyzer {
+func NewThreatAnalyzer(hub *DashboardHub, whitelist *Whitelist, blocklist *Blocklist) *ThreatAnalyzer {
 	return &ThreatAnalyzer{
 		hub:       hub,
 		whitelist: whitelist,
+		blocklist: blocklist,
 		sources:   make(map[string]*sourceActivity),
 		alerts:    make(map[string]*threatAlert),
 	}
@@ -658,7 +724,7 @@ func (t *ThreatAnalyzer) Observe(record FlowRecord) {
 		sa.events = append([]flowEvent(nil), sa.events[len(sa.events)-threatMaxEventsPerSrc:]...)
 	}
 
-	changed := t.evaluateLocked(src, sa, now)
+	changed, reason := t.evaluateLocked(src, sa, now)
 	var snapshot []ThreatAlert
 	if changed {
 		snapshot = t.snapshotAlertsLocked()
@@ -666,6 +732,9 @@ func (t *ThreatAnalyzer) Observe(record FlowRecord) {
 	t.mu.Unlock()
 
 	if changed {
+		// Zararlı olarak işaretlenen kaynağı kalıcı kara listeye ekle/tazele.
+		// Disk yazımı t.mu dışında yapılır ki analiz sıcak yolu kilitli kalmasın.
+		t.blocklist.Add(src, reason)
 		t.hub.SetThreats(snapshot)
 	}
 }
@@ -677,6 +746,9 @@ func (t *ThreatAnalyzer) Maintain() {
 		return
 	}
 	now := time.Now()
+
+	// Süresi dolan kara liste kayıtlarını temizle (retention penceresi geçenler).
+	t.blocklist.PurgeExpired()
 
 	t.mu.Lock()
 	for src, sa := range t.sources {
@@ -710,6 +782,8 @@ func (t *ThreatAnalyzer) PurgeWhitelisted() {
 	if t == nil {
 		return
 	}
+	// Whitelist'e alınan IP'ler kara listeden de düşürülür.
+	t.blocklist.PurgeWhitelisted()
 	t.mu.Lock()
 	for src := range t.sources {
 		if t.whitelist.Contains(src) {
@@ -735,7 +809,9 @@ func (t *ThreatAnalyzer) PurgeWhitelisted() {
 }
 
 // evaluateLocked, kaynağın penceredeki olaylarını üç kural açısından değerlendirir.
-func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time.Time) bool {
+// İkinci dönüş değeri, tetiklenen en yüksek önem dereceli kuralın adıdır (kara
+// liste kaydında sebep olarak saklanır); değişiklik yoksa boştur.
+func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time.Time) (bool, string) {
 	type portAgg struct {
 		count   int
 		ipCount map[string]int
@@ -762,6 +838,15 @@ func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time
 
 	windowSec := int(threatWindow.Seconds())
 	changed := false
+	reason := ""
+	reasonRank := 0
+	// mark, tetiklenen kuralı en yüksek önem derecesine göre "sebep" olarak seçer.
+	mark := func(severity, rule string) {
+		if r := severityRank(severity); r >= reasonRank {
+			reasonRank = r
+			reason = rule
+		}
+	}
 
 	// Kural 1 — Brute-force / servis flood: hassas bir porta çok sayıda akış.
 	for port, pa := range portMap {
@@ -791,6 +876,7 @@ func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time
 			detail:   detail,
 		}, now) {
 			changed = true
+			mark("high", "bruteforce")
 		}
 	}
 
@@ -811,6 +897,7 @@ func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time
 				src, windowSec, dstIP, len(ports)),
 		}, now) {
 			changed = true
+			mark("medium", "portscan")
 		}
 	}
 
@@ -834,10 +921,11 @@ func (t *ThreatAnalyzer) evaluateLocked(src string, sa *sourceActivity, now time
 				src, windowSec, portLabel(port), len(pa.ipCount)),
 		}, now) {
 			changed = true
+			mark("medium", "hostsweep")
 		}
 	}
 
-	return changed
+	return changed, reason
 }
 
 // upsertLocked, uyarıyı ekler ya da mevcut olanı günceller. Yeni uyarı veya
@@ -943,7 +1031,7 @@ type Whitelist struct {
 	path string
 
 	mu      sync.RWMutex
-	entries []string     // kullanıcının eklediği sırayla normalize edilmiş girişler
+	entries []string // kullanıcının eklediği sırayla normalize edilmiş girişler
 	ips     map[string]struct{}
 	nets    []*net.IPNet
 }
@@ -1137,6 +1225,231 @@ func normalizeWhitelistEntry(entry string) (string, error) {
 	return ip.String(), nil
 }
 
+// blocklistEntry, tespit edilen zararlı bir kaynak IP'nin kalıcı kaydıdır.
+type blocklistEntry struct {
+	IP        string    `json:"ip"`
+	Rule      string    `json:"rule"`
+	Hits      int       `json:"hits"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// blocklistFileFormat, blocklist.json'un disk biçimidir.
+type blocklistFileFormat struct {
+	Entries []blocklistEntry `json:"entries"`
+}
+
+// Blocklist, tehdit analizinin zararlı olarak işaretlediği kaynak IP'leri
+// blocklist.json içinde kalıcı olarak tutar. Her IP, en son tespitten itibaren
+// retention süresi (72 saat) boyunca listede kalır; süresi dolanlar temizlenir.
+// Liste, OPNsense gibi güvenlik duvarlarının "alias URL table" özelliğiyle
+// çekebilmesi için düz metin bir endpoint üzerinden yayınlanır.
+type Blocklist struct {
+	path      string
+	retention time.Duration
+	whitelist *Whitelist
+
+	mu          sync.Mutex
+	entries     map[string]*blocklistEntry
+	lastPersist time.Time
+}
+
+// NewBlocklist, verilen yoldan kara listeyi yükler (yoksa boş başlar). Yüklerken
+// süresi dolmuş ve whitelist'e alınmış girişler atlanır.
+func NewBlocklist(path string, retention time.Duration, whitelist *Whitelist) *Blocklist {
+	b := &Blocklist{
+		path:      path,
+		retention: retention,
+		whitelist: whitelist,
+		entries:   make(map[string]*blocklistEntry),
+	}
+	b.load()
+	return b
+}
+
+// load, blocklist.json'daki geçerli (süresi dolmamış, whitelist dışı) kayıtları okur.
+func (b *Blocklist) load() {
+	data, err := os.ReadFile(b.path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("blocklist read failed: %v", err)
+		}
+		return
+	}
+	var f blocklistFileFormat
+	if err := json.Unmarshal(data, &f); err != nil {
+		log.Printf("blocklist parse failed: %v", err)
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	loaded := 0
+	for i := range f.Entries {
+		e := f.Entries[i]
+		if e.IP == "" || !e.ExpiresAt.After(now) {
+			continue
+		}
+		if b.whitelist.Contains(e.IP) {
+			continue
+		}
+		cp := e
+		b.entries[e.IP] = &cp
+		loaded++
+	}
+	if loaded > 0 {
+		log.Printf("loaded %d active blocklist entr(ies) from %s", loaded, b.path)
+	}
+}
+
+// Add, bir kaynak IP'yi kara listeye ekler ya da mevcut kaydın süresini tazeler.
+// Her çağrı son görülme zamanını günceller ve bitişi now+retention'a taşır, böylece
+// IP son tespitten itibaren en az retention süresi boyunca listede kalır.
+func (b *Blocklist) Add(ip, rule string) {
+	if b == nil || ip == "" {
+		return
+	}
+	// Whitelist'teki IP'ler asla kara listeye girmez (savunma amaçlı çift kontrol).
+	if b.whitelist.Contains(ip) {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	e := b.entries[ip]
+	isNew := e == nil
+	if isNew {
+		e = &blocklistEntry{IP: ip, FirstSeen: now}
+		b.entries[ip] = e
+	}
+	e.LastSeen = now
+	e.ExpiresAt = now.Add(b.retention)
+	e.Hits++
+	if rule != "" {
+		e.Rule = rule
+	}
+	// Yeni IP anında yazılır; yalnızca süre tazelemelerinde disk yazımı kısılır.
+	b.maybePersistLocked(isNew)
+	b.mu.Unlock()
+}
+
+// Snapshot, süresi dolmamış kayıtları son görülmeye göre (yeni → eski) sıralı döndürür.
+func (b *Blocklist) Snapshot() []blocklistEntry {
+	if b == nil {
+		return nil
+	}
+	now := time.Now()
+	b.mu.Lock()
+	out := make([]blocklistEntry, 0, len(b.entries))
+	for _, e := range b.entries {
+		if !e.ExpiresAt.After(now) {
+			continue
+		}
+		out = append(out, *e)
+	}
+	b.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
+	return out
+}
+
+// IPs, düz metin endpoint için geçerli (süresi dolmamış, whitelist dışı) IP'leri
+// kararlı bir sırayla döndürür.
+func (b *Blocklist) IPs() []string {
+	if b == nil {
+		return nil
+	}
+	snap := b.Snapshot()
+	out := make([]string, 0, len(snap))
+	for _, e := range snap {
+		if b.whitelist.Contains(e.IP) {
+			continue
+		}
+		out = append(out, e.IP)
+	}
+	return out
+}
+
+// PurgeExpired, retention süresi geçen kayıtları siler; değişiklik olursa yazar.
+func (b *Blocklist) PurgeExpired() {
+	if b == nil {
+		return
+	}
+	now := time.Now()
+	b.mu.Lock()
+	changed := false
+	for ip, e := range b.entries {
+		if !e.ExpiresAt.After(now) {
+			delete(b.entries, ip)
+			changed = true
+		}
+	}
+	if changed {
+		b.persistLocked()
+	}
+	b.mu.Unlock()
+}
+
+// PurgeWhitelisted, whitelist'e alınmış IP'leri kara listeden düşürür.
+func (b *Blocklist) PurgeWhitelisted() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	changed := false
+	for ip := range b.entries {
+		if b.whitelist.Contains(ip) {
+			delete(b.entries, ip)
+			changed = true
+		}
+	}
+	if changed {
+		b.persistLocked()
+	}
+	b.mu.Unlock()
+}
+
+// maybePersistLocked, yeni kayıt/silme dışındaki süre tazelemelerinde disk yazımını
+// blocklistPersistThrottle ile kısar (b.mu kilitli olmalı).
+func (b *Blocklist) maybePersistLocked(force bool) {
+	if force || time.Since(b.lastPersist) > blocklistPersistThrottle {
+		b.persistLocked()
+	}
+}
+
+// persistLocked, kara listeyi IP'ye göre sıralı ve atomik biçimde diske yazar
+// (b.mu kilitli olmalı).
+func (b *Blocklist) persistLocked() {
+	list := make([]blocklistEntry, 0, len(b.entries))
+	for _, e := range b.entries {
+		list = append(list, *e)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].IP < list[j].IP })
+
+	data, err := json.MarshalIndent(blocklistFileFormat{Entries: list}, "", "  ")
+	if err != nil {
+		log.Printf("blocklist marshal failed: %v", err)
+		return
+	}
+	if dir := filepath.Dir(b.path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("blocklist dir create failed: %v", err)
+			return
+		}
+	}
+	tmp := b.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("blocklist write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, b.path); err != nil {
+		log.Printf("blocklist rename failed: %v", err)
+		return
+	}
+	b.lastPersist = time.Now()
+}
+
 // dominantTarget, en çok hedeflenen IP'yi ve farklı hedef sayısını döndürür.
 func dominantTarget(ipCount map[string]int) (string, int) {
 	best := ""
@@ -1251,7 +1564,11 @@ func (a *App) dashboardRouter() http.Handler {
 	mux.Handle("/", a.basicAuth(http.HandlerFunc(a.handleDashboard)))
 	mux.Handle("/api/state", a.basicAuth(http.HandlerFunc(a.handleDashboardState)))
 	mux.Handle("/api/whitelist", a.basicAuth(http.HandlerFunc(a.handleWhitelist)))
+	mux.Handle("/api/blocklist", a.basicAuth(http.HandlerFunc(a.handleBlocklistAPI)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
+	// Düz metin kara liste: OPNsense alias URL table için. Basic auth yerine
+	// token (ve opsiyonel IP kısıtı) ile korunur; firewall'lar Basic auth göndermez.
+	mux.Handle("/blocklist", http.HandlerFunc(a.handleBlocklist))
 	return mux
 }
 
@@ -1313,6 +1630,90 @@ func writeJSONError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// handleBlocklist, zararlı IP kara listesini OPNsense'in okuyabileceği düz metin
+// olarak döndürür: her satırda bir IP, HTML/JSON/boş satır olmadan. OPNsense'te
+// Firewall → Aliases → tür "URL Table (IPs)" olarak bu endpoint tanımlanır:
+//
+//	https://<host>:<port>/blocklist?token=<BLOCKLIST_TOKEN>
+func (a *App) handleBlocklist(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.blocklistAuthorized(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	for _, ip := range a.blocklist.IPs() {
+		fmt.Fprintln(w, ip)
+	}
+}
+
+// handleBlocklistAPI, panel/görüntüleme için kara listeyi ayrıntılı JSON döndürür
+// (basic auth arkasında).
+func (a *App) handleBlocklistAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	entries := a.blocklist.Snapshot()
+	if entries == nil {
+		entries = []blocklistEntry{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"entries":      entries,
+		"retention_h":  int(blocklistRetention.Hours()),
+		"total_active": len(entries),
+	})
+}
+
+// blocklistAuthorized, /blocklist endpoint'i için token ve opsiyonel IP kısıtını
+// doğrular. BLOCKLIST_TOKEN tanımlı değilse endpoint tamamen devre dışıdır.
+func (a *App) blocklistAuthorized(r *http.Request) bool {
+	// Opsiyonel IP kısıtlaması: tanımlıysa yalnızca izin verilen ağlar kabul edilir.
+	if len(a.cfg.BlocklistAllowNets) > 0 {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(strings.TrimSpace(host))
+		allowed := false
+		if ip != nil {
+			for _, n := range a.cfg.BlocklistAllowNets {
+				if n.Contains(ip) {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+
+	expected := a.cfg.BlocklistToken
+	if expected == "" {
+		return false
+	}
+	got := r.URL.Query().Get("token")
+	if got == "" {
+		got = bearerToken(r)
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+}
+
+// bearerToken, "Authorization: Bearer <token>" başlığından token'ı çıkarır.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
 }
 
 func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {

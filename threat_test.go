@@ -21,7 +21,7 @@ func alertsByRule(hub *DashboardHub) map[string]ThreatAlert {
 
 func TestBruteforceDetection(t *testing.T) {
 	hub := NewDashboardHub(10)
-	a := NewThreatAnalyzer(hub, nil)
+	a := NewThreatAnalyzer(hub, nil, nil)
 
 	feed(a, FlowRecord{SrcIP: "203.0.113.9", DstIP: "10.0.0.5", DstPort: 22, Protocol: "TCP"}, threatBruteforceMin+5)
 
@@ -43,7 +43,7 @@ func TestBruteforceDetection(t *testing.T) {
 
 func TestVerticalPortScanDetection(t *testing.T) {
 	hub := NewDashboardHub(10)
-	a := NewThreatAnalyzer(hub, nil)
+	a := NewThreatAnalyzer(hub, nil, nil)
 
 	for p := 0; p < threatPortScanMin; p++ {
 		a.Observe(FlowRecord{SrcIP: "198.51.100.7", DstIP: "10.0.0.5", DstPort: uint16(1000 + p), Protocol: "TCP"})
@@ -56,7 +56,7 @@ func TestVerticalPortScanDetection(t *testing.T) {
 
 func TestHorizontalHostSweepDetection(t *testing.T) {
 	hub := NewDashboardHub(10)
-	a := NewThreatAnalyzer(hub, nil)
+	a := NewThreatAnalyzer(hub, nil, nil)
 
 	for i := 0; i < threatHostSweepMin; i++ {
 		a.Observe(FlowRecord{SrcIP: "198.51.100.8", DstIP: "10.0.0." + strconv.Itoa(i), DstPort: 445, Protocol: "TCP"})
@@ -73,7 +73,7 @@ func TestHorizontalHostSweepDetection(t *testing.T) {
 
 func TestBenignTrafficNoAlert(t *testing.T) {
 	hub := NewDashboardHub(10)
-	a := NewThreatAnalyzer(hub, nil)
+	a := NewThreatAnalyzer(hub, nil, nil)
 
 	// Eşik altında normal trafik: birkaç farklı hedefe azar akış.
 	a.Observe(FlowRecord{SrcIP: "10.0.0.20", DstIP: "93.184.216.34", DstPort: 443, Protocol: "TCP"})

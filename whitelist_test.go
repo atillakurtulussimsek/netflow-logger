@@ -96,7 +96,7 @@ func TestWhitelistIgnoredByAnalyzer(t *testing.T) {
 	}
 
 	hub := NewDashboardHub(10)
-	a := NewThreatAnalyzer(hub, w)
+	a := NewThreatAnalyzer(hub, w, nil)
 	// Whitelist'teki kaynaktan dikey port tarama denemesi — hiç uyarı olmamalı.
 	for p := 0; p < threatPortScanMin+5; p++ {
 		a.Observe(FlowRecord{SrcIP: "203.0.113.7", DstIP: "10.0.0.5", DstPort: uint16(1000 + p), Protocol: "TCP"})
@@ -111,7 +111,7 @@ func TestHandleWhitelistFlow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	w := NewWhitelist(path)
 	hub := NewDashboardHub(10)
-	app := &App{whitelist: w, analyzer: NewThreatAnalyzer(hub, w)}
+	app := &App{whitelist: w, analyzer: NewThreatAnalyzer(hub, w, nil)}
 
 	// POST — geçerli giriş ekle.
 	rec := httptest.NewRecorder()

@@ -1,0 +1,161 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestBlocklistAddAndIPs, ekleme, whitelist filtrelemesi ve düz metin çıktısını doğrular.
+func TestBlocklistAddAndIPs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	if err := w.Add("10.0.0.5"); err != nil {
+		t.Fatalf("whitelist Add: %v", err)
+	}
+	b := NewBlocklist(path, blocklistRetention, w)
+
+	b.Add("185.234.12.34", "bruteforce")
+	b.Add("45.155.204.15", "portscan")
+	b.Add("185.234.12.34", "hostsweep") // aynı IP tekrar → tekilleştirilmeli, hits artmalı
+	b.Add("10.0.0.5", "bruteforce")     // whitelist'te → eklenmemeli
+
+	ips := b.IPs()
+	if len(ips) != 2 {
+		t.Fatalf("2 IP bekleniyordu, alınan %d: %v", len(ips), ips)
+	}
+	joined := strings.Join(ips, ",")
+	if !strings.Contains(joined, "185.234.12.34") || !strings.Contains(joined, "45.155.204.15") {
+		t.Errorf("beklenen IP'ler yok: %v", ips)
+	}
+	if strings.Contains(joined, "10.0.0.5") {
+		t.Errorf("whitelist'teki IP kara listeye girmemeliydi: %v", ips)
+	}
+
+	snap := b.Snapshot()
+	for _, e := range snap {
+		if e.IP == "185.234.12.34" && e.Hits != 2 {
+			t.Errorf("185.234.12.34 için hits=2 bekleniyordu, alınan %d", e.Hits)
+		}
+	}
+}
+
+// TestBlocklistPersistAndReload, diske yazma ve süresi dolmuş kayıtların yeniden
+// yüklemede atlanmasını doğrular.
+func TestBlocklistPersistAndReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+
+	b := NewBlocklist(path, blocklistRetention, w)
+	b.Add("185.234.12.34", "bruteforce")
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("blocklist.json yazılmadı: %v", err)
+	}
+
+	// Yeni örnek diskten yüklemeli.
+	b2 := NewBlocklist(path, blocklistRetention, w)
+	if got := b2.IPs(); len(got) != 1 || got[0] != "185.234.12.34" {
+		t.Fatalf("yeniden yükleme başarısız, alınan: %v", got)
+	}
+
+	// Süresi dolmuş bir kayıt içeren dosya yazıp yüklemenin onu atlamasını doğrula.
+	expired := blocklistFileFormat{Entries: []blocklistEntry{{
+		IP:        "1.2.3.4",
+		Rule:      "bruteforce",
+		Hits:      1,
+		FirstSeen: time.Now().Add(-100 * time.Hour),
+		LastSeen:  time.Now().Add(-100 * time.Hour),
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // geçmişte → atlanmalı
+	}}}
+	data, _ := json.MarshalIndent(expired, "", "  ")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("dosya yazımı: %v", err)
+	}
+	b3 := NewBlocklist(path, blocklistRetention, w)
+	if got := b3.IPs(); len(got) != 0 {
+		t.Fatalf("süresi dolmuş kayıt atlanmalıydı, alınan: %v", got)
+	}
+}
+
+// TestBlocklistPurgeExpired, negatif retention ile süresi anında dolan kayıtların
+// PurgeExpired ile temizlenmesini doğrular.
+func TestBlocklistPurgeExpired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	b := NewBlocklist(path, -1*time.Minute, w) // ExpiresAt geçmişte olur
+
+	b.Add("185.234.12.34", "bruteforce")
+	if got := b.IPs(); len(got) != 0 {
+		t.Fatalf("süresi geçmiş kayıt IPs() içinde görünmemeli: %v", got)
+	}
+	b.PurgeExpired()
+	if got := b.Snapshot(); len(got) != 0 {
+		t.Fatalf("PurgeExpired sonrası boş bekleniyordu: %v", got)
+	}
+}
+
+// TestBlocklistEndpointToken, düz metin endpoint'in token doğrulamasını ve
+// çıktısını doğrular.
+func TestBlocklistEndpointToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	b := NewBlocklist(path, blocklistRetention, w)
+	b.Add("185.234.12.34", "bruteforce")
+
+	app := &App{
+		cfg:       Config{BlocklistToken: "gizli-token"},
+		blocklist: b,
+	}
+
+	// Token yok → 403.
+	req := httptest.NewRequest(http.MethodGet, "/blocklist", nil)
+	rec := httptest.NewRecorder()
+	app.handleBlocklist(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("token'sız istek 403 bekleniyordu, alınan %d", rec.Code)
+	}
+
+	// Yanlış token → 403.
+	req = httptest.NewRequest(http.MethodGet, "/blocklist?token=yanlis", nil)
+	rec = httptest.NewRecorder()
+	app.handleBlocklist(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("yanlış token 403 bekleniyordu, alınan %d", rec.Code)
+	}
+
+	// Doğru token → 200 ve düz metin IP.
+	req = httptest.NewRequest(http.MethodGet, "/blocklist?token=gizli-token", nil)
+	rec = httptest.NewRecorder()
+	app.handleBlocklist(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("doğru token 200 bekleniyordu, alınan %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("text/plain bekleniyordu, alınan %q", ct)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "185.234.12.34" {
+		t.Errorf("beklenen çıktı '185.234.12.34', alınan %q", body)
+	}
+}
+
+// TestBlocklistEndpointDisabledWithoutToken, BLOCKLIST_TOKEN boşken endpoint'in
+// devre dışı olduğunu doğrular.
+func TestBlocklistEndpointDisabledWithoutToken(t *testing.T) {
+	b := NewBlocklist(filepath.Join(t.TempDir(), "blocklist.json"), blocklistRetention,
+		NewWhitelist(filepath.Join(t.TempDir(), "config.json")))
+	app := &App{cfg: Config{BlocklistToken: ""}, blocklist: b}
+
+	req := httptest.NewRequest(http.MethodGet, "/blocklist?token=any", nil)
+	rec := httptest.NewRecorder()
+	app.handleBlocklist(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("token yapılandırılmamışken 403 bekleniyordu, alınan %d", rec.Code)
+	}
+}

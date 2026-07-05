@@ -16,6 +16,7 @@ Bu proje, OPNsense üzerinden UDP `9995` portuna gönderilen NetFlow v9 kayıtla
 - Aktif log dosyası, son SHA-256 ve son TSA durumunu panelde izleme
 - Arka planda tehdit analizi (brute-force, dikey/yatay tarama) ve açılır güvenlik paneli
 - Tehdit analizinde görmezden gelinecek kaynak IP/CIDR whitelist'i (`config.json` içinde kalıcı)
+- Zararlı IP kara listesi (`blocklist.json` içinde kalıcı, 72 saat saklama) ve OPNsense için düz metin `/blocklist` endpoint'i
 - Ubuntu için otomatik kurulum ve `systemd` servisleştirme desteği
 
 ## Log Satır Formatı
@@ -55,6 +56,8 @@ Desteklenen değişkenler:
 - `LOG_ROOT`: log kök dizini, varsayılan `./logs`
 - `TSA_URL`: TSA servisi, varsayılan `https://freetsa.org/tsr`
 - `TIMEZONE`: zaman dilimi, varsayılan `Europe/Istanbul`
+- `BLOCKLIST_TOKEN`: `/blocklist` düz metin endpoint erişim token'ı; boşsa endpoint devre dışı
+- `BLOCKLIST_ALLOW_IPS`: (opsiyonel) `/blocklist` için izin verilen IP/CIDR listesi (virgülle ayrılır)
 
 ## Geliştirme Ortamında Çalıştırma
 
@@ -148,6 +151,59 @@ Whitelist ayrıca HTTP API ile de yönetilebilir (tümü HTTP Basic Auth ile kor
 - `DELETE /api/whitelist?entry=10.0.0.0%2F24` — girişi kaldırır
 
 Girişler eklenirken doğrulanır ve kanonik biçime indirgenir (ör. `10.0.0.5/24` → `10.0.0.0/24`); geçersiz IP/CIDR değerleri `400` ile reddedilir.
+
+## Zararlı IP Kara Listesi (OPNsense Otomatik Ban)
+
+Tehdit analizi bir kaynak IP'yi zararlı olarak işaretlediğinde (brute-force, port/host tarama), bu IP çalışma dizinindeki `blocklist.json` dosyasında **kalıcı** olarak saklanır. Uyarıların aksine kara liste süreç yeniden başlatıldığında kaybolmaz.
+
+- Her IP, **son tespitten itibaren 72 saat** boyunca listede kalır (`blocklistRetention`). Aktif bir saldırganın her yeni tespiti bu süreyi tazeler; saldırı durduktan sonra IP en az 72 saat listede kalır ve süresi dolunca otomatik temizlenir.
+- Whitelist'e alınan bir IP kara listeye asla girmez; sonradan whitelist'e eklenirse kara listeden de anında düşürülür.
+
+`blocklist.json` biçimi:
+
+```json
+{
+  "entries": [
+    {
+      "ip": "185.234.12.34",
+      "rule": "bruteforce",
+      "hits": 7,
+      "first_seen": "2026-07-06T10:00:00+03:00",
+      "last_seen": "2026-07-06T10:12:30+03:00",
+      "expires_at": "2026-07-09T10:12:30+03:00"
+    }
+  ]
+}
+```
+
+### Düz Metin Endpoint (`/blocklist`)
+
+OPNsense'in **Firewall → Aliases** ekranında **URL Table (IPs)** tipiyle çekebileceği, satır başına bir IP içeren temiz düz metin çıktısı sağlanır (HTML / JSON / boş satır yok):
+
+```
+185.234.12.34
+45.155.204.15
+```
+
+Bu endpoint HTTP Basic Auth yerine token ile korunur (firewall'lar Basic Auth göndermez). `.env` içinde:
+
+```env
+BLOCKLIST_TOKEN=uzun-rastgele-bir-token
+# (opsiyonel) yalnızca OPNsense WAN IP'sinden erişime izin ver
+BLOCKLIST_ALLOW_IPS=203.0.113.10
+```
+
+OPNsense alias URL'si:
+
+```
+https://<host>:<port>/blocklist?token=uzun-rastgele-bir-token
+```
+
+- `BLOCKLIST_TOKEN` boş bırakılırsa endpoint tamamen **devre dışıdır** (her istek `403`).
+- Token `?token=` sorgu parametresi veya `Authorization: Bearer <token>` başlığı ile gönderilebilir; karşılaştırma sabit zamanlıdır.
+- `BLOCKLIST_ALLOW_IPS` tanımlıysa (virgülle ayrılmış IP/CIDR), yalnızca bu ağlardan gelen istekler kabul edilir.
+
+Ayrıca panel/görüntüleme için Basic Auth arkasında ayrıntılı JSON döndüren `GET /api/blocklist` bulunur.
 
 ## OPNsense Tarafı
 

@@ -12,6 +12,9 @@
 # Çalışma zamanı yapılandırması (whitelist vb.)
 /config.json
 
+# Zararlı IP kara listesi (çalışma zamanında üretilir)
+/blocklist.json
+
 # Go test ve coverage artefaktları
 *.test
 *.out
