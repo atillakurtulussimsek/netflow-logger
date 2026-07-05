@@ -160,6 +160,26 @@ func TestBlocklistEndpointDisabledWithoutToken(t *testing.T) {
 	}
 }
 
+// TestBlocklistEndpointReflectsManualImmediately, dosyaya elle eklenen manuel
+// kaydın (SyncManual elle çağrılmadan) endpoint isteğinde anında görünmesini doğrular.
+func TestBlocklistEndpointReflectsManualImmediately(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.json")
+	w := NewWhitelist(filepath.Join(t.TempDir(), "config.json"))
+	b := NewBlocklist(path, blocklistRetention, w)
+	app := &App{cfg: Config{BlocklistToken: "tok"}, blocklist: b}
+
+	// Süreç çalışırken kullanıcı dosyaya elle manuel IP ekler.
+	writeBlocklistFile(t, path, blocklistEntry{IP: "185.234.12.34", Manual: true})
+
+	// Endpoint isteği SyncManual'ı elle çağırmadan yansıtmalı.
+	req := httptest.NewRequest(http.MethodGet, "/blocklist?token=tok", nil)
+	rec := httptest.NewRecorder()
+	app.handleBlocklist(rec, req)
+	if body := strings.TrimSpace(rec.Body.String()); body != "185.234.12.34" {
+		t.Fatalf("manuel IP endpoint'te anında görünmeliydi, alınan: %q", body)
+	}
+}
+
 // writeBlocklistFile, testte dosyaya doğrudan (elle düzenleme simülasyonu) yazar.
 func writeBlocklistFile(t *testing.T, path string, entries ...blocklistEntry) {
 	t.Helper()

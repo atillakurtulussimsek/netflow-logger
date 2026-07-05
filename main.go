@@ -1733,6 +1733,10 @@ func (a *App) handleBlocklist(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		return
 	}
+	// İstek anında dosyadaki manuel düzenlemeleri belleğe yansıt; böylece elle
+	// eklenen/çıkarılan manuel kayıtlar 5 sn'lik bakım döngüsünü beklemeden
+	// endpoint'e anında yansır.
+	a.blocklist.SyncManual()
 	for _, ip := range a.blocklist.IPs() {
 		fmt.Fprintln(w, ip)
 	}
@@ -1742,6 +1746,7 @@ func (a *App) handleBlocklist(w http.ResponseWriter, r *http.Request) {
 // (basic auth arkasında).
 func (a *App) handleBlocklistAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	a.blocklist.SyncManual()
 	entries := a.blocklist.Snapshot()
 	if entries == nil {
 		entries = []blocklistEntry{}
