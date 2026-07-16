@@ -1503,6 +1503,15 @@ func (b *Blocklist) syncManualFromFileLocked() {
 // çalışma zamanında elle eklenmiş kayıtlar üzerine yazılıp kaybolmasın.
 func (b *Blocklist) persistLocked() {
 	b.syncManualFromFileLocked()
+	b.writeFileLocked()
+}
+
+// writeFileLocked, bellekteki kayıtları IP'ye göre sıralı ve atomik biçimde diske
+// yazar (b.mu kilitli olmalı). persistLocked'ın aksine dosyayla senkronlamaz;
+// çağıran, b.entries'in yazılmak istenen son durumu içerdiğinden emin olmalıdır.
+// Bu ayrım, henüz dosyada olmayan yeni bir manuel kaydın (AddManual) senkron
+// sırasında yanlışlıkla silinmesini önlemek için gereklidir.
+func (b *Blocklist) writeFileLocked() {
 	list := make([]blocklistEntry, 0, len(b.entries))
 	for _, e := range b.entries {
 		list = append(list, *e)
@@ -1530,6 +1539,84 @@ func (b *Blocklist) persistLocked() {
 		return
 	}
 	b.lastPersist = time.Now()
+}
+
+// AddManual, bir kaynak IP'yi kalıcı (manuel) kara liste kaydı olarak ekler. Manuel
+// kayıtlar süre aşımıyla temizlenmez ve yalnızca blocklist.json içinde tutulur;
+// config.json'a hiç dokunulmaz. Böylece IP'ler web arayüzünden config dosyasıyla
+// uğraşmadan engellenebilir. Whitelist'teki IP'ler engellenemez.
+func (b *Blocklist) AddManual(ip, reason string) error {
+	if b == nil {
+		return errors.New("kara liste kullanılamıyor")
+	}
+	norm, err := normalizeBlocklistIP(ip)
+	if err != nil {
+		return err
+	}
+	if b.whitelist.Contains(norm) {
+		return fmt.Errorf("%s whitelist'te olduğundan engellenemez", norm)
+	}
+	reason = strings.TrimSpace(reason)
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Eşzamanlı dosya düzenlemelerinin ezilmemesi için önce dosyadaki manuel
+	// kayıtları belleğe al; ardından yeni kaydı ekleyip writeFileLocked ile yaz.
+	// persistLocked kullanılmaz: tekrar senkronlarsa, henüz dosyada olmayan bu
+	// yeni manuel kayıt silinir.
+	b.syncManualFromFileLocked()
+	e := b.entries[norm]
+	if e == nil {
+		e = &blocklistEntry{IP: norm, FirstSeen: now}
+		b.entries[norm] = e
+	}
+	e.Manual = true
+	e.LastSeen = now
+	e.Hits++
+	if reason != "" {
+		e.Rule = reason
+	} else if e.Rule == "" {
+		e.Rule = "Panelden elle engellendi"
+	}
+	b.writeFileLocked()
+	return nil
+}
+
+// RemoveManual, manuel olarak engellenmiş bir IP'yi kara listeden kaldırır. Yalnızca
+// manuel kayıtlar kaldırılabilir; sistemin tespit ettiği kayıtlar retention süresince
+// otomatik yönetilir. IP sistemce tekrar tespit edilirse yeniden listeye girer.
+func (b *Blocklist) RemoveManual(ip string) error {
+	if b == nil {
+		return errors.New("kara liste kullanılamıyor")
+	}
+	norm, err := normalizeBlocklistIP(ip)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.syncManualFromFileLocked()
+	e := b.entries[norm]
+	if e == nil || !e.Manual {
+		return fmt.Errorf("%s manuel engel listesinde bulunamadı", norm)
+	}
+	delete(b.entries, norm)
+	b.writeFileLocked()
+	return nil
+}
+
+// normalizeBlocklistIP, tek bir IP adresini doğrular ve kanonik biçimine getirir.
+// Kara liste kayıtları IP bazlıdır (CIDR desteklenmez); geçersiz girişte hata döner.
+func normalizeBlocklistIP(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", errors.New("IP adresi boş olamaz")
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return "", fmt.Errorf("geçersiz IP adresi: %s", s)
+	}
+	return ip.String(), nil
 }
 
 // dominantTarget, en çok hedeflenen IP'yi ve farklı hedef sayısını döndürür.
@@ -1742,9 +1829,43 @@ func (a *App) handleBlocklist(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleBlocklistAPI, panel/görüntüleme için kara listeyi ayrıntılı JSON döndürür
-// (basic auth arkasında).
+// handleBlocklistAPI, kara listeyi panel için yönetir (basic auth arkasında):
+//   - GET: aktif kayıtları ayrıntılı JSON olarak döndürür.
+//   - POST: gövdedeki IP'yi manuel (kalıcı) olarak engeller.
+//   - DELETE: ?ip=<adres> ile verilen manuel engeli kaldırır.
+//
+// Manuel engeller yalnızca blocklist.json'a yazılır; config.json'a dokunulmaz.
 func (a *App) handleBlocklistAPI(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.writeBlocklist(w)
+	case http.MethodPost:
+		var body struct {
+			IP     string `json:"ip"`
+			Reason string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, "geçersiz istek gövdesi", http.StatusBadRequest)
+			return
+		}
+		if err := a.blocklist.AddManual(body.IP, body.Reason); err != nil {
+			writeJSONError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		a.writeBlocklist(w)
+	case http.MethodDelete:
+		if err := a.blocklist.RemoveManual(r.URL.Query().Get("ip")); err != nil {
+			writeJSONError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		a.writeBlocklist(w)
+	default:
+		writeJSONError(w, "desteklenmeyen metot", http.StatusMethodNotAllowed)
+	}
+}
+
+// writeBlocklist, güncel kara liste durumunu JSON olarak yazar.
+func (a *App) writeBlocklist(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	a.blocklist.SyncManual()
 	entries := a.blocklist.Snapshot()
@@ -3793,7 +3914,6 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .threat-copy-ip {
-      margin-top: 8px;
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -4093,6 +4213,60 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     .whitelist-remove svg { width: 12px; height: 12px; }
+
+    /* Engellenen kaynaklar (manuel kara liste) — kırmızı aksan */
+    .blocklist-section { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border-soft); }
+    .blocklist-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; color: #fff; }
+    .blocklist-title svg { width: 17px; height: 17px; color: #ff5d7a; flex-shrink: 0; }
+    .blocklist-sub { margin: 5px 0 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+    .blocklist-sub .mono { color: var(--neon-blue); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .blocklist-form { display: flex; gap: 8px; margin-top: 14px; }
+    .blocklist-input {
+      flex: 1; min-width: 0; min-height: 42px; border-radius: 14px; border: 1px solid var(--border);
+      background: rgba(7,10,20,0.9); color: var(--text); padding: 0 14px; font-size: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      outline: none; transition: 0.18s ease;
+    }
+    .blocklist-input::placeholder { color: var(--muted-2); }
+    .blocklist-input:hover { border-color: rgba(255,93,122,0.4); }
+    .blocklist-input:focus { border-color: #ff5d7a; box-shadow: 0 0 0 3px rgba(255,93,122,0.18); }
+    .blocklist-add {
+      display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 0 18px;
+      border-radius: 14px; border: 1px solid #ff5d7a; background: #ff5d7a; color: #2e0511;
+      font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: 0.18s ease;
+    }
+    .blocklist-add:hover { box-shadow: 0 0 18px rgba(255,93,122,0.45); }
+    .blocklist-error {
+      margin-top: 10px; padding: 9px 12px; border-radius: 12px; font-size: 12px; color: #ffb4c2;
+      background: rgba(255,93,122,0.1); border: 1px solid rgba(255,93,122,0.32);
+    }
+    .blocklist-error[hidden] { display: none; }
+    .blocklist-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .blocklist-empty { font-size: 12px; color: var(--muted-2); }
+    .blocklist-chip {
+      display: inline-flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-radius: 999px;
+      background: rgba(255,93,122,0.1); border: 1px solid rgba(255,93,122,0.3); font-size: 13px; font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; color: #ffd7de;
+    }
+    .blocklist-chip .blocklist-chip-rule { color: var(--muted-2); font-weight: 500; font-size: 11px; }
+    .blocklist-remove {
+      display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px;
+      border-radius: 999px; border: none; background: rgba(255,93,122,0.18); color: #ffd7de; cursor: pointer; transition: 0.15s ease;
+    }
+    .blocklist-remove:hover { background: rgba(255,93,122,0.4); color: #fff; }
+    .blocklist-remove svg { width: 12px; height: 12px; }
+
+    /* Tehdit uyarısında tek tıkla banla butonu */
+    .threat-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+    .threat-ban {
+      display: inline-flex; align-items: center; gap: 5px; margin-left: 8px; padding: 3px 9px; border-radius: 8px;
+      border: 1px solid rgba(255,93,122,0.4); background: rgba(255,93,122,0.12); color: #ff8ea3;
+      font-size: 11px; font-weight: 700; cursor: pointer; transition: 0.15s ease; vertical-align: middle;
+    }
+    .threat-ban:hover { background: rgba(255,93,122,0.24); color: #fff; }
+    .threat-ban svg { width: 12px; height: 12px; flex-shrink: 0; }
+    .threat-ban.banned { border-color: rgba(255,93,122,0.6); background: rgba(255,93,122,0.28); color: #fff; cursor: default; }
+    .threat-ban[disabled] { opacity: 0.7; cursor: default; }
 
     @media (prefers-reduced-motion: reduce) {
       .threat-badge.active { animation: none; }
@@ -4604,6 +4778,26 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
         </div>
 
+        <div class="blocklist-section">
+          <div class="blocklist-head">
+            <span class="blocklist-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>
+              </svg>
+              Engellenen kaynaklar
+            </span>
+            <p class="blocklist-sub">Buraya eklenen IP adresleri kalıcı olarak kara listeye alınır ve <span class="mono">/blocklist</span> endpoint'i üzerinden güvenlik duvarına (OPNsense) yansır. Kayıtlar <span class="mono">blocklist.json</span> içinde tutulur; <span class="mono">config.json</span>'a dokunulmaz.</p>
+          </div>
+          <form class="blocklist-form" id="blocklist-form" autocomplete="off">
+            <input type="text" class="blocklist-input" id="blocklist-input" placeholder="Engellenecek IP (ör. 203.0.113.5)" spellcheck="false" aria-label="Engellenecek IP" />
+            <button type="submit" class="blocklist-add">Engelle</button>
+          </form>
+          <div class="blocklist-error" id="blocklist-error" role="alert" hidden></div>
+          <div class="blocklist-list" id="blocklist-list">
+            <div class="blocklist-empty" id="blocklist-empty">Elle engellenen kaynak yok.</div>
+          </div>
+        </div>
+
         <div class="whitelist-section">
           <div class="whitelist-head">
             <span class="whitelist-title">
@@ -4724,6 +4918,11 @@ const dashboardHTML = `<!DOCTYPE html>
     const whitelistErrorEl = document.getElementById('whitelist-error');
     const whitelistListEl = document.getElementById('whitelist-list');
     const whitelistEmptyEl = document.getElementById('whitelist-empty');
+    const blocklistFormEl = document.getElementById('blocklist-form');
+    const blocklistInputEl = document.getElementById('blocklist-input');
+    const blocklistErrorEl = document.getElementById('blocklist-error');
+    const blocklistListEl = document.getElementById('blocklist-list');
+    const blocklistEmptyEl = document.getElementById('blocklist-empty');
 
     let eventSource = null;
     let livePollTimer = null;
@@ -5254,10 +5453,16 @@ const dashboardHTML = `<!DOCTYPE html>
       hostsweep: 'Host tarama'
     };
     let lastThreatSig = null;
+    // En son alınan tehdit listesi; engel durumu değiştiğinde satırları yeniden çizmek için saklanır.
+    let lastThreatList = null;
+    // Şu an manuel engelli olan IP'ler; tehdit satırındaki "Banla" butonunun durumunu
+    // belirlemek için loadBlocklist() ile güncellenir.
+    const bannedIps = new Set();
 
     // Güvenlik panelini ve ribbon tehdit rozetini gelen uyarı listesine göre günceller.
     function updateThreats(threats) {
       const list = Array.isArray(threats) ? threats : [];
+      lastThreatList = list;
       const count = list.length;
 
       if (threatBadgeEl) {
@@ -5284,8 +5489,9 @@ const dashboardHTML = `<!DOCTYPE html>
         threatStatusEl.className = 'threat-status ' + (count > 0 ? 'alert' : 'ok');
       }
 
-      // Gereksiz DOM yenilemesini önlemek için imza karşılaştırması.
-      const sig = JSON.stringify(list);
+      // Gereksiz DOM yenilemesini önlemek için imza karşılaştırması. Banlı IP kümesi
+      // de imzaya katılır ki bir IP engellendiğinde buton durumu tazelenirken güncellensin.
+      const sig = JSON.stringify(list) + '|' + Array.from(bannedIps).sort().join(',');
       if (sig === lastThreatSig) {
         return;
       }
@@ -5307,9 +5513,18 @@ const dashboardHTML = `<!DOCTYPE html>
         const detail = a.detail ? escapeHtml(a.detail) : (rule + ' tespit edildi.');
         const ip = a.src_ip ? String(a.src_ip) : '';
         const copyIp = ip
-          ? '<button type="button" class="threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala (banlamak için)">'
+          ? '<button type="button" class="threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala">'
             + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>'
             + '<span class="threat-copy-label">' + escapeHtml(ip) + '</span>'
+            + '</button>'
+          : '';
+        const banned = ip && bannedIps.has(ip);
+        const banBtn = ip
+          ? '<button type="button" class="threat-ban' + (banned ? ' banned' : '') + '" data-ip="' + escapeHtml(ip) + '"'
+            + ' data-reason="' + escapeHtml(a.title || rule) + '"' + (banned ? ' disabled' : '')
+            + ' title="Bu IP\'yi kalıcı olarak engelle">'
+            + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>'
+            + '<span>' + (banned ? 'Engellendi' : 'Banla') + '</span>'
             + '</button>'
           : '';
         return '<div class="threat-item ' + sev + '">'
@@ -5317,7 +5532,7 @@ const dashboardHTML = `<!DOCTYPE html>
           + '<div class="threat-body">'
           +   '<div class="threat-item-title">' + escapeHtml(a.title || rule) + hits + '</div>'
           +   '<div class="threat-meta">' + detail + '</div>'
-          +   copyIp
+          +   '<div class="threat-actions">' + copyIp + banBtn + '</div>'
           + '</div>'
           + '<span class="threat-time">' + escapeHtml(formatTime(a.last_seen || '')) + '</span>'
           + '</div>';
@@ -5551,6 +5766,7 @@ const dashboardHTML = `<!DOCTYPE html>
       threatModalEl.hidden = false;
       if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'true');
       loadWhitelist();
+      loadBlocklist();
       const closeBtn = threatModalEl.querySelector('.threat-close');
       if (closeBtn) closeBtn.focus();
     }
@@ -5699,6 +5915,119 @@ const dashboardHTML = `<!DOCTYPE html>
       });
     }
 
+    // Manuel kara liste yönetimi: engellenen IP'leri listeler, ekler ve kaldırır.
+    // Değişiklikler /api/blocklist üzerinden blocklist.json'a yazılır (config.json'a değil).
+    function showBlocklistError(msg) {
+      if (!blocklistErrorEl) return;
+      if (msg) {
+        blocklistErrorEl.textContent = msg;
+        blocklistErrorEl.hidden = false;
+      } else {
+        blocklistErrorEl.textContent = '';
+        blocklistErrorEl.hidden = true;
+      }
+    }
+
+    // syncBannedIps, verilen kayıt listesinden bannedIps kümesini yeniden kurar; tehdit
+    // satırındaki "Banla" butonlarının güncel duruma göre çizilmesi için lastThreatSig'i
+    // sıfırlayıp son tehdit listesini yeniden render eder.
+    function syncBannedIps(entries) {
+      bannedIps.clear();
+      (Array.isArray(entries) ? entries : []).forEach(function(e){
+        if (e && e.ip) bannedIps.add(String(e.ip));
+      });
+      lastThreatSig = null;
+      if (lastThreatList) updateThreats(lastThreatList);
+    }
+
+    function renderBlocklist(entries) {
+      if (!blocklistListEl) return;
+      const list = (Array.isArray(entries) ? entries : []).filter(function(e){ return e && e.manual; });
+      Array.prototype.slice.call(blocklistListEl.querySelectorAll('.blocklist-chip')).forEach(function(n){ n.remove(); });
+      if (blocklistEmptyEl) blocklistEmptyEl.hidden = list.length > 0;
+      if (list.length === 0) return;
+      const html = list.map(function(e){
+        const ip = String(e.ip);
+        const rule = e.rule ? '<span class="blocklist-chip-rule">' + escapeHtml(String(e.rule)) + '</span>' : '';
+        return '<span class="blocklist-chip">'
+          + '<span>' + escapeHtml(ip) + '</span>' + rule
+          + '<button type="button" class="blocklist-remove" data-ip="' + escapeHtml(ip) + '" aria-label="' + escapeHtml(ip) + ' engelini kaldır">'
+          +   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
+          + '</button>'
+          + '</span>';
+      }).join('');
+      blocklistListEl.insertAdjacentHTML('beforeend', html);
+    }
+
+    async function loadBlocklist() {
+      try {
+        const response = await fetch('/api/blocklist', { cache: 'no-store' });
+        if (!response.ok) throw new Error('liste alınamadı');
+        const data = await response.json();
+        syncBannedIps(data.entries);
+        renderBlocklist(data.entries);
+      } catch (error) {
+        showBlocklistError('Engel listesi yüklenemedi.');
+      }
+    }
+
+    async function submitBlock(ip, reason) {
+      showBlocklistError('');
+      try {
+        const response = await fetch('/api/blocklist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip: ip, reason: reason || '' }),
+        });
+        const data = await response.json().catch(function(){ return {}; });
+        if (!response.ok) {
+          showBlocklistError(data.error || 'IP engellenemedi.');
+          return false;
+        }
+        syncBannedIps(data.entries);
+        renderBlocklist(data.entries);
+        return true;
+      } catch (error) {
+        showBlocklistError('IP engellenemedi.');
+        return false;
+      }
+    }
+
+    async function removeBlock(ip) {
+      showBlocklistError('');
+      try {
+        const response = await fetch('/api/blocklist?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
+        const data = await response.json().catch(function(){ return {}; });
+        if (!response.ok) {
+          showBlocklistError(data.error || 'Engel kaldırılamadı.');
+          return;
+        }
+        syncBannedIps(data.entries);
+        renderBlocklist(data.entries);
+      } catch (error) {
+        showBlocklistError('Engel kaldırılamadı.');
+      }
+    }
+
+    if (blocklistFormEl) {
+      blocklistFormEl.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const value = (blocklistInputEl.value || '').trim();
+        if (!value) return;
+        const ok = await submitBlock(value, 'Panelden elle engellendi');
+        if (ok) {
+          blocklistInputEl.value = '';
+          blocklistInputEl.focus();
+        }
+      });
+    }
+    if (blocklistListEl) {
+      blocklistListEl.addEventListener('click', (event) => {
+        const btn = event.target.closest('.blocklist-remove');
+        if (btn) removeBlock(btn.getAttribute('data-ip'));
+      });
+    }
+
     prevPageEl.addEventListener('click', async () => {
       if (currentPage <= 1) {
         return;
@@ -5734,8 +6063,21 @@ const dashboardHTML = `<!DOCTYPE html>
       setTimeout(() => copyShaEl.classList.remove('copied'), 1200);
     });
 
-    // Güvenlik uyarılarındaki "IP kopyala" butonları (dinamik içerik → event delegation).
+    // Güvenlik uyarılarındaki "IP kopyala" ve "Banla" butonları (dinamik içerik → event delegation).
     threatListEl.addEventListener('click', async (event) => {
+      const banBtn = event.target.closest('.threat-ban');
+      if (banBtn) {
+        const ip = banBtn.getAttribute('data-ip');
+        if (!ip || banBtn.classList.contains('banned') || banBtn.disabled) {
+          return;
+        }
+        banBtn.disabled = true;
+        const ok = await submitBlock(ip, banBtn.getAttribute('data-reason') || '');
+        if (!ok) {
+          banBtn.disabled = false;
+        }
+        return;
+      }
       const btn = event.target.closest('.threat-copy-ip');
       if (!btn) {
         return;
