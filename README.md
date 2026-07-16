@@ -16,7 +16,7 @@ Bu proje, OPNsense üzerinden UDP `9995` portuna gönderilen NetFlow v9 kayıtla
 - Aktif log dosyası, son SHA-256 ve son TSA durumunu panelde izleme
 - Arka planda tehdit analizi (brute-force, dikey/yatay tarama) ve açılır güvenlik paneli
 - Tehdit analizinde görmezden gelinecek kaynak IP/CIDR whitelist'i (`config.json` içinde kalıcı)
-- Zararlı IP kara listesi (`blocklist.json` içinde kalıcı, 72 saat saklama) ve OPNsense için düz metin `/blocklist` endpoint'i
+- Zararlı IP kara listesi (`blocklist.json` içinde kalıcı, 7 gün saklama) ve OPNsense için düz metin `/blocklist` endpoint'i
 - Ubuntu için otomatik kurulum ve `systemd` servisleştirme desteği
 
 ## Log Satır Formatı
@@ -156,7 +156,7 @@ Girişler eklenirken doğrulanır ve kanonik biçime indirgenir (ör. `10.0.0.5/
 
 Tehdit analizi bir kaynak IP'yi zararlı olarak işaretlediğinde (brute-force, port/host tarama), bu IP çalışma dizinindeki `blocklist.json` dosyasında **kalıcı** olarak saklanır. Uyarıların aksine kara liste süreç yeniden başlatıldığında kaybolmaz.
 
-- Her IP, **son tespitten itibaren 72 saat** boyunca listede kalır (`blocklistRetention`). Aktif bir saldırganın her yeni tespiti bu süreyi tazeler; saldırı durduktan sonra IP en az 72 saat listede kalır ve süresi dolunca otomatik temizlenir.
+- Her IP, **son tespitten itibaren 7 gün** boyunca listede kalır (`blocklistRetention`). Aktif bir saldırganın her yeni tespiti bu süreyi tazeler; saldırı durduktan sonra IP en az 7 gün listede kalır ve süresi dolunca otomatik temizlenir.
 - Whitelist'e alınan bir IP kara listeye asla girmez; sonradan whitelist'e eklenirse kara listeden de anında düşürülür.
 
 `blocklist.json` biçimi:
@@ -170,7 +170,7 @@ Tehdit analizi bir kaynak IP'yi zararlı olarak işaretlediğinde (brute-force, 
       "hits": 7,
       "first_seen": "2026-07-06T10:00:00+03:00",
       "last_seen": "2026-07-06T10:12:30+03:00",
-      "expires_at": "2026-07-09T10:12:30+03:00"
+      "expires_at": "2026-07-13T10:12:30+03:00"
     }
   ]
 }
@@ -180,7 +180,7 @@ Tehdit analizi bir kaynak IP'yi zararlı olarak işaretlediğinde (brute-force, 
 
 Kara listeye elle IP eklemek istersen, kaydın içine **`"manual": true`** alanını yazman gerekir. Sistem `blocklist.json` dosyasını bellekten yeniden yazdığı için, bu işaret olmadan elle eklenen kayıtlar bir sonraki yazımda ezilir. Manuel kayıtlar:
 
-- Süre aşımıyla **temizlenmez** (72 saat kuralı yalnızca sistem kayıtları içindir); kalıcıdır.
+- Süre aşımıyla **temizlenmez** (7 gün kuralı yalnızca sistem kayıtları içindir); kalıcıdır.
 - Sistem dosyayı yeniden yazarken **korunur** (yazımdan önce dosyadaki manuel kayıtlar geri okunur).
 - Çalışma zamanında yapılan ekleme/çıkarmalar endpoint'e **anında** yansır: her `/blocklist` (ve `/api/blocklist`) isteği dosyadaki manuel kayıtları önce belleğe senkronlar. Ayrıca 5 sn'lik bakım döngüsü de senkronu tekrarlar. Süreç yeniden başlatmak gerekmez.
 - Dosyadan silinince bellekten de düşer.

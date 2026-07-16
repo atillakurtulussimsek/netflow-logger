@@ -51,7 +51,7 @@ const (
 	// listede kalacağı asgari süredir. Her yeni tespit bu süreyi tazeler, böylece
 	// aktif bir saldırgan pencereyi sürekli uzatır; saldırı dursa bile IP son
 	// tespitten itibaren en az bu süre boyunca listede kalır.
-	blocklistRetention = 72 * time.Hour
+	blocklistRetention = 7 * 24 * time.Hour // 7 gün
 	// blocklistPersistThrottle, mevcut bir kaydın süresi tazelendiğinde diske
 	// yazma sıklığını sınırlar (yeni IP ve silme işlemleri her zaman anında yazılır).
 	blocklistPersistThrottle = 30 * time.Second
@@ -62,9 +62,9 @@ const (
 // hız/desen tabanlıdır).
 const (
 	threatWindow          = 60 * time.Second // değerlendirme penceresi
-	threatBruteforceMin   = 15               // hassas porta bu kadar akış → brute-force
-	threatPortScanMin     = 20               // tek hedefte bu kadar farklı port → dikey tarama
-	threatHostSweepMin    = 25               // tek portta bu kadar farklı hedef → yatay tarama
+	threatBruteforceMin   = 8                // hassas porta bu kadar akış → brute-force
+	threatPortScanMin     = 12               // tek hedefte bu kadar farklı port → dikey tarama
+	threatHostSweepMin    = 15               // tek portta bu kadar farklı hedef → yatay tarama
 	threatAlertTTL        = 3 * time.Minute  // güncellenmeyen (hareketsiz) uyarının panelde kalma süresi
 	threatMaxAlerts       = 200              // panelde tutulan azami uyarı sayısı
 	threatMaxSources      = 4096             // izlenen azami kaynak IP sayısı
@@ -1254,7 +1254,7 @@ type blocklistFileFormat struct {
 
 // Blocklist, tehdit analizinin zararlı olarak işaretlediği kaynak IP'leri
 // blocklist.json içinde kalıcı olarak tutar. Her IP, en son tespitten itibaren
-// retention süresi (72 saat) boyunca listede kalır; süresi dolanlar temizlenir.
+// retention süresi (7 gün) boyunca listede kalır; süresi dolanlar temizlenir.
 // Liste, OPNsense gibi güvenlik duvarlarının "alias URL table" özelliğiyle
 // çekebilmesi için düz metin bir endpoint üzerinden yayınlanır.
 type Blocklist struct {
