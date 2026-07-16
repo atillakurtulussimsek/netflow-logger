@@ -65,7 +65,7 @@ const (
 	threatBruteforceMin   = 15               // hassas porta bu kadar akış → brute-force
 	threatPortScanMin     = 20               // tek hedefte bu kadar farklı port → dikey tarama
 	threatHostSweepMin    = 25               // tek portta bu kadar farklı hedef → yatay tarama
-	threatAlertTTL        = 5 * time.Minute  // güncellenmeyen uyarının panelde kalma süresi
+	threatAlertTTL        = 3 * time.Minute  // güncellenmeyen (hareketsiz) uyarının panelde kalma süresi
 	threatMaxAlerts       = 200              // panelde tutulan azami uyarı sayısı
 	threatMaxSources      = 4096             // izlenen azami kaynak IP sayısı
 	threatMaxEventsPerSrc = 2000             // kaynak başına tutulan azami olay sayısı
