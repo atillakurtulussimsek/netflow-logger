@@ -598,6 +598,15 @@ func (h *DashboardHub) PublishThreats(alerts []ThreatAlert) {
 	h.broadcastSnapshot(snapshot)
 }
 
+// ThreatsSnapshot, yalnızca güncel tehdit uyarılarının bir kopyasını döndürür.
+// Modal açıkken hafif yoklama için tam durum anlık görüntüsünden (kayıtlar, dosya
+// boyutları vb.) daha ucuzdur.
+func (h *DashboardHub) ThreatsSnapshot() []ThreatAlert {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]ThreatAlert(nil), h.threats...)
+}
+
 func (h *DashboardHub) Subscribe() (chan []byte, func()) {
 	ch := make(chan []byte, 16)
 
@@ -1734,6 +1743,7 @@ func (a *App) dashboardRouter() http.Handler {
 	mux.Handle("/api/state", a.basicAuth(http.HandlerFunc(a.handleDashboardState)))
 	mux.Handle("/api/whitelist", a.basicAuth(http.HandlerFunc(a.handleWhitelist)))
 	mux.Handle("/api/blocklist", a.basicAuth(http.HandlerFunc(a.handleBlocklistAPI)))
+	mux.Handle("/api/threats", a.basicAuth(http.HandlerFunc(a.handleThreats)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
 	// Düz metin kara liste: OPNsense alias URL table için. Basic auth yerine
 	// token (ve opsiyonel IP kısıtı) ile korunur; firewall'lar Basic auth göndermez.
@@ -1862,6 +1872,19 @@ func (a *App) handleBlocklistAPI(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, "desteklenmeyen metot", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleThreats, yalnızca güncel güvenlik uyarılarını JSON döndürür. Güvenlik modalı
+// açık olduğu sürece paneli (tablo sayfasından/modundan bağımsız) canlı tutmak için
+// hafif bir yoklama endpoint'idir.
+func (a *App) handleThreats(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	threats := a.dashboard.ThreatsSnapshot()
+	if threats == nil {
+		threats = []ThreatAlert{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"threats": threats})
 }
 
 // writeBlocklist, güncel kara liste durumunu JSON olarak yazar.
@@ -5458,6 +5481,8 @@ const dashboardHTML = `<!DOCTYPE html>
     // Şu an manuel engelli olan IP'ler; tehdit satırındaki "Banla" butonunun durumunu
     // belirlemek için loadBlocklist() ile güncellenir.
     const bannedIps = new Set();
+    // Engellenen kaynaklar listesinin son imzası; yoklamada gereksiz DOM yenilemesini önler.
+    let lastBlocklistSig = null;
 
     // Güvenlik panelini ve ribbon tehdit rozetini gelen uyarı listesine göre günceller.
     function updateThreats(threats) {
@@ -5674,18 +5699,24 @@ const dashboardHTML = `<!DOCTYPE html>
       eventSource = new EventSource('/events?' + params.toString());
 
       eventSource.addEventListener('state', (event) => {
-        if (currentMode !== 'live' || currentPage !== 1) {
-          return;
-        }
         let state;
         try {
           state = JSON.parse(event.data);
         } catch (err) {
           return;
         }
+        setConnectionState('Canlı', 'live');
+        // Güvenlik paneli/tehdit rozeti, log tablosunun sayfasından ve modundan
+        // bağımsız olarak her zaman güncellenir; aksi halde 2. sayfaya geçince
+        // veya geçmiş moda bakarken güvenlik izleme donuyordu.
+        if (Array.isArray(state.threats)) {
+          updateThreats(state.threats);
+        }
+        if (currentMode !== 'live' || currentPage !== 1) {
+          return;
+        }
         state.mode = 'live';
         render(state);
-        setConnectionState('Canlı', 'live');
       });
 
       // EventSource bağlantı koptuğunda kendiliğinden yeniden bağlanır; bu sırada
@@ -5759,6 +5790,36 @@ const dashboardHTML = `<!DOCTYPE html>
     // Güvenlik uyarıları modalı: üst kontroldeki buton (ve ribbon rozeti) ile
     // canlı akış ile güvenlik ekranı arasında geçiş sağlar.
     let threatLastFocus = null;
+    let securityPollTimer = null;
+
+    // refreshSecurityPanel, modal açıkken güvenlik panelini canlı tutar: güncel
+    // tehdit uyarılarını (/api/threats) ve engellenen IP listesini (/api/blocklist)
+    // tazeler. SSE'den bağımsız çalışır; böylece geçmiş modda veya tablo sayfası
+    // 1'den farklıyken bile panel güncel kalır.
+    async function refreshSecurityPanel() {
+      try {
+        const res = await fetch('/api/threats', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.threats)) updateThreats(data.threats);
+        }
+      } catch (err) { /* geçici hata: sonraki yoklamada tekrar denenir */ }
+      loadBlocklist();
+    }
+
+    function startSecurityPoll() {
+      if (securityPollTimer !== null) return;
+      // 4 sn: saldırı sırasında SSE zaten anlık günceller; bu yoklama SSE'nin
+      // atladığı durumları (sayfa/mod) ve kara liste değişimlerini garanti eder.
+      securityPollTimer = setInterval(refreshSecurityPanel, 4000);
+    }
+
+    function stopSecurityPoll() {
+      if (securityPollTimer !== null) {
+        clearInterval(securityPollTimer);
+        securityPollTimer = null;
+      }
+    }
 
     function openThreatModal() {
       if (!threatModalEl || !threatModalEl.hidden) return;
@@ -5767,6 +5828,8 @@ const dashboardHTML = `<!DOCTYPE html>
       if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'true');
       loadWhitelist();
       loadBlocklist();
+      refreshSecurityPanel();
+      startSecurityPoll();
       const closeBtn = threatModalEl.querySelector('.threat-close');
       if (closeBtn) closeBtn.focus();
     }
@@ -5774,6 +5837,7 @@ const dashboardHTML = `<!DOCTYPE html>
     function closeThreatModal() {
       if (!threatModalEl || threatModalEl.hidden) return;
       threatModalEl.hidden = true;
+      stopSecurityPoll();
       if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'false');
       if (threatLastFocus && typeof threatLastFocus.focus === 'function') {
         threatLastFocus.focus();
@@ -5932,10 +5996,19 @@ const dashboardHTML = `<!DOCTYPE html>
     // satırındaki "Banla" butonlarının güncel duruma göre çizilmesi için lastThreatSig'i
     // sıfırlayıp son tehdit listesini yeniden render eder.
     function syncBannedIps(entries) {
-      bannedIps.clear();
+      const next = new Set();
       (Array.isArray(entries) ? entries : []).forEach(function(e){
-        if (e && e.ip) bannedIps.add(String(e.ip));
+        if (e && e.ip) next.add(String(e.ip));
       });
+      // Yalnızca banlı küme gerçekten değiştiyse tehdit satırlarını yeniden çiz;
+      // aksi halde 4 sn'lik yoklama her seferinde gereksiz yeniden çizim yapardı.
+      let changed = next.size !== bannedIps.size;
+      if (!changed) {
+        next.forEach(function(ip){ if (!bannedIps.has(ip)) changed = true; });
+      }
+      if (!changed) return;
+      bannedIps.clear();
+      next.forEach(function(ip){ bannedIps.add(ip); });
       lastThreatSig = null;
       if (lastThreatList) updateThreats(lastThreatList);
     }
@@ -5943,6 +6016,10 @@ const dashboardHTML = `<!DOCTYPE html>
     function renderBlocklist(entries) {
       if (!blocklistListEl) return;
       const list = (Array.isArray(entries) ? entries : []).filter(function(e){ return e && e.manual; });
+      // İmza değişmediyse (yoklama sırasında sık olur) DOM'a dokunma → titreme olmaz.
+      const sig = JSON.stringify(list.map(function(e){ return [e.ip, e.rule]; }));
+      if (sig === lastBlocklistSig) return;
+      lastBlocklistSig = sig;
       Array.prototype.slice.call(blocklistListEl.querySelectorAll('.blocklist-chip')).forEach(function(n){ n.remove(); });
       if (blocklistEmptyEl) blocklistEmptyEl.hidden = list.length > 0;
       if (list.length === 0) return;
