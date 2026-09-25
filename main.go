@@ -3109,1633 +3109,1136 @@ const dashboardHTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
   <title>netflow logger panel</title>
   <style>
+    /* ── Tasarım belirteçleri ─────────────────────────────────────────── */
     :root {
       color-scheme: dark;
-      --bg: #05070e;
-      --panel: rgba(15, 21, 36, 0.74);
-      --panel-2: rgba(11, 16, 29, 0.80);
-      --border: rgba(125, 152, 194, 0.16);
-      --border-soft: rgba(125, 152, 194, 0.10);
-      --text: #eaf0fb;
-      --muted: #9fb1cf;
-      --muted-2: #66799c;
-      --accent: #38bdf8;
-      --accent-soft: rgba(56, 189, 248, 0.12);
-      --accent-2: #34e39b;
-      --neon-cyan: #38bdf8;
-      --neon-blue: #5b9dff;
-      --neon-pink: #5b9dff;
-      --neon-purple: #8aa4ff;
-      --neon-green: #34e39b;
-      --neon-amber: #f5b544;
-      --warn: #f5b544;
-      --danger: #f4586e;
-      --shadow: 0 20px 54px rgba(2, 4, 10, 0.55);
-      --glow-cyan: 0 0 14px rgba(56,189,248,0.28);
-      --glow-pink: 0 0 14px rgba(91,157,255,0.26);
-      --glow-green: 0 0 14px rgba(52,227,155,0.26);
-      --radius: 20px;
+      --bg: #060809;
+      --surface: #0b1011;
+      --surface-2: #0f1617;
+      --surface-3: #152021;
+      --line: #1b2729;
+      --line-2: #2a3a3c;
+      --text: #d6e4df;
+      --text-2: #a0b5ae;
+      --text-3: #72887f;
+      --green: #3ee08a;
+      --green-rgb: 62, 224, 138;
+      --green-soft: rgba(62, 224, 138, 0.10);
+      --cyan: #5ccaf2;
+      --cyan-soft: rgba(92, 202, 242, 0.10);
+      --amber: #f5b83d;
+      --amber-soft: rgba(245, 184, 61, 0.10);
+      --red: #ff6170;
+      --red-soft: rgba(255, 97, 112, 0.10);
+      --violet: #b59dff;
+      --violet-soft: rgba(181, 157, 255, 0.10);
+      --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+      --radius: 3px;
+      --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+      --dur: 180ms;
+      --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px;
     }
 
-    * { box-sizing: border-box; }
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html { -webkit-text-size-adjust: 100%; }
 
     body {
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(1100px circle at 15% -8%, rgba(56,189,248,0.10), transparent 46%),
-        radial-gradient(1000px circle at 92% 4%, rgba(91,157,255,0.07), transparent 44%),
-        linear-gradient(180deg, #070a13 0%, #05070e 100%);
-      background-attachment: fixed;
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(rgba(var(--green-rgb), 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--green-rgb), 0.025) 1px, transparent 1px);
+      background-size: 32px 32px;
       color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      padding: 32px;
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.5;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "zero" 1, "calt" 0;
     }
 
-    body::before {
+    /* CRT tarama çizgileri: çok düşük opaklıkta, yalnızca doku için. */
+    body::after {
       content: "";
       position: fixed;
       inset: 0;
       pointer-events: none;
-      background-image:
-        linear-gradient(rgba(125,152,194,0.028) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(125,152,194,0.028) 1px, transparent 1px);
-      background-size: 64px 64px;
-      mask-image: radial-gradient(circle at 50% -10%, #000 0%, transparent 68%);
-      -webkit-mask-image: radial-gradient(circle at 50% -10%, #000 0%, transparent 68%);
-      z-index: 0;
+      background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
+      opacity: 0.35;
+      z-index: 100;
     }
 
-    .layout { position: relative; z-index: 1; }
+    ::selection { background: rgba(var(--green-rgb), 0.28); color: #fff; }
 
-    .layout {
-      width: min(1440px, 100%);
-      margin: 0 auto;
-      display: grid;
-      gap: 22px;
+    button, input, select { font: inherit; color: inherit; }
+    button { cursor: pointer; touch-action: manipulation; }
+    button:disabled { cursor: not-allowed; }
+
+    :focus-visible {
+      outline: 2px solid var(--green);
+      outline-offset: 2px;
     }
 
-    .hero {
-      position: relative;
-      background: linear-gradient(180deg, rgba(13,18,32,0.78), rgba(8,11,22,0.82));
-      border: 1px solid var(--border);
-      border-radius: 28px;
-      box-shadow: var(--shadow), 0 0 36px rgba(56,189,248,0.10), inset 0 1px 0 rgba(255,255,255,0.04);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
-      padding: 18px 24px 20px 24px;
-      display: grid;
-      gap: 16px;
-      overflow: hidden;
-    }
+    svg { display: block; flex: none; }
 
-    .hero::before {
-      content: "";
+    .mono { font-family: var(--font-mono); }
+
+    .skip-link {
       position: absolute;
-      top: -1px; left: 24px; right: 24px;
-      height: 1px;
-      background: linear-gradient(90deg, transparent, var(--neon-cyan), var(--neon-pink), transparent);
-      opacity: 0.7;
+      left: var(--s4);
+      top: -48px;
+      padding: var(--s2) var(--s3);
+      background: var(--green);
+      color: #041109;
+      font-weight: 700;
+      z-index: 200;
+      transition: top var(--dur) var(--ease);
+    }
+    .skip-link:focus { top: var(--s2); }
+
+    /* ── Üst çubuk ───────────────────────────────────────────────────── */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      background: rgba(6, 8, 9, 0.92);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--line);
     }
 
-    .hero-top {
+    .topbar-inner {
+      width: min(1600px, 100%);
+      margin: 0 auto;
+      padding: var(--s3) var(--s5);
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 16px;
-      flex-wrap: wrap;
+      gap: var(--s4);
     }
 
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 13px;
-      min-width: 0;
-    }
+    .brand { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
 
     .brand-mark {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 42px;
-      height: 42px;
-      flex-shrink: 0;
-      border-radius: 13px;
-      color: var(--neon-cyan);
-      background: var(--accent-soft);
-      border: 1px solid rgba(56,189,248,0.40);
-      box-shadow: 0 0 18px rgba(56,189,248,0.30), inset 0 0 14px rgba(56,189,248,0.12);
-      filter: drop-shadow(0 0 4px rgba(56,189,248,0.5));
+      width: 36px; height: 36px;
+      display: grid; place-items: center;
+      border: 1px solid rgba(var(--green-rgb), 0.45);
+      border-radius: var(--radius);
+      color: var(--green);
+      background: var(--green-soft);
     }
+    .brand-mark svg { width: 20px; height: 20px; }
 
-    .brand-mark svg { width: 24px; height: 24px; }
+    .brand-text { min-width: 0; }
 
     .brand-title {
       margin: 0;
-      font-size: 19px;
+      font-size: 16px;
       font-weight: 700;
-      letter-spacing: -0.02em;
-      color: #fff;
-      text-shadow: 0 0 18px rgba(56,189,248,0.20);
-    }
-
-    .brand-subtitle {
-      margin: 2px 0 0 0;
-      font-size: 12px;
-      color: var(--muted);
-    }
-
-    .hero-controls {
+      letter-spacing: 0.01em;
+      color: var(--text);
       display: flex;
       align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    .status-ribbon {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 4px 2px;
-      padding: 8px 12px;
-      border-radius: 14px;
-      background: linear-gradient(180deg, rgba(8,12,22,0.7), rgba(6,9,18,0.78));
-      border: 1px solid var(--border-soft);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
-    }
-
-    .ribbon-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-width: 0;
-      padding: 2px 8px;
-    }
-
-    .ribbon-conn { padding-left: 2px; }
-
-    .ribbon-item .status-badge,
-    .ribbon-item .seal-badge {
-      min-height: 26px;
-    }
-
-    .ribbon-item .status-badge {
-      padding: 0 12px;
-      font-size: 12px;
-    }
-
-    .ribbon-ico {
-      width: 15px;
-      height: 15px;
-      flex-shrink: 0;
-      color: var(--accent);
-      opacity: 0.82;
-    }
-
-    .ribbon-label {
-      color: var(--muted-2);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      font-weight: 600;
       white-space: nowrap;
     }
+    .brand-title .host { color: var(--green); }
+    .brand-title .sep { color: var(--text-3); }
+    .brand-title .path { color: var(--cyan); }
 
-    .ribbon-value {
-      color: var(--text);
+    .caret {
+      display: inline-block;
+      width: 8px; height: 16px;
+      margin-left: 6px;
+      background: var(--green);
+      animation: blink 1.1s steps(1) infinite;
+    }
+
+    .brand-sub {
+      margin: 2px 0 0;
       font-size: 12px;
-      font-weight: 600;
-      font-variant-numeric: tabular-nums;
+      color: var(--text-3);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
-    .ribbon-file { flex: 1 1 auto; min-width: 100px; }
-    .ribbon-file .ribbon-value {
-      max-width: 100%;
-      color: var(--neon-blue);
-      text-shadow: 0 0 8px rgba(56,189,248,0.3);
+    .actions { display: flex; align-items: center; gap: var(--s2); flex: none; }
+
+    /* ── Butonlar ────────────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--s2);
+      min-height: 40px;
+      padding: 0 var(--s4);
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      color: var(--text-2);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
+    }
+    .btn svg { width: 16px; height: 16px; }
+    .btn:hover:not(:disabled) { color: var(--text); border-color: var(--text-3); background: var(--surface-3); }
+    .btn:active:not(:disabled) { transform: translateY(1px); }
+    .btn:disabled { opacity: 0.4; }
+
+    .btn-live .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--text-3);
+    }
+    .btn-live.live {
+      color: var(--green);
+      border-color: rgba(var(--green-rgb), 0.5);
+      background: var(--green-soft);
+    }
+    .btn-live.live .dot {
+      background: var(--green);
+      box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0.6);
+      animation: pulse 1.8s var(--ease) infinite;
     }
 
-    .ribbon-sep {
-      width: 1px;
-      height: 18px;
-      flex-shrink: 0;
-      background: linear-gradient(180deg, transparent, rgba(148,163,184,0.28), transparent);
+    .btn-threat .count {
+      min-width: 22px;
+      padding: 1px 6px;
+      border-radius: 2px;
+      background: var(--red);
+      color: #1a0306;
+      font-size: 12px;
+      font-weight: 800;
+      text-align: center;
+    }
+    .btn-threat.active {
+      color: var(--red);
+      border-color: rgba(255, 97, 112, 0.55);
+      background: var(--red-soft);
+    }
+    .btn-threat[aria-expanded="true"] { border-color: var(--text-3); }
+
+    .icon-btn {
+      width: 40px; height: 40px;
+      display: inline-grid; place-items: center;
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      color: var(--text-2);
+      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+    }
+    .icon-btn svg { width: 16px; height: 16px; }
+    .icon-btn:hover:not(:disabled) { color: var(--green); border-color: rgba(var(--green-rgb), 0.5); }
+    .icon-btn:disabled { opacity: 0.35; }
+    .icon-btn .ico-done { display: none; }
+    .icon-btn.copied { color: var(--green); border-color: var(--green); }
+    .icon-btn.copied .ico-copy { display: none; }
+    .icon-btn.copied .ico-done { display: block; }
+
+    /* ── Durum satırı (tmux/vim status bar) ──────────────────────────── */
+    .statusline {
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
     }
 
-    .hero-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      align-items: stretch;
-    }
-
-    .stat-card {
-      position: relative;
+    .statusline-inner {
+      width: min(1600px, 100%);
+      margin: 0 auto;
+      padding: 0 var(--s5);
       display: flex;
-      flex-direction: column;
-      gap: 8px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.015));
-      border: 1px solid var(--border-soft);
-      border-radius: 16px;
-      padding: 13px 15px;
-      min-width: 0;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+      align-items: stretch;
+      overflow-x: auto;
+      scrollbar-width: none;
     }
+    .statusline-inner::-webkit-scrollbar { display: none; }
 
-    .stat-card:hover {
-      border-color: rgba(56,189,248,0.34);
-      box-shadow: 0 0 24px rgba(56,189,248,0.14);
-      transform: translateY(-2px);
-    }
-
-    .stat-card.accent {
-      background: linear-gradient(160deg, rgba(56,189,248,0.14), rgba(138,164,255,0.06));
-      border-color: rgba(56,189,248,0.34);
-      box-shadow: inset 0 0 22px rgba(56,189,248,0.08), 0 0 22px rgba(56,189,248,0.10);
-    }
-
-    .stat-card.integrity:hover {
-      border-color: rgba(91,157,255,0.34);
-      box-shadow: 0 0 24px rgba(91,157,255,0.14);
-    }
-
-    .stat-head {
+    .sl-item {
       display: flex;
       align-items: center;
+      gap: var(--s2);
+      padding: var(--s2) var(--s4);
+      border-right: 1px solid var(--line);
+      white-space: nowrap;
+      min-height: 40px;
+    }
+    .sl-item:first-child { padding-left: 0; }
+    .sl-item:last-child { border-right: 0; }
+
+    .sl-key {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+
+    .sl-val { font-size: 13px; color: var(--text); }
+
+    .sl-file { min-width: 0; }
+    .sl-file .sl-val {
+      max-width: 38ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--cyan);
+    }
+
+    /* Durum etiketleri: renk + metin + işaret birlikte kullanılır. */
+    .status-badge, .seal-badge, .threat-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-2);
+    }
+    .status-badge::before, .seal-badge::before {
+      content: "";
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-3);
+    }
+    .status-badge.live { color: var(--green); }
+    .status-badge.live::before { background: var(--green); animation: pulse 1.8s var(--ease) infinite; }
+    .status-badge.retry { color: var(--amber); }
+    .status-badge.retry::before { background: var(--amber); animation: blink 0.9s steps(1) infinite; }
+    .status-badge.error { color: var(--red); }
+    .status-badge.error::before { background: var(--red); }
+
+    .seal-badge.ok { color: var(--green); }
+    .seal-badge.ok::before { background: var(--green); }
+    .seal-badge.error { color: var(--red); }
+    .seal-badge.error::before { background: var(--red); }
+
+    .threat-badge {
+      min-width: 28px;
+      justify-content: center;
+      padding: 2px 8px;
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      background: transparent;
+      cursor: pointer;
+    }
+    .threat-badge:hover { border-color: var(--text-3); color: var(--text); }
+    .threat-badge.active {
+      color: #1a0306;
+      background: var(--red);
+      border-color: var(--red);
+    }
+
+    /* ── Ana yerleşim ────────────────────────────────────────────────── */
+    .shell {
+      width: min(1600px, 100%);
+      margin: 0 auto;
+      padding: var(--s5);
+      display: grid;
+      gap: var(--s4);
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      min-width: 0;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      gap: var(--s2);
+      padding: var(--s2) var(--s4);
+      min-height: 40px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+
+    .panel-tag {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--green);
+      letter-spacing: 0.06em;
+    }
+    .panel-tag::before { content: "["; color: var(--text-3); }
+    .panel-tag::after { content: "]"; color: var(--text-3); }
+
+    .panel-title {
+      margin: 0;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-2);
+    }
+
+    .panel-head .spacer { flex: 1; }
+
+    .panel-meta { font-size: 12px; color: var(--text-3); }
+
+    .panel-sub {
+      margin: 2px 0 0;
+      font-size: 12px;
+      color: var(--text-3);
+    }
+
+    /* ── Gösterge kartları ───────────────────────────────────────────── */
+    .metrics {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--s4);
+    }
+
+    .metric-body { padding: var(--s4); display: grid; gap: var(--s3); }
+
+    .live-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--line-2);
+      transition: background-color var(--dur) var(--ease);
+    }
+    .live-dot.active { background: var(--green); animation: pulse 1.8s var(--ease) infinite; }
+
+    .rate-top {
+      display: flex;
+      align-items: baseline;
       justify-content: space-between;
-      gap: 6px 8px;
+      gap: var(--s3);
       flex-wrap: wrap;
     }
 
-    .stat-main {
-      display: flex;
-      align-items: baseline;
-      gap: 7px;
-      min-width: 0;
-    }
+    .metric-value { display: flex; align-items: baseline; gap: var(--s2); }
 
     .stat-number {
-      font-size: 26px;
+      font-size: 40px;
       font-weight: 700;
+      line-height: 1;
       letter-spacing: -0.02em;
-      color: #fff;
-      font-variant-numeric: tabular-nums;
-      line-height: 1.1;
+      color: var(--green);
+      text-shadow: 0 0 18px rgba(var(--green-rgb), 0.25);
     }
 
-    .stat-card.accent .stat-number {
-      color: var(--neon-cyan);
-      text-shadow: var(--glow-cyan);
-    }
-
-    .stat-number.sm {
-      font-size: 18px;
+    .stat-unit {
+      font-size: 13px;
       font-weight: 600;
-      color: var(--neon-blue);
+      color: var(--text-3);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
     }
 
-    .stat-unit { font-size: 12px; color: var(--muted); font-weight: 600; }
+    .rate-legend { display: flex; gap: var(--s3); font-size: 12px; color: var(--text-3); }
+    .rate-legend strong { color: var(--text-2); font-weight: 600; }
 
     .rate-chart {
       position: relative;
-      width: 100%;
-      height: 46px;
-      margin-top: 2px;
+      height: 88px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      background:
+        linear-gradient(rgba(var(--green-rgb), 0.05) 1px, transparent 1px) 0 0 / 100% 25%,
+        var(--bg);
     }
+    .rate-chart canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
-    .rate-chart canvas {
-      display: block;
-      width: 100%;
-      height: 100%;
-    }
-
-    .rate-chart-peak,
-    .rate-chart-span {
-      position: absolute;
-      top: 0;
-      font-size: 9.5px;
+    .sha-label {
+      font-size: 11px;
       font-weight: 600;
-      letter-spacing: 0.02em;
-      color: var(--muted-2);
-      font-variant-numeric: tabular-nums;
-      pointer-events: none;
-      text-shadow: 0 0 6px rgba(4,5,10,0.9);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
     }
 
-    .rate-chart-peak { left: 0; color: var(--neon-cyan); opacity: 0.85; }
-    .rate-chart-span { right: 0; }
-
-    .stat-foot {
-      font-size: 11px;
-      color: var(--muted-2);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .stat-foot span { color: var(--muted); font-weight: 600; }
-
-    .live-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--muted-2);
-      flex-shrink: 0;
-    }
-
-    .live-dot.active {
-      background: var(--neon-green);
-      box-shadow: 0 0 0 0 rgba(52,227,155,0.5), 0 0 12px rgba(52,227,155,0.8);
-      animation: pulse 1.6s ease-out infinite;
-    }
-
-    @keyframes pulse {
-      0%   { box-shadow: 0 0 0 0 rgba(52,227,155,0.5), 0 0 12px rgba(52,227,155,0.8); }
-      70%  { box-shadow: 0 0 0 8px rgba(52,227,155,0), 0 0 12px rgba(52,227,155,0.8); }
-      100% { box-shadow: 0 0 0 0 rgba(52,227,155,0), 0 0 12px rgba(52,227,155,0.8); }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      .live-dot.active { animation: none; }
-    }
-
-    .seal-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 2px 9px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--muted);
-      background: rgba(148,163,184,0.10);
-      border: 1px solid rgba(148,163,184,0.18);
-      white-space: nowrap;
-    }
-
-    .seal-badge.ok {
-      color: #052e16;
-      background: var(--neon-green);
-      border-color: var(--neon-green);
-      box-shadow: var(--glow-green);
-    }
-
-    .seal-badge.error {
-      color: #fff;
-      background: rgba(255,93,122,0.22);
-      border-color: var(--danger);
-      box-shadow: 0 0 10px rgba(255,93,122,0.45);
-    }
-
-    .seal-sha-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
+    .sha-row { display: flex; align-items: center; gap: var(--s2); }
 
     .seal-sha {
       flex: 1;
       min-width: 0;
-      font-size: 12px;
-      color: var(--neon-blue);
-      background: rgba(5,7,14,0.7);
-      border: 1px solid rgba(91,157,255,0.22);
-      border-radius: 9px;
-      padding: 5px 9px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .copy-btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 30px;
-      height: 30px;
-      flex-shrink: 0;
-      border-radius: 9px;
-      background: rgba(148,163,184,0.10);
-      border: 1px solid var(--border-soft);
-      color: var(--muted);
-      cursor: pointer;
-      transition: 0.15s ease;
-    }
-
-    .copy-btn svg { width: 15px; height: 15px; }
-    .copy-btn:hover:not(:disabled) { color: var(--neon-cyan); border-color: rgba(56,189,248,0.45); background: var(--accent-soft); box-shadow: 0 0 14px rgba(56,189,248,0.25); }
-    .copy-btn:disabled { opacity: 0.4; cursor: default; }
-    .copy-btn.copied { color: #052e16; border-color: var(--neon-green); background: var(--neon-green); box-shadow: var(--glow-green); }
-
-    .stat-card.sizes { gap: 10px; grid-column: span 2; }
-
-    .status-label {
-      color: var(--muted-2);
-      font-size: 10px;
-      margin-bottom: 4px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      white-space: nowrap;
-    }
-
-    .status-value {
+      padding: var(--s2) var(--s3);
+      min-height: 40px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      background: var(--bg);
+      color: var(--cyan);
       font-size: 13px;
-      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    .status-badge,
-    .mode-button {
-      display: inline-flex;
+    .seal-foot {
+      font-size: 12px;
+      color: var(--text-2);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .seal-foot::before { content: "› "; color: var(--green); }
+
+    .kv { margin: 0; display: grid; gap: 2px; }
+
+    .kv-row {
+      display: flex;
+      align-items: baseline;
+      gap: var(--s2);
+      padding: 6px 0;
+    }
+    .kv-row dt {
+      display: flex;
       align-items: center;
-      justify-content: center;
-      min-height: 36px;
-      padding: 0 14px;
-      border-radius: 999px;
-      background: rgba(148,163,184,0.08);
-      border: 1px solid rgba(148,163,184,0.18);
-      color: var(--text);
+      gap: var(--s2);
+      color: var(--text-2);
       font-size: 13px;
-      font-weight: 600;
-      text-decoration: none;
-      cursor: pointer;
-      transition: 0.2s ease;
     }
-
-    .mode-button:hover {
-      border-color: rgba(56,189,248,0.5);
-      background: var(--accent-soft);
-      color: #ccfbff;
-      box-shadow: var(--glow-cyan);
+    .kv-row dt { flex: 1; min-width: 0; }
+    .kv-row dt::after {
+      content: "";
+      flex: 1;
+      min-width: 16px;
+      border-bottom: 1px dotted var(--line-2);
+      transform: translateY(4px);
     }
+    .kv-row dd { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+    .kv-row.total { margin-top: var(--s1); padding-top: var(--s2); border-top: 1px solid var(--line); }
+    .kv-row.total dt { color: var(--text); font-weight: 700; }
+    .kv-row.total dd { color: var(--green); }
 
-    .status-badge.live,
-    .mode-button.live {
-      color: #052e16;
-      border-color: var(--neon-green);
-      background: var(--neon-green);
-      box-shadow: var(--glow-green);
-    }
+    .kv-dot { width: 8px; height: 8px; border-radius: 1px; }
+    .kv-dot.hourly { background: var(--cyan); }
+    .kv-dot.daily { background: var(--violet); }
+    .kv-dot.monthly { background: var(--amber); }
+    .kv-dot.total { background: var(--green); }
 
-    .mode-button.live:hover {
-      color: #052e16;
-      background: var(--neon-green);
-      box-shadow: var(--glow-green);
-    }
-
-    .status-badge.retry {
-      color: #1c1407;
-      border-color: var(--neon-amber);
-      background: var(--neon-amber);
-      box-shadow: 0 0 10px rgba(255,176,32,0.5), 0 0 24px rgba(255,176,32,0.25);
-    }
-
-    .status-badge.error {
-      color: #fff;
-      border-color: var(--danger);
-      background: rgba(255,93,122,0.22);
-      box-shadow: 0 0 10px rgba(255,93,122,0.45);
-    }
-
+    /* ── "Log gelmiyor" uyarısı ──────────────────────────────────────── */
     .alert-banner {
       display: flex;
       align-items: center;
-      gap: 14px;
-      padding: 14px 20px;
-      border-radius: 18px;
-      background: linear-gradient(180deg, rgba(255,176,32,0.12), rgba(255,93,122,0.06));
-      border: 1px solid rgba(255,176,32,0.40);
-      box-shadow: 0 0 22px rgba(255,176,32,0.16), inset 0 0 18px rgba(255,176,32,0.06);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
-      animation: alertIn 0.32s ease-out;
+      gap: var(--s3);
+      padding: var(--s3) var(--s4);
+      border: 1px solid rgba(245, 184, 61, 0.5);
+      border-left-width: 4px;
+      border-radius: var(--radius);
+      background: var(--amber-soft);
+      color: var(--amber);
     }
-
     .alert-banner[hidden] { display: none; }
-
-    @keyframes alertIn {
-      0%   { opacity: 0; transform: translateY(-8px); }
-      100% { opacity: 1; transform: translateY(0); }
-    }
-
-    .alert-icon {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 40px;
-      height: 40px;
-      flex-shrink: 0;
-      border-radius: 12px;
-      color: var(--neon-amber);
-      background: rgba(255,176,32,0.12);
-      border: 1px solid rgba(255,176,32,0.4);
-      box-shadow: 0 0 16px rgba(255,176,32,0.3);
-    }
-
-    .alert-icon svg { width: 22px; height: 22px; }
-
+    .alert-icon svg { width: 20px; height: 20px; }
     .alert-text { flex: 1; min-width: 0; }
-
     .alert-title {
-      font-size: 15px;
+      font-size: 13px;
       font-weight: 700;
-      color: #ffd98a;
-      text-shadow: 0 0 10px rgba(255,176,32,0.4);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
-
-    .alert-detail {
-      margin-top: 2px;
-      font-size: 12.5px;
-      color: var(--muted);
-    }
-
+    .alert-detail { font-size: 13px; color: var(--text); }
     .alert-pulse {
-      width: 12px;
-      height: 12px;
-      flex-shrink: 0;
-      border-radius: 50%;
-      background: var(--neon-amber);
-      box-shadow: 0 0 0 0 rgba(255,176,32,0.55), 0 0 12px rgba(255,176,32,0.85);
-      animation: alertPulse 1.5s ease-out infinite;
+      width: 10px; height: 10px;
+      background: var(--amber);
+      animation: blink 1s steps(1) infinite;
     }
 
-    @keyframes alertPulse {
-      0%   { box-shadow: 0 0 0 0 rgba(255,176,32,0.5), 0 0 12px rgba(255,176,32,0.85); }
-      70%  { box-shadow: 0 0 0 9px rgba(255,176,32,0), 0 0 12px rgba(255,176,32,0.85); }
-      100% { box-shadow: 0 0 0 0 rgba(255,176,32,0), 0 0 12px rgba(255,176,32,0.85); }
+    /* ── Log tablosu ─────────────────────────────────────────────────── */
+    .log-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: var(--s4);
+      flex-wrap: wrap;
+      padding: var(--s3) var(--s4);
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
     }
 
-    @media (prefers-reduced-motion: reduce) {
-      .alert-banner { animation: none; }
-      .alert-pulse { animation: none; }
+    .log-title { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }
+    .log-title .panel-title { font-size: 13px; }
+
+    .toolbar { display: flex; align-items: flex-end; gap: var(--s3); flex-wrap: wrap; }
+
+    .field { display: grid; gap: 4px; }
+    .field label, .field .field-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
     }
 
-    /* Ribbon tehdit rozeti */
-    .threat-badge {
+    .select {
+      appearance: none;
+      -webkit-appearance: none;
+      min-width: 132px;
+      min-height: 40px;
+      padding: 0 34px 0 var(--s3);
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      background:
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2372887f' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center / 14px,
+        var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      transition: border-color var(--dur) var(--ease);
+    }
+    .select:hover:not(:disabled) { border-color: var(--text-3); }
+    .select:disabled { opacity: 0.4; cursor: not-allowed; }
+    .select option { background: var(--surface-2); color: var(--text); }
+
+    .pager { display: flex; align-items: center; gap: var(--s2); }
+    .pager .btn { padding: 0 var(--s3); }
+    .pager-info {
+      min-width: 72px;
+      text-align: center;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .table-wrap {
+      overflow: auto;
+      max-height: 72vh;
+    }
+
+    .log-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .log-table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 10px var(--s4);
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--line-2);
+      text-align: left;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
+      white-space: nowrap;
+    }
+    .log-table th.num, .log-table td.num { text-align: right; }
+
+    .log-table tbody td {
+      padding: 7px var(--s4);
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+      color: var(--text);
+    }
+    .log-table tbody tr { transition: background-color var(--dur) var(--ease); }
+    .log-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.012); }
+    .log-table tbody tr:hover { background: var(--surface-3); }
+
+    .cell-time { color: var(--text-3); }
+    .cell-ip-src { color: var(--cyan); }
+    .cell-ip-dst { color: var(--violet); }
+    .cell-port { color: var(--text-2); }
+    .cell-size { color: var(--text-2); }
+
+    .arrow { color: var(--text-3); padding: 0 !important; width: 1ch; }
+
+    .row-enter { animation: rowEnter 1.4s var(--ease); }
+    .row-enter td:first-child { box-shadow: inset 2px 0 0 var(--green); }
+
+    .proto {
       display: inline-flex;
       align-items: center;
-      justify-content: center;
-      min-width: 24px;
-      min-height: 22px;
-      padding: 0 8px;
-      border-radius: 999px;
-      font-size: 12px;
+      gap: 5px;
+      padding: 1px 7px;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+      font-size: 11px;
       font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--neon-green);
-      background: rgba(52,227,155,0.12);
-      border: 1px solid rgba(52,227,155,0.4);
-      transition: 0.2s ease;
+      letter-spacing: 0.06em;
+      color: var(--text-2);
+    }
+    .proto .lock { width: 11px; height: 11px; color: var(--green); }
+    .proto.tcp { color: var(--cyan); background: var(--cyan-soft); }
+    .proto.udp { color: var(--amber); background: var(--amber-soft); }
+    .proto.icmp, .proto.icmpv6 { color: var(--violet); background: var(--violet-soft); }
+
+    .empty-row td { padding: 56px var(--s4) !important; text-align: center; color: var(--text-3); white-space: normal !important; }
+    .empty-title { color: var(--text-2); font-weight: 700; margin-bottom: 4px; }
+    .empty-title::before { content: "$ "; color: var(--green); }
+
+    /* ── Güvenlik çekmecesi ──────────────────────────────────────────── */
+    .threat-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .threat-modal[hidden] { display: none; }
+
+    .threat-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 4, 5, 0.72);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+      animation: fadeIn var(--dur) var(--ease);
     }
 
-    .threat-badge.active {
-      color: #fff;
-      background: rgba(255,93,122,0.22);
-      border-color: var(--danger);
-      box-shadow: 0 0 10px rgba(255,93,122,0.5), 0 0 22px rgba(255,93,122,0.28);
-      animation: threatPulse 1.5s ease-out infinite;
-    }
-
-    @keyframes threatPulse {
-      0%   { box-shadow: 0 0 0 0 rgba(255,93,122,0.5), 0 0 12px rgba(255,93,122,0.7); }
-      70%  { box-shadow: 0 0 0 8px rgba(255,93,122,0), 0 0 12px rgba(255,93,122,0.7); }
-      100% { box-shadow: 0 0 0 0 rgba(255,93,122,0), 0 0 12px rgba(255,93,122,0.7); }
-    }
-
-    /* Güvenlik izleme paneli */
-    .threat-card {
+    .threat-modal-panel {
       position: relative;
-      background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
-      border: 1px solid var(--border-soft);
-      border-radius: 22px;
-      box-shadow: var(--shadow), 0 0 24px rgba(52,227,155,0.06);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
-      padding: 18px 22px 20px 22px;
-      transition: border-color 0.25s ease, box-shadow 0.25s ease;
-    }
-
-    .threat-card.has-threats {
-      border-color: rgba(255,93,122,0.42);
-      box-shadow: var(--shadow), 0 0 30px rgba(255,93,122,0.14);
-    }
-
-    .threat-header {
+      width: min(600px, 100%);
+      height: 100%;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      flex-wrap: wrap;
+      flex-direction: column;
+      background: var(--surface);
+      border-left: 1px solid var(--line-2);
+      box-shadow: -24px 0 48px rgba(0, 0, 0, 0.5);
+      animation: slideIn 240ms var(--ease);
+      overscroll-behavior: contain;
+    }
+    .threat-modal-panel.has-threats { border-left-color: rgba(255, 97, 112, 0.6); }
+
+    .drawer-head {
+      display: grid;
+      gap: var(--s3);
+      padding: var(--s4) var(--s5);
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
     }
 
-    .threat-heading {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
+    .drawer-title-row { display: flex; align-items: flex-start; gap: var(--s3); }
 
     .threat-mark {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 38px;
-      height: 38px;
-      flex-shrink: 0;
-      border-radius: 12px;
-      color: var(--neon-green);
-      background: rgba(52,227,155,0.10);
-      border: 1px solid rgba(52,227,155,0.32);
-      box-shadow: inset 0 0 12px rgba(52,227,155,0.10);
+      width: 36px; height: 36px;
+      display: grid; place-items: center;
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      color: var(--green);
+      flex: none;
     }
+    .threat-mark svg { width: 18px; height: 18px; }
+    .has-threats .threat-mark { color: var(--red); border-color: rgba(255, 97, 112, 0.55); background: var(--red-soft); }
 
-    .threat-card.has-threats .threat-mark {
-      color: var(--danger);
-      background: rgba(255,93,122,0.12);
-      border-color: rgba(255,93,122,0.38);
-      box-shadow: inset 0 0 12px rgba(255,93,122,0.12);
-    }
-
-    .threat-mark svg { width: 21px; height: 21px; }
+    .drawer-title-text { flex: 1; min-width: 0; }
 
     .threat-title {
       margin: 0;
       display: flex;
       align-items: center;
-      gap: 9px;
-      font-size: 16px;
+      gap: var(--s2);
+      font-size: 15px;
       font-weight: 700;
-      letter-spacing: -0.01em;
-      color: #fff;
-    }
-
-    .threat-count {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 22px;
-      padding: 1px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-      color: #fff;
-      background: rgba(255,93,122,0.22);
-      border: 1px solid var(--danger);
-      box-shadow: 0 0 10px rgba(255,93,122,0.4);
-    }
-
-    .threat-subtitle {
-      margin: 3px 0 0 0;
-      font-size: 12px;
-      color: var(--muted);
-    }
-
-    .threat-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 12px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-
-    .threat-status.ok {
-      color: var(--neon-green);
-      background: rgba(52,227,155,0.10);
-      border: 1px solid rgba(52,227,155,0.35);
-    }
-
-    .threat-status.alert {
-      color: #fff;
-      background: rgba(255,93,122,0.20);
-      border: 1px solid var(--danger);
-      box-shadow: 0 0 12px rgba(255,93,122,0.35);
-    }
-
-    .threat-list {
-      display: grid;
-      gap: 10px;
-      margin-top: 16px;
-    }
-
-    .threat-empty {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 14px 4px 6px 4px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .threat-empty svg { width: 20px; height: 20px; color: var(--neon-green); flex-shrink: 0; }
-    .threat-empty[hidden], .threat-count[hidden] { display: none; }
-
-    .threat-item {
-      display: flex;
-      align-items: flex-start;
-      gap: 12px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(148,163,184,0.10);
-      border-left-width: 3px;
-    }
-
-    .threat-item.high {
-      border-color: rgba(255,93,122,0.16);
-      border-left-color: var(--danger);
-      background: linear-gradient(180deg, rgba(255,93,122,0.07), rgba(255,255,255,0.01));
-    }
-
-    .threat-item.medium {
-      border-color: rgba(255,176,32,0.16);
-      border-left-color: var(--neon-amber);
-      background: linear-gradient(180deg, rgba(255,176,32,0.06), rgba(255,255,255,0.01));
-    }
-
-    .threat-sev {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      min-width: 58px;
-      padding: 4px 9px;
-      border-radius: 999px;
-      font-size: 10px;
-      font-weight: 800;
       letter-spacing: 0.06em;
       text-transform: uppercase;
     }
 
-    .threat-item.high .threat-sev {
-      color: #fff;
-      background: rgba(255,93,122,0.22);
-      border: 1px solid var(--danger);
-      box-shadow: 0 0 10px rgba(255,93,122,0.35);
+    .threat-count {
+      padding: 1px 7px;
+      border-radius: 2px;
+      background: var(--red);
+      color: #1a0306;
+      font-size: 12px;
+      font-weight: 800;
     }
 
-    .threat-item.medium .threat-sev {
-      color: #1c1407;
-      background: var(--neon-amber);
-      border: 1px solid var(--neon-amber);
-      box-shadow: 0 0 10px rgba(255,176,32,0.35);
+    .threat-subtitle { margin: 4px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.55; }
+
+    .threat-status {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--s2);
+      justify-self: start;
+      padding: 4px 10px;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .threat-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .threat-status.ok { color: var(--green); background: var(--green-soft); }
+    .threat-status.alert { color: var(--red); background: var(--red-soft); }
+    .threat-status.alert::before { animation: blink 0.9s steps(1) infinite; }
+
+    .drawer-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--s4) var(--s5) var(--s6);
+      display: grid;
+      align-content: start;
+      gap: var(--s5);
     }
 
-    .threat-body { min-width: 0; flex: 1; }
+    .drawer-section { display: grid; gap: var(--s3); }
+
+    .section-head { display: grid; gap: 4px; }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: var(--s2);
+      margin: 0;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-2);
+    }
+    .section-title svg { width: 14px; height: 14px; color: var(--text-3); }
+    .section-title::before { content: "//"; color: var(--green); }
+
+    .section-sub { margin: 0; font-size: 12px; color: var(--text-3); line-height: 1.6; }
+    .section-sub .mono { color: var(--text-2); }
+
+    .threat-list { display: grid; gap: var(--s2); }
+
+    .threat-empty {
+      display: flex;
+      align-items: center;
+      gap: var(--s3);
+      padding: var(--s4);
+      border: 1px dashed var(--line-2);
+      border-radius: var(--radius);
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    .threat-empty[hidden] { display: none; }
+    .threat-empty svg { width: 18px; height: 18px; color: var(--green); }
+
+    .threat-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: var(--s3);
+      padding: var(--s3);
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--amber);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+    .threat-item.high { border-left-color: var(--red); }
+
+    .threat-sev {
+      align-self: start;
+      padding: 2px 6px;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--amber);
+    }
+    .threat-item.high .threat-sev { color: var(--red); background: var(--red-soft); }
+
+    .threat-body { min-width: 0; display: grid; gap: 4px; }
 
     .threat-item-title {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: var(--s2);
       flex-wrap: wrap;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 700;
       color: var(--text);
     }
 
     .threat-hits {
+      padding: 0 6px;
+      border-radius: 2px;
+      background: var(--surface-3);
+      color: var(--text-2);
       font-size: 11px;
       font-weight: 700;
-      color: var(--neon-amber);
-      font-variant-numeric: tabular-nums;
-      padding: 1px 7px;
-      border-radius: 999px;
-      background: rgba(255,176,32,0.10);
-      border: 1px solid rgba(255,176,32,0.30);
     }
 
-    .threat-item.high .threat-hits {
-      color: #ffb4c2;
-      background: rgba(255,93,122,0.12);
-      border-color: rgba(255,93,122,0.32);
-    }
+    .threat-meta { font-size: 12px; color: var(--text-2); line-height: 1.55; overflow-wrap: anywhere; }
 
-    .threat-meta {
-      margin-top: 4px;
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.5;
-    }
+    .threat-actions { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: 4px; }
 
-    .threat-meta .mono {
-      color: var(--neon-blue);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
-
-    .threat-copy-ip {
+    .chip-btn {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 3px 10px;
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      background: var(--bg);
+      color: var(--text-2);
       font-size: 12px;
       font-weight: 600;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      color: var(--neon-blue);
-      background: rgba(56,189,248,0.08);
-      border: 1px solid rgba(56,189,248,0.28);
-      border-radius: 999px;
-      cursor: pointer;
-      transition: color .15s, background .15s, border-color .15s, box-shadow .15s;
+      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
     }
-    .threat-copy-ip:hover {
-      color: var(--neon-cyan);
-      border-color: rgba(56,189,248,0.5);
-      background: var(--accent-soft);
-      box-shadow: 0 0 12px rgba(56,189,248,0.22);
-    }
-    .threat-copy-ip.copied {
-      color: #052e16;
-      border-color: var(--neon-green);
-      background: var(--neon-green);
-    }
-    .threat-copy-ip svg { width: 13px; height: 13px; flex-shrink: 0; }
-    .threat-copy-ip .threat-copy-label { display: inline; }
-    .threat-copy-ip.copied .threat-copy-label::after { content: " • kopyalandı"; }
+    .chip-btn svg { width: 13px; height: 13px; }
+    .chip-btn:hover:not(:disabled) { color: var(--text); border-color: var(--text-3); }
 
-    .threat-time {
-      flex-shrink: 0;
-      font-size: 11px;
-      color: var(--muted-2);
-      font-variant-numeric: tabular-nums;
-      white-space: nowrap;
-      padding-top: 2px;
-    }
+    .threat-copy-ip { color: var(--cyan); }
+    .threat-copy-ip.copied { color: var(--green); border-color: var(--green); }
+    .threat-copy-ip.copied .threat-copy-label::after { content: " ✓"; }
 
-    /* Güvenlik uyarıları — üst kontrol butonu */
-    .threat-toggle {
-      gap: 8px;
-      position: relative;
-    }
+    .threat-ban { color: var(--red); border-color: rgba(255, 97, 112, 0.45); }
+    .threat-ban:hover:not(:disabled) { color: #1a0306; background: var(--red); border-color: var(--red); }
+    .threat-ban.banned, .threat-ban:disabled { color: var(--text-3); border-color: var(--line-2); background: transparent; opacity: 1; }
 
-    .threat-toggle svg {
-      width: 16px;
-      height: 16px;
-    }
+    .threat-time { align-self: start; font-size: 12px; color: var(--text-3); }
 
-    .threat-toggle-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 20px;
-      height: 20px;
-      padding: 0 6px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 800;
-      font-variant-numeric: tabular-nums;
-      color: #fff;
-      background: rgba(255,93,122,0.9);
-      border: 1px solid var(--danger);
-    }
+    .inline-form { display: flex; gap: var(--s2); }
 
-    .threat-toggle-badge[hidden] { display: none; }
-
-    .threat-toggle.active {
-      color: #fff;
-      border-color: var(--danger);
-      background: rgba(255,93,122,0.16);
-      box-shadow: 0 0 10px rgba(255,93,122,0.4);
-      animation: threatPulse 1.5s ease-out infinite;
-    }
-
-    .threat-toggle.active:hover {
-      color: #fff;
-      border-color: var(--danger);
-      background: rgba(255,93,122,0.24);
-      box-shadow: 0 0 12px rgba(255,93,122,0.5);
-    }
-
-    /* Güvenlik uyarıları — açılır modal */
-    .threat-modal {
-      position: fixed;
-      inset: 0;
-      z-index: 120;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
-      padding: 7vh 20px 24px 20px;
-      overflow-y: auto;
-    }
-
-    .threat-modal[hidden] { display: none; }
-
-    .threat-modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(4,7,14,0.66);
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
-      animation: threatFade 0.2s ease;
-    }
-
-    .threat-modal-panel {
-      position: relative;
-      width: 100%;
-      max-width: 720px;
-      margin: 0 auto;
-      animation: threatPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    .threat-close {
-      position: absolute;
-      top: 16px;
-      right: 16px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 32px;
-      height: 32px;
-      border-radius: 10px;
-      color: var(--muted);
-      background: rgba(148,163,184,0.08);
-      border: 1px solid rgba(148,163,184,0.18);
-      cursor: pointer;
-      transition: 0.2s ease;
-    }
-
-    .threat-close svg { width: 16px; height: 16px; }
-
-    .threat-close:hover {
-      color: #fff;
-      border-color: rgba(255,93,122,0.5);
-      background: rgba(255,93,122,0.16);
-    }
-
-    .threat-modal .threat-list {
-      max-height: 62vh;
-      overflow-y: auto;
-    }
-
-    @keyframes threatFade {
-      from { opacity: 0; }
-      to   { opacity: 1; }
-    }
-
-    @keyframes threatPop {
-      from { opacity: 0; transform: translateY(-12px) scale(0.98); }
-      to   { opacity: 1; transform: none; }
-    }
-
-    /* Whitelist — görmezden gelinen kaynaklar bölümü */
-    .whitelist-section {
-      margin-top: 20px;
-      padding-top: 18px;
-      border-top: 1px solid var(--border-soft);
-    }
-
-    .whitelist-title {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 14px;
-      font-weight: 700;
-      color: #fff;
-    }
-
-    .whitelist-title svg {
-      width: 17px;
-      height: 17px;
-      color: var(--neon-green);
-      flex-shrink: 0;
-    }
-
-    .whitelist-sub {
-      margin: 5px 0 0 0;
-      font-size: 12px;
-      line-height: 1.55;
-      color: var(--muted);
-    }
-
-    .whitelist-sub .mono {
-      color: var(--neon-blue);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
-
-    .whitelist-form {
-      display: flex;
-      gap: 8px;
-      margin-top: 14px;
-    }
-
-    .whitelist-input {
+    .text-input {
       flex: 1;
       min-width: 0;
-      min-height: 42px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: rgba(7,10,20,0.9);
+      min-height: 40px;
+      padding: 0 var(--s3);
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      background: var(--bg);
       color: var(--text);
-      padding: 0 14px;
-      font-size: 14px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      outline: none;
-      transition: 0.18s ease;
-    }
-
-    .whitelist-input::placeholder { color: var(--muted-2); }
-    .whitelist-input:hover { border-color: rgba(56,189,248,0.4); }
-    .whitelist-input:focus {
-      border-color: var(--neon-cyan);
-      box-shadow: 0 0 0 3px rgba(56,189,248,0.18), var(--glow-cyan);
-    }
-
-    .whitelist-add {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 42px;
-      padding: 0 18px;
-      border-radius: 14px;
-      border: 1px solid var(--neon-green);
-      background: var(--neon-green);
-      color: #052e16;
       font-size: 13px;
-      font-weight: 700;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: 0.18s ease;
+      transition: border-color var(--dur) var(--ease);
     }
+    .text-input::placeholder { color: var(--text-3); }
+    .text-input:hover { border-color: var(--text-3); }
+    .text-input:focus-visible { outline-offset: 0; border-color: var(--green); }
 
-    .whitelist-add:hover { box-shadow: var(--glow-green); }
+    .btn-danger { color: var(--red); border-color: rgba(255, 97, 112, 0.5); background: var(--red-soft); }
+    .btn-danger:hover:not(:disabled) { color: #1a0306; background: var(--red); border-color: var(--red); }
 
-    .whitelist-error {
-      margin-top: 10px;
-      padding: 9px 12px;
-      border-radius: 12px;
+    .btn-accent { color: var(--green); border-color: rgba(var(--green-rgb), 0.5); background: var(--green-soft); }
+    .btn-accent:hover:not(:disabled) { color: #041109; background: var(--green); border-color: var(--green); }
+
+    .form-error {
+      padding: var(--s2) var(--s3);
+      border: 1px solid rgba(255, 97, 112, 0.5);
+      border-radius: 2px;
+      background: var(--red-soft);
+      color: var(--red);
       font-size: 12px;
-      color: #ffb4c2;
-      background: rgba(255,93,122,0.1);
-      border: 1px solid rgba(255,93,122,0.32);
     }
+    .form-error::before { content: "ERR "; font-weight: 800; }
+    .form-error[hidden] { display: none; }
 
-    .whitelist-error[hidden] { display: none; }
+    .chip-list { display: flex; flex-wrap: wrap; gap: var(--s2); }
 
-    .whitelist-list {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 14px;
-    }
+    .list-empty { font-size: 12px; color: var(--text-3); }
+    .list-empty::before { content: "∅ "; }
+    .list-empty[hidden] { display: none; }
 
-    .whitelist-empty {
-      font-size: 12px;
-      color: var(--muted-2);
-    }
-
-    .whitelist-chip {
+    .entry-chip {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px 8px 6px 12px;
-      border-radius: 999px;
-      background: rgba(148,163,184,0.08);
-      border: 1px solid rgba(148,163,184,0.18);
-      font-size: 13px;
-      font-weight: 600;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      gap: var(--s2);
+      min-height: 32px;
+      padding: 0 4px 0 10px;
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      background: var(--surface-2);
+      font-size: 12px;
       color: var(--text);
     }
+    .entry-chip.cidr { border-style: dashed; }
+    .entry-chip.blocked { border-color: rgba(255, 97, 112, 0.45); }
+    .entry-chip.blocked .entry-ip { color: var(--red); }
+    .entry-chip.allowed .entry-ip { color: var(--green); }
 
-    .whitelist-chip.cidr {
-      color: #ccfbff;
-      border-color: rgba(56,189,248,0.32);
-      background: rgba(56,189,248,0.08);
-    }
+    .entry-rule { color: var(--text-3); font-size: 11px; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    .whitelist-remove {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 20px;
-      height: 20px;
-      border-radius: 999px;
-      border: none;
-      background: rgba(148,163,184,0.14);
-      color: var(--muted);
-      cursor: pointer;
-      transition: 0.15s ease;
+    .entry-remove {
+      width: 26px; height: 26px;
+      display: grid; place-items: center;
+      border: 0;
+      border-radius: 2px;
+      background: transparent;
+      color: var(--text-3);
+      transition: color var(--dur) var(--ease), background-color var(--dur) var(--ease);
     }
+    .entry-remove svg { width: 12px; height: 12px; }
+    .entry-remove:hover { color: var(--red); background: var(--red-soft); }
 
-    .whitelist-remove:hover {
-      background: rgba(255,93,122,0.2);
-      color: #fff;
-    }
+    .drawer-divider { height: 1px; background: var(--line); }
 
-    .whitelist-remove svg { width: 12px; height: 12px; }
-
-    /* Engellenen kaynaklar (manuel kara liste) — kırmızı aksan */
-    .blocklist-section { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border-soft); }
-    .blocklist-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; color: #fff; }
-    .blocklist-title svg { width: 17px; height: 17px; color: #ff5d7a; flex-shrink: 0; }
-    .blocklist-sub { margin: 5px 0 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
-    .blocklist-sub .mono { color: var(--neon-blue); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-    .blocklist-form { display: flex; gap: 8px; margin-top: 14px; }
-    .blocklist-input {
-      flex: 1; min-width: 0; min-height: 42px; border-radius: 14px; border: 1px solid var(--border);
-      background: rgba(7,10,20,0.9); color: var(--text); padding: 0 14px; font-size: 14px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      outline: none; transition: 0.18s ease;
+    /* ── Animasyonlar ────────────────────────────────────────────────── */
+    @keyframes blink { 50% { opacity: 0; } }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0.55); }
+      70% { box-shadow: 0 0 0 6px rgba(var(--green-rgb), 0); }
+      100% { box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0); }
     }
-    .blocklist-input::placeholder { color: var(--muted-2); }
-    .blocklist-input:hover { border-color: rgba(255,93,122,0.4); }
-    .blocklist-input:focus { border-color: #ff5d7a; box-shadow: 0 0 0 3px rgba(255,93,122,0.18); }
-    .blocklist-add {
-      display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 0 18px;
-      border-radius: 14px; border: 1px solid #ff5d7a; background: #ff5d7a; color: #2e0511;
-      font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: 0.18s ease;
-    }
-    .blocklist-add:hover { box-shadow: 0 0 18px rgba(255,93,122,0.45); }
-    .blocklist-error {
-      margin-top: 10px; padding: 9px 12px; border-radius: 12px; font-size: 12px; color: #ffb4c2;
-      background: rgba(255,93,122,0.1); border: 1px solid rgba(255,93,122,0.32);
-    }
-    .blocklist-error[hidden] { display: none; }
-    .blocklist-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-    .blocklist-empty { font-size: 12px; color: var(--muted-2); }
-    .blocklist-chip {
-      display: inline-flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-radius: 999px;
-      background: rgba(255,93,122,0.1); border: 1px solid rgba(255,93,122,0.3); font-size: 13px; font-weight: 600;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; color: #ffd7de;
-    }
-    .blocklist-chip .blocklist-chip-rule { color: var(--muted-2); font-weight: 500; font-size: 11px; }
-    .blocklist-remove {
-      display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px;
-      border-radius: 999px; border: none; background: rgba(255,93,122,0.18); color: #ffd7de; cursor: pointer; transition: 0.15s ease;
-    }
-    .blocklist-remove:hover { background: rgba(255,93,122,0.4); color: #fff; }
-    .blocklist-remove svg { width: 12px; height: 12px; }
-
-    /* Tehdit uyarısında tek tıkla banla butonu */
-    .threat-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
-    .threat-ban {
-      display: inline-flex; align-items: center; gap: 5px; margin-left: 8px; padding: 3px 9px; border-radius: 8px;
-      border: 1px solid rgba(255,93,122,0.4); background: rgba(255,93,122,0.12); color: #ff8ea3;
-      font-size: 11px; font-weight: 700; cursor: pointer; transition: 0.15s ease; vertical-align: middle;
-    }
-    .threat-ban:hover { background: rgba(255,93,122,0.24); color: #fff; }
-    .threat-ban svg { width: 12px; height: 12px; flex-shrink: 0; }
-    .threat-ban.banned { border-color: rgba(255,93,122,0.6); background: rgba(255,93,122,0.28); color: #fff; cursor: default; }
-    .threat-ban[disabled] { opacity: 0.7; cursor: default; }
-
-    @media (prefers-reduced-motion: reduce) {
-      .threat-badge.active { animation: none; }
-      .threat-toggle.active { animation: none; }
-      .threat-modal-backdrop,
-      .threat-modal-panel { animation: none; }
-    }
-
-    @media (max-width: 560px) {
-      .threat-item { flex-wrap: wrap; }
-      .threat-time { width: 100%; padding-top: 0; }
-    }
-
-    .table-card {
-      position: relative;
-      background: linear-gradient(180deg, rgba(11,15,27,0.82), rgba(7,10,20,0.86));
-      border: 1px solid var(--border);
-      border-radius: 28px;
-      box-shadow: var(--shadow), 0 0 30px rgba(138,164,255,0.08);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
-      overflow: hidden;
-    }
-
-    .table-card::before {
-      content: "";
-      position: absolute;
-      top: -1px; left: 28px; right: 28px;
-      height: 1px;
-      background: linear-gradient(90deg, transparent, var(--neon-purple), var(--neon-cyan), transparent);
-      opacity: 0.6;
-    }
-
-    .table-card-header {
-      padding: 24px 28px 18px 28px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      flex-wrap: wrap;
-      border-bottom: 1px solid var(--border-soft);
-    }
-
-    .table-title {
-      margin: 0;
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      color: #fff;
-    }
-
-    .table-subtitle {
-      margin: 6px 0 0 0;
-      color: var(--muted);
-      font-size: 14px;
-    }
-
-    .toolbar {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
-    .field {
-      display: grid;
-      gap: 6px;
-      min-width: 140px;
-    }
-
-    .field label {
-      color: var(--muted-2);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .select {
-      min-height: 42px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: rgba(7,10,20,0.9);
-      color: var(--text);
-      padding: 0 14px;
-      font-size: 14px;
-      outline: none;
-      transition: 0.18s ease;
-    }
-
-    .select:hover { border-color: rgba(56,189,248,0.4); }
-    .select:focus {
-      border-color: var(--neon-cyan);
-      box-shadow: 0 0 0 3px rgba(56,189,248,0.18), var(--glow-cyan);
-    }
-
-    .table-wrap {
-      overflow: auto;
-      padding: 8px 10px 12px 10px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      min-width: 980px;
-    }
-
-    thead th {
-      text-align: left;
-      padding: 15px 18px;
-      color: #8aa0c4;
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.09em;
-      font-weight: 700;
-      position: sticky;
-      top: 0;
-      background: rgba(9,13,24,0.97);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--border-soft);
-      z-index: 1;
-    }
-
-    tbody td {
-      padding: 15px 18px;
-      border-bottom: 1px solid rgba(125,152,194,0.07);
-      font-size: 14px;
-      color: var(--text);
-      vertical-align: middle;
-    }
-
-    .cell-ip-src {
-      color: #7fd6ff;
-      font-weight: 600;
-    }
-
-    .cell-ip-dst {
-      color: #9fb8ff;
-      font-weight: 600;
-    }
-
-    .cell-port-src {
-      color: #f3c14e;
-      font-weight: 700;
-    }
-
-    .cell-port-dst {
-      color: #b3b8ff;
-      font-weight: 700;
-    }
-
-    tbody tr { transition: background-color 0.15s ease; }
-    tbody tr:hover td {
-      background: rgba(56,189,248,0.05);
-    }
-
     @keyframes rowEnter {
-      0%   { opacity: 0; }
-      100% { opacity: 1; }
+      from { background-color: rgba(var(--green-rgb), 0.16); }
+      to { background-color: transparent; }
     }
-
-    @keyframes rowFlash {
-      0%   { background: rgba(56,189,248,0.20); box-shadow: inset 3px 0 0 var(--neon-cyan), inset 0 0 24px rgba(56,189,248,0.18); }
-      100% { background: transparent; box-shadow: inset 3px 0 0 transparent, inset 0 0 24px transparent; }
-    }
-
-    tbody tr.row-enter { animation: rowEnter 0.4s ease-out; }
-    tbody tr.row-enter td { animation: rowFlash 1.4s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes slideIn { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
 
     @media (prefers-reduced-motion: reduce) {
-      tbody tr.row-enter,
-      tbody tr.row-enter td { animation: none; }
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+      .caret { opacity: 1; }
     }
 
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    /* ── Duyarlı düzen ───────────────────────────────────────────────── */
+    @media (max-width: 1180px) {
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric-rate { grid-column: 1 / -1; }
     }
 
-    .muted-cell { color: var(--muted); }
-
-    .proto {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 56px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      background: rgba(148,163,184,0.10);
-      border: 1px solid rgba(148,163,184,0.16);
-      color: var(--text);
-    }
-
-    .proto.tcp {
-      color: #9ad8ff;
-      background: rgba(56,189,248,0.12);
-      border-color: rgba(56,189,248,0.34);
-    }
-
-    .proto.udp {
-      color: #74e6b6;
-      background: rgba(52,227,155,0.10);
-      border-color: rgba(52,227,155,0.34);
-    }
-
-    .proto.icmp {
-      color: #f7cb6f;
-      background: rgba(245,181,68,0.10);
-      border-color: rgba(245,181,68,0.34);
-    }
-
-    .cell-proto { white-space: nowrap; }
-    .proto { cursor: default; }
-    .proto.svc { min-width: 64px; }
-    .proto .lock {
-      width: 11px;
-      height: 11px;
-      margin-right: 4px;
-      flex-shrink: 0;
-      opacity: 0.9;
-    }
-
-    .empty {
-      padding: 44px 28px 54px 28px;
-      text-align: center;
-      color: var(--muted);
-      font-size: 15px;
-    }
-
-    .empty-title {
-      font-size: 18px;
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 8px;
-    }
-
-    .file-sizes-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 3px;
-      width: 100%;
-      min-width: 0;
-    }
-
-    .file-size-item {
-      display: flex;
-      flex-direction: column;
-      gap: 1px;
-      padding: 4px 6px;
-      border-radius: 8px;
-      background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(148,163,184,0.06);
-      min-width: 0;
-    }
-
-    .file-size-item .size-label {
-      display: flex;
-      align-items: center;
-      gap: 3px;
-      color: var(--muted-2);
-      font-size: 8px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-weight: 600;
-      white-space: nowrap;
-    }
-
-    .file-size-item .size-dot {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      display: inline-block;
-      flex-shrink: 0;
-    }
-
-    .file-size-item .size-dot.hourly { background: var(--neon-cyan); box-shadow: 0 0 6px rgba(56,189,248,0.9); }
-    .file-size-item .size-dot.daily { background: var(--neon-green); box-shadow: 0 0 6px rgba(52,227,155,0.9); }
-    .file-size-item .size-dot.monthly { background: var(--neon-amber); box-shadow: 0 0 6px rgba(255,176,32,0.9); }
-    .file-size-item .size-dot.total { background: var(--neon-purple); box-shadow: 0 0 6px rgba(138,164,255,0.9); }
-
-    .file-size-item .size-value {
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      color: var(--text);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .file-size-item .size-value.hourly { color: #8fd6ff; }
-    .file-size-item .size-value.daily { color: #7fe3b8; }
-    .file-size-item .size-value.monthly { color: #f5cd82; }
-    .file-size-item .size-value.total { color: #b3b8ff; }
-
-    .file-size-value-wrap {
-      display: block;
-      width: 100%;
-    }
-
-    @media (max-width: 1100px) {
-      body { padding: 18px; }
-      .hero-grid { grid-template-columns: 1fr 1fr; }
-    }
-
-    @media (max-width: 920px) {
-      body { padding: 12px; }
-      .hero, .table-card { border-radius: 22px; }
-      .hero { padding: 18px; }
-      .table-card-header { padding: 20px 20px 16px 20px; }
-      .toolbar { width: 100%; }
-      .field { width: 100%; }
-      .hero-controls { width: 100%; }
-      .ribbon-file { flex-basis: 100%; }
-    }
-
-    @media (max-width: 560px) {
-      .hero-grid { grid-template-columns: 1fr; }
-      .stat-card.sizes { grid-column: auto; }
-      .file-sizes-grid { grid-template-columns: repeat(2, 1fr); }
-      .status-ribbon { gap: 6px 4px; }
-      .ribbon-sep { display: none; }
-      .ribbon-item { flex-basis: calc(50% - 4px); }
-      .ribbon-conn { flex-basis: 100%; }
+    @media (max-width: 720px) {
+      .topbar-inner, .statusline-inner, .shell { padding-left: var(--s4); padding-right: var(--s4); }
+      .shell { padding-top: var(--s4); padding-bottom: var(--s4); }
+      .brand-sub { display: none; }
+      .brand-mark { display: none; }
+      .btn .btn-text { display: none; }
+      .btn { padding: 0 var(--s3); }
+      .metrics { grid-template-columns: minmax(0, 1fr); }
+      .stat-number { font-size: 34px; }
+      .toolbar { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+      .toolbar .field-pager { grid-column: 1 / -1; }
+      .select { width: 100%; min-width: 0; }
+      .pager { justify-content: space-between; }
+      .drawer-head, .drawer-body { padding-left: var(--s4); padding-right: var(--s4); }
+      .threat-item { grid-template-columns: 1fr; }
+      .threat-time { order: -1; }
     }
   </style>
 </head>
 <body>
-  <div class="layout">
-    <section class="hero">
-      <div class="hero-top">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12h4l2 6 4-14 2 8h6"/>
-            </svg>
-          </span>
-          <div class="brand-text">
-            <h1 class="brand-title">NetFlow Logger</h1>
-            <p class="brand-subtitle">NetFlow v9 · saatlik mühürlü kayıt paneli</p>
-          </div>
-        </div>
-        <div class="hero-controls">
-          <button type="button" class="mode-button live" id="live-toggle">Canlı SSE akışı</button>
-          <button type="button" class="mode-button threat-toggle" id="threat-toggle" aria-haspopup="dialog" aria-expanded="false" title="Güvenlik uyarılarını göster">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
-            </svg>
-            <span>Güvenlik uyarıları</span>
-            <span class="threat-toggle-badge" id="threat-toggle-count" hidden>0</span>
-          </button>
+  <a class="skip-link" href="#log-panel">Log kayıtlarına geç</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12h4l2 6 4-14 2 8h6"/>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1 class="brand-title"><span class="host">netflow</span><span class="sep">@</span><span>logger</span><span class="sep">:</span><span class="path">~</span><span class="sep">$</span><span class="caret" aria-hidden="true"></span></h1>
+          <p class="brand-sub">NetFlow v9 · saatlik mühürlü kayıt paneli</p>
         </div>
       </div>
-
-      <div class="status-ribbon" role="status" aria-live="polite">
-        <span class="ribbon-item ribbon-conn">
-          <span class="status-badge" id="connection">Bağlanıyor</span>
-        </span>
-        <span class="ribbon-sep" aria-hidden="true"></span>
-        <span class="ribbon-item">
-          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
-          </svg>
-          <span class="ribbon-label">Son güncelleme</span>
-          <span class="ribbon-value mono" id="updated-at">-</span>
-        </span>
-        <span class="ribbon-sep" aria-hidden="true"></span>
-        <span class="ribbon-item ribbon-file">
-          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M14 3v5h5"/><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
-          </svg>
-          <span class="ribbon-label">Aktif dosya</span>
-          <span class="ribbon-value mono" id="active-file" title="Aktif log dosyası">-</span>
-        </span>
-        <span class="ribbon-sep" aria-hidden="true"></span>
-        <span class="ribbon-item">
-          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>
-          </svg>
-          <span class="ribbon-label">Bütünlük</span>
-          <span class="seal-badge" id="seal-badge">Bekliyor</span>
-        </span>
-        <span class="ribbon-sep" aria-hidden="true"></span>
-        <span class="ribbon-item">
-          <svg class="ribbon-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <nav class="actions" aria-label="Görünüm">
+        <button type="button" class="btn btn-live live" id="live-toggle" title="Canlı SSE akışına dön">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="live-toggle-label">Canlı</span>
+        </button>
+        <button type="button" class="btn btn-threat" id="threat-toggle" aria-haspopup="dialog" aria-expanded="false" aria-controls="threat-modal" title="Güvenlik uyarılarını göster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
           </svg>
-          <span class="ribbon-label">Tehdit</span>
-          <span class="threat-badge" id="threat-badge">0</span>
-        </span>
-      </div>
+          <span class="btn-text">Güvenlik</span>
+          <span class="count" id="threat-toggle-count" hidden>0</span>
+        </button>
+      </nav>
+    </div>
+  </header>
 
-      <div class="hero-grid">
-        <div class="stat-card accent">
-          <div class="stat-head">
-            <span class="status-label">Akış hızı</span>
-            <span class="live-dot" id="rate-dot" aria-hidden="true"></span>
+  <div class="statusline">
+    <div class="statusline-inner">
+      <div class="sl-item">
+        <span class="sl-key">Bağlantı</span>
+        <span class="status-badge" id="connection" role="status" aria-live="polite">Bağlanıyor</span>
+      </div>
+      <div class="sl-item">
+        <span class="sl-key">Güncelleme</span>
+        <span class="sl-val" id="updated-at">-</span>
+      </div>
+      <div class="sl-item sl-file">
+        <span class="sl-key">Dosya</span>
+        <span class="sl-val" id="active-file" title="Aktif log dosyası">-</span>
+      </div>
+      <div class="sl-item">
+        <span class="sl-key">Mühür</span>
+        <span class="seal-badge" id="seal-badge">Bekliyor</span>
+      </div>
+      <div class="sl-item">
+        <span class="sl-key">Tehdit</span>
+        <span class="threat-badge" id="threat-badge">0</span>
+      </div>
+    </div>
+  </div>
+
+  <main class="shell">
+    <section class="metrics" aria-label="Özet göstergeler">
+      <article class="panel metric-rate">
+        <header class="panel-head">
+          <span class="panel-tag">01</span>
+          <h2 class="panel-title">Akış hızı</h2>
+          <span class="spacer"></span>
+          <span class="live-dot" id="rate-dot" aria-hidden="true"></span>
+        </header>
+        <div class="metric-body">
+          <div class="rate-top">
+            <div class="metric-value">
+              <span class="stat-number" id="throughput-rate">0</span>
+              <span class="stat-unit">paket/sn</span>
+            </div>
+            <div class="rate-legend">
+              <span id="rate-peak">tepe 0</span>
+              <span>son 2 dk</span>
+            </div>
           </div>
-          <div class="stat-main">
-            <span class="stat-number" id="throughput-rate">0</span>
-            <span class="stat-unit">pps</span>
-          </div>
-          <div class="rate-chart" title="Son 2 dakikalık paket akış hızı (paket/sn)">
-            <canvas id="rate-spark"></canvas>
-            <span class="rate-chart-peak" id="rate-peak">tepe 0</span>
-            <span class="rate-chart-span">son 2 dk</span>
+          <div class="rate-chart">
+            <canvas id="rate-spark" role="img" aria-label="Son 2 dakikalık paket akış hızı grafiği"></canvas>
           </div>
         </div>
+      </article>
 
-        <div class="stat-card integrity">
-          <div class="stat-head">
-            <span class="status-label">Bütünlük mührü</span>
-          </div>
-          <div class="seal-sha-row">
-            <code class="seal-sha mono" id="seal-sha" title="Son SHA-256 özeti">SHA-256 henüz yok</code>
-            <button type="button" class="copy-btn" id="copy-sha" title="SHA-256 kopyala" disabled aria-label="SHA-256 özetini kopyala">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <article class="panel">
+        <header class="panel-head">
+          <span class="panel-tag">02</span>
+          <h2 class="panel-title">Bütünlük mührü</h2>
+        </header>
+        <div class="metric-body">
+          <span class="sha-label">Son SHA-256 özeti</span>
+          <div class="sha-row">
+            <code class="seal-sha" id="seal-sha" title="Son SHA-256 özeti">SHA-256 henüz yok</code>
+            <button type="button" class="icon-btn" id="copy-sha" title="SHA-256 kopyala" disabled aria-label="SHA-256 özetini kopyala">
+              <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>
+              </svg>
+              <svg class="ico-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5"/>
               </svg>
             </button>
           </div>
-          <div class="stat-foot" id="seal-detail" title="Son TSA durumu">TSA: bekleniyor</div>
+          <div class="seal-foot" id="seal-detail" title="Son TSA durumu">TSA: bekleniyor</div>
         </div>
+      </article>
 
-        <div class="stat-card sizes">
-          <div class="stat-head"><span class="status-label">Dosya boyutları</span></div>
-          <div class="file-sizes-grid">
-            <div class="file-size-item">
-              <span class="size-label"><span class="size-dot hourly"></span>Saatlik</span>
-              <span class="size-value hourly" id="file-size-hourly">-</span>
+      <article class="panel">
+        <header class="panel-head">
+          <span class="panel-tag">03</span>
+          <h2 class="panel-title">Dosya boyutları</h2>
+        </header>
+        <div class="metric-body">
+          <dl class="kv">
+            <div class="kv-row">
+              <dt><span class="kv-dot hourly" aria-hidden="true"></span>Saatlik</dt>
+              <dd id="file-size-hourly">-</dd>
             </div>
-            <div class="file-size-item">
-              <span class="size-label"><span class="size-dot daily"></span>Günlük</span>
-              <span class="size-value daily" id="file-size-daily">-</span>
+            <div class="kv-row">
+              <dt><span class="kv-dot daily" aria-hidden="true"></span>Günlük</dt>
+              <dd id="file-size-daily">-</dd>
             </div>
-            <div class="file-size-item">
-              <span class="size-label"><span class="size-dot monthly"></span>Aylık</span>
-              <span class="size-value monthly" id="file-size-monthly">-</span>
+            <div class="kv-row">
+              <dt><span class="kv-dot monthly" aria-hidden="true"></span>Aylık</dt>
+              <dd id="file-size-monthly">-</dd>
             </div>
-            <div class="file-size-item">
-              <span class="size-label"><span class="size-dot total"></span>Toplam</span>
-              <span class="size-value total" id="file-size-total">-</span>
+            <div class="kv-row total">
+              <dt><span class="kv-dot total" aria-hidden="true"></span>Toplam</dt>
+              <dd id="file-size-total">-</dd>
             </div>
-          </div>
+          </dl>
         </div>
-      </div>
+      </article>
     </section>
 
     <div class="alert-banner" id="no-data-alert" role="alert" hidden>
@@ -4752,86 +4255,14 @@ const dashboardHTML = `<!DOCTYPE html>
       <span class="alert-pulse" aria-hidden="true"></span>
     </div>
 
-    <div class="threat-modal" id="threat-modal" hidden>
-      <div class="threat-modal-backdrop" data-threat-close></div>
-      <section class="threat-card threat-modal-panel" id="threat-card" role="dialog" aria-modal="true" aria-labelledby="threat-modal-title">
-        <button type="button" class="threat-close" data-threat-close aria-label="Güvenlik panelini kapat">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
-          </svg>
-        </button>
-        <div class="threat-header">
-          <div class="threat-heading">
-            <span class="threat-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
-              </svg>
-            </span>
-            <div>
-              <h2 class="threat-title" id="threat-modal-title">Güvenlik izleme
-                <span class="threat-count" id="threat-count" hidden>0</span>
-              </h2>
-              <p class="threat-subtitle">Akış trafiği arka planda sürekli analiz edilir; brute-force ve port/host tarama denemeleri tespit edilir.</p>
-            </div>
-          </div>
-          <span class="threat-status ok" id="threat-status">Şüpheli aktivite yok</span>
-        </div>
-        <div class="threat-list" id="threat-list">
-          <div class="threat-empty" id="threat-empty">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M9 12l2 2 4-4"/>
-            </svg>
-            <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
-          </div>
-        </div>
-
-        <div class="blocklist-section">
-          <div class="blocklist-head">
-            <span class="blocklist-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>
-              </svg>
-              Engellenen kaynaklar
-            </span>
-            <p class="blocklist-sub">Buraya eklenen IP adresleri kalıcı olarak kara listeye alınır ve <span class="mono">/blocklist</span> endpoint'i üzerinden güvenlik duvarına (OPNsense) yansır. Kayıtlar <span class="mono">blocklist.json</span> içinde tutulur; <span class="mono">config.json</span>'a dokunulmaz.</p>
-          </div>
-          <form class="blocklist-form" id="blocklist-form" autocomplete="off">
-            <input type="text" class="blocklist-input" id="blocklist-input" placeholder="Engellenecek IP (ör. 203.0.113.5)" spellcheck="false" aria-label="Engellenecek IP" />
-            <button type="submit" class="blocklist-add">Engelle</button>
-          </form>
-          <div class="blocklist-error" id="blocklist-error" role="alert" hidden></div>
-          <div class="blocklist-list" id="blocklist-list">
-            <div class="blocklist-empty" id="blocklist-empty">Elle engellenen kaynak yok.</div>
-          </div>
-        </div>
-
-        <div class="whitelist-section">
-          <div class="whitelist-head">
-            <span class="whitelist-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>
-              </svg>
-              Görmezden gelinen kaynaklar
-            </span>
-            <p class="whitelist-sub">Buraya eklenen kaynak IP adresleri veya CIDR blokları (ör. <span class="mono">10.0.0.0/24</span>) tehdit analizinde tamamen yok sayılır. Ayarlar <span class="mono">config.json</span> içinde kalıcı tutulur.</p>
-          </div>
-          <form class="whitelist-form" id="whitelist-form" autocomplete="off">
-            <input type="text" class="whitelist-input" id="whitelist-input" placeholder="192.168.1.10 veya 10.0.0.0/24" spellcheck="false" aria-label="Whitelist girişi" />
-            <button type="submit" class="whitelist-add">Ekle</button>
-          </form>
-          <div class="whitelist-error" id="whitelist-error" role="alert" hidden></div>
-          <div class="whitelist-list" id="whitelist-list">
-            <div class="whitelist-empty" id="whitelist-empty">Henüz görmezden gelinen kaynak eklenmedi.</div>
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <section class="table-card">
-      <div class="table-card-header">
+    <section class="panel log-panel" id="log-panel" tabindex="-1" aria-labelledby="log-title">
+      <header class="log-head">
         <div>
-          <h2 class="table-title">Log kayıtları</h2>
-          <p class="table-subtitle" id="table-subtitle">Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.</p>
+          <div class="log-title">
+            <span class="panel-tag">04</span>
+            <h2 class="panel-title" id="log-title">Log kayıtları</h2>
+          </div>
+          <p class="panel-sub" id="table-subtitle">Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.</p>
         </div>
         <div class="toolbar">
           <div class="field">
@@ -4847,7 +4278,7 @@ const dashboardHTML = `<!DOCTYPE html>
             </select>
           </div>
           <div class="field">
-            <label for="limit-select">Satır sayısı</label>
+            <label for="limit-select">Satır</label>
             <select id="limit-select" class="select">
               <option value="50" selected>50</option>
               <option value="100">100</option>
@@ -4855,81 +4286,173 @@ const dashboardHTML = `<!DOCTYPE html>
               <option value="500">500</option>
             </select>
           </div>
-          <div class="field">
-            <label>Sayfa</label>
-            <div class="pager">
-              <button type="button" class="mode-button" id="prev-page">Önceki</button>
-              <span class="pager-info" id="page-info">1 / 1</span>
-              <button type="button" class="mode-button" id="next-page">Sonraki</button>
+          <div class="field field-pager">
+            <span class="field-label" id="pager-label">Sayfa</span>
+            <div class="pager" role="group" aria-labelledby="pager-label">
+              <button type="button" class="btn" id="prev-page" aria-label="Önceki sayfa">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+              </button>
+              <span class="pager-info" id="page-info" aria-live="polite">1 / 1</span>
+              <button type="button" class="btn" id="next-page" aria-label="Sonraki sayfa">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </button>
             </div>
           </div>
         </div>
-      </div>
+      </header>
       <div class="table-wrap">
-        <table>
+        <table class="log-table">
           <thead>
             <tr>
-              <th>Zaman</th>
-              <th>Kaynak IP</th>
-              <th>Kaynak Port</th>
-              <th>Hedef IP</th>
-              <th>Hedef Port</th>
-              <th>Protokol</th>
-              <th>Boyut</th>
+              <th scope="col">Zaman</th>
+              <th scope="col">Kaynak IP</th>
+              <th scope="col" class="num">Kaynak Port</th>
+              <th scope="col" class="arrow" aria-hidden="true"></th>
+              <th scope="col">Hedef IP</th>
+              <th scope="col" class="num">Hedef Port</th>
+              <th scope="col">Protokol</th>
+              <th scope="col" class="num">Boyut</th>
             </tr>
           </thead>
           <tbody id="records"></tbody>
         </table>
       </div>
     </section>
+  </main>
+
+  <div class="threat-modal" id="threat-modal" hidden>
+    <div class="threat-modal-backdrop" data-threat-close></div>
+    <section class="threat-card threat-modal-panel" id="threat-card" role="dialog" aria-modal="true" aria-labelledby="threat-modal-title">
+      <header class="drawer-head">
+        <div class="drawer-title-row">
+          <span class="threat-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
+            </svg>
+          </span>
+          <div class="drawer-title-text">
+            <h2 class="threat-title" id="threat-modal-title">Güvenlik izleme
+              <span class="threat-count" id="threat-count" hidden>0</span>
+            </h2>
+            <p class="threat-subtitle">Akış trafiği arka planda sürekli analiz edilir; brute-force ve port/host tarama denemeleri tespit edilir.</p>
+          </div>
+          <button type="button" class="icon-btn threat-close" data-threat-close aria-label="Güvenlik panelini kapat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+            </svg>
+          </button>
+        </div>
+        <span class="threat-status ok" id="threat-status" role="status">Şüpheli aktivite yok</span>
+      </header>
+
+      <div class="drawer-body">
+        <div class="drawer-section">
+          <div class="section-head">
+            <h3 class="section-title">Aktif uyarılar</h3>
+          </div>
+          <div class="threat-list" id="threat-list">
+            <div class="threat-empty" id="threat-empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M9 12l2 2 4-4"/>
+              </svg>
+              <span>Şu an şüpheli bir aktivite tespit edilmedi.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="drawer-divider" aria-hidden="true"></div>
+
+        <div class="drawer-section">
+          <div class="section-head">
+            <h3 class="section-title">Engellenen kaynaklar</h3>
+            <p class="section-sub">Buraya eklenen IP adresleri kalıcı olarak kara listeye alınır ve <span class="mono">/blocklist</span> endpoint'i üzerinden güvenlik duvarına (OPNsense) yansır. Kayıtlar <span class="mono">blocklist.json</span> içinde tutulur; <span class="mono">config.json</span>'a dokunulmaz.</p>
+          </div>
+          <form class="inline-form" id="blocklist-form" autocomplete="off">
+            <input type="text" class="text-input" id="blocklist-input" placeholder="203.0.113.5" spellcheck="false" aria-label="Engellenecek IP" />
+            <button type="submit" class="btn btn-danger">Engelle</button>
+          </form>
+          <div class="form-error" id="blocklist-error" role="alert" hidden></div>
+          <div class="chip-list" id="blocklist-list">
+            <div class="list-empty" id="blocklist-empty">Elle engellenen kaynak yok.</div>
+          </div>
+        </div>
+
+        <div class="drawer-divider" aria-hidden="true"></div>
+
+        <div class="drawer-section">
+          <div class="section-head">
+            <h3 class="section-title">Görmezden gelinen kaynaklar</h3>
+            <p class="section-sub">Buraya eklenen kaynak IP adresleri veya CIDR blokları (ör. <span class="mono">10.0.0.0/24</span>) tehdit analizinde tamamen yok sayılır. Ayarlar <span class="mono">config.json</span> içinde kalıcı tutulur.</p>
+          </div>
+          <form class="inline-form" id="whitelist-form" autocomplete="off">
+            <input type="text" class="text-input" id="whitelist-input" placeholder="192.168.1.10 veya 10.0.0.0/24" spellcheck="false" aria-label="Whitelist girişi" />
+            <button type="submit" class="btn btn-accent">Ekle</button>
+          </form>
+          <div class="form-error" id="whitelist-error" role="alert" hidden></div>
+          <div class="chip-list" id="whitelist-list">
+            <div class="list-empty" id="whitelist-empty">Henüz görmezden gelinen kaynak eklenmedi.</div>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <script>
-    const updatedAtEl = document.getElementById('updated-at');
-    const recordsEl = document.getElementById('records');
-    const connectionEl = document.getElementById('connection');
-    const dateSelectEl = document.getElementById('date-select');
-    const hourSelectEl = document.getElementById('hour-select');
-    const limitSelectEl = document.getElementById('limit-select');
-    const liveToggleEl = document.getElementById('live-toggle');
-    const tableSubtitleEl = document.getElementById('table-subtitle');
-    const prevPageEl = document.getElementById('prev-page');
-    const nextPageEl = document.getElementById('next-page');
-    const pageInfoEl = document.getElementById('page-info');
-    const fileSizeHourlyEl = document.getElementById('file-size-hourly');
-    const fileSizeDailyEl = document.getElementById('file-size-daily');
-    const fileSizeMonthlyEl = document.getElementById('file-size-monthly');
-    const fileSizeTotalEl = document.getElementById('file-size-total');
-    const throughputRateEl = document.getElementById('throughput-rate');
-    const rateDotEl = document.getElementById('rate-dot');
-    const rateSparkEl = document.getElementById('rate-spark');
-    const ratePeakEl = document.getElementById('rate-peak');
-    const activeFileEl = document.getElementById('active-file');
-    const sealBadgeEl = document.getElementById('seal-badge');
-    const sealShaEl = document.getElementById('seal-sha');
-    const sealDetailEl = document.getElementById('seal-detail');
-    const copyShaEl = document.getElementById('copy-sha');
-    const noDataEl = document.getElementById('no-data-alert');
-    const noDataDetailEl = document.getElementById('no-data-detail');
-    const threatCardEl = document.getElementById('threat-card');
-    const threatListEl = document.getElementById('threat-list');
-    const threatEmptyEl = document.getElementById('threat-empty');
-    const threatCountEl = document.getElementById('threat-count');
-    const threatStatusEl = document.getElementById('threat-status');
-    const threatBadgeEl = document.getElementById('threat-badge');
-    const threatModalEl = document.getElementById('threat-modal');
-    const threatToggleEl = document.getElementById('threat-toggle');
-    const threatToggleCountEl = document.getElementById('threat-toggle-count');
-    const whitelistFormEl = document.getElementById('whitelist-form');
-    const whitelistInputEl = document.getElementById('whitelist-input');
-    const whitelistErrorEl = document.getElementById('whitelist-error');
-    const whitelistListEl = document.getElementById('whitelist-list');
-    const whitelistEmptyEl = document.getElementById('whitelist-empty');
-    const blocklistFormEl = document.getElementById('blocklist-form');
-    const blocklistInputEl = document.getElementById('blocklist-input');
-    const blocklistErrorEl = document.getElementById('blocklist-error');
-    const blocklistListEl = document.getElementById('blocklist-list');
-    const blocklistEmptyEl = document.getElementById('blocklist-empty');
+    'use strict';
+
+    const $ = (id) => document.getElementById(id);
+
+    const updatedAtEl = $('updated-at');
+    const recordsEl = $('records');
+    const connectionEl = $('connection');
+    const dateSelectEl = $('date-select');
+    const hourSelectEl = $('hour-select');
+    const limitSelectEl = $('limit-select');
+    const liveToggleEl = $('live-toggle');
+    const liveToggleLabelEl = $('live-toggle-label');
+    const tableSubtitleEl = $('table-subtitle');
+    const prevPageEl = $('prev-page');
+    const nextPageEl = $('next-page');
+    const pageInfoEl = $('page-info');
+    const fileSizeHourlyEl = $('file-size-hourly');
+    const fileSizeDailyEl = $('file-size-daily');
+    const fileSizeMonthlyEl = $('file-size-monthly');
+    const fileSizeTotalEl = $('file-size-total');
+    const throughputRateEl = $('throughput-rate');
+    const rateDotEl = $('rate-dot');
+    const rateSparkEl = $('rate-spark');
+    const ratePeakEl = $('rate-peak');
+    const activeFileEl = $('active-file');
+    const sealBadgeEl = $('seal-badge');
+    const sealShaEl = $('seal-sha');
+    const sealDetailEl = $('seal-detail');
+    const copyShaEl = $('copy-sha');
+    const noDataEl = $('no-data-alert');
+    const noDataDetailEl = $('no-data-detail');
+    const threatCardEl = $('threat-card');
+    const threatListEl = $('threat-list');
+    const threatEmptyEl = $('threat-empty');
+    const threatCountEl = $('threat-count');
+    const threatStatusEl = $('threat-status');
+    const threatBadgeEl = $('threat-badge');
+    const threatModalEl = $('threat-modal');
+    const threatToggleEl = $('threat-toggle');
+    const threatToggleCountEl = $('threat-toggle-count');
+    const whitelistFormEl = $('whitelist-form');
+    const whitelistInputEl = $('whitelist-input');
+    const whitelistErrorEl = $('whitelist-error');
+    const whitelistListEl = $('whitelist-list');
+    const whitelistEmptyEl = $('whitelist-empty');
+    const blocklistFormEl = $('blocklist-form');
+    const blocklistInputEl = $('blocklist-input');
+    const blocklistErrorEl = $('blocklist-error');
+    const blocklistListEl = $('blocklist-list');
+    const blocklistEmptyEl = $('blocklist-empty');
+
+    const ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+    const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+    const ICON_BAN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>';
+    const ICON_LOCK = '<svg class="lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 
     let eventSource = null;
     let livePollTimer = null;
@@ -4941,9 +4464,8 @@ const dashboardHTML = `<!DOCTYPE html>
     let rateEma = 0;
     let currentSha = '';
 
-    // Canlı akış mini grafiği: rateEma değeri sabit aralıkla örneklenir ve son
-    // 2 dakikalık pencere (120 örnek) bir halka tamponunda tutulur. Böylece grafik
-    // zaman ekseni, olay sıklığından bağımsız ve düzgün olur.
+    // Canlı akış grafiği: rateEma sabit aralıkla örneklenir; son 2 dakika
+    // (120 örnek) bir halka tamponda tutulur. Zaman ekseni olay sıklığından bağımsızdır.
     const RATE_SAMPLE_MS = 1000;
     const RATE_WINDOW = 120;
     const rateSamples = [];
@@ -4959,7 +4481,10 @@ const dashboardHTML = `<!DOCTYPE html>
 
     const numberFmt = new Intl.NumberFormat('tr-TR');
 
-    // pps her zaman tam sayı olarak gösterilir; binlik ayırıcıyla biçimlenir.
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
     function formatRate(value) {
       return numberFmt.format(Math.max(0, Math.round(value)));
     }
@@ -4971,16 +4496,14 @@ const dashboardHTML = `<!DOCTYPE html>
       return idx >= 0 ? clean.slice(idx + 1) : clean;
     }
 
-    // Akış hızı, saatlik sıfırlanan toplam paket sayacının (packets_total) türevinden
-    // pps (paket/sn) olarak hesaplanır. Saat dönümünde sayaç sıfırlandığında (total
-    // düşer) baz değer yenilenir; o örnek atlanır, böylece sahte bir sıçrama olmaz.
+    // Akış hızı, saatlik sıfırlanan packets_total sayacının türevinden pps olarak
+    // hesaplanır. Saat dönümünde sayaç düşerse baz yenilenir; sahte sıçrama olmaz.
     function updateThroughput(state) {
       const total = Number(state.packets_total);
       if (!Number.isFinite(total)) return;
 
       const now = performance.now();
       if (lastProcessed !== null && total < lastProcessed) {
-        // Saatlik sıfırlama: bazı yeniden hizala, hızı koru.
         lastProcessed = total;
         lastProcessedAt = now;
         return;
@@ -5008,12 +4531,11 @@ const dashboardHTML = `<!DOCTYPE html>
       drawRateChart();
     }
 
-    // Canvas'ı yüksek DPI ekranlara göre ölçekler ve mevcut çizim bağlamını döndürür.
     function prepareRateCanvas() {
       if (!rateSparkEl) return null;
       const dpr = window.devicePixelRatio || 1;
-      const w = rateSparkEl.clientWidth || rateSparkEl.parentElement.clientWidth || 220;
-      const h = rateSparkEl.clientHeight || 46;
+      const w = rateSparkEl.clientWidth || 300;
+      const h = rateSparkEl.clientHeight || 88;
       const pw = Math.round(w * dpr);
       const ph = Math.round(h * dpr);
       if (rateSparkEl.width !== pw || rateSparkEl.height !== ph) {
@@ -5025,42 +4547,34 @@ const dashboardHTML = `<!DOCTYPE html>
       return { ctx, w, h };
     }
 
-    // Son 2 dakikalık akış hızını neon alan grafiği olarak çizer.
+    // Son 2 dakikalık akış hızını fosfor yeşili basamaklı alan grafiği olarak çizer.
     function drawRateChart() {
       const env = prepareRateCanvas();
       if (!env) return;
       const { ctx, w, h } = env;
       ctx.clearRect(0, 0, w, h);
 
-      const pad = 4;
-      const baseY = h - pad;
-      const topY = pad + 8;
-
-      // Eksen tabanı.
-      ctx.strokeStyle = 'rgba(56,189,248,0.14)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(0, baseY + 0.5);
-      ctx.lineTo(w, baseY + 0.5);
-      ctx.stroke();
-
       const n = rateSamples.length;
-      const peak = n ? Math.max(...rateSamples) : 0;
-      ratePeakEl.textContent = 'tepe ' + formatRate(peak);
+      const peak = n ? Math.max.apply(null, rateSamples) : 0;
+      ratePeakEl.innerHTML = 'tepe <strong>' + formatRate(peak) + '</strong>';
+      rateSparkEl.setAttribute('aria-label', 'Son 2 dakikalık paket akış hızı grafiği, tepe ' + formatRate(peak) + ' paket/sn');
 
       if (n < 2 || peak <= 0) return;
 
-      // X ekseni her zaman tam pencereyi temsil eder; veri sağdan sola akar.
+      const green = cssVar('--green') || '#3ee08a';
+      const rgb = cssVar('--green-rgb') || '62, 224, 138';
+      const padTop = 8;
+      const baseY = h - 1;
       const stepX = w / (RATE_WINDOW - 1);
-      const scaleY = (baseY - topY) / peak;
+      const scaleY = (baseY - padTop) / peak;
       const offset = RATE_WINDOW - n;
       const xAt = (i) => (offset + i) * stepX;
       const yAt = (v) => baseY - v * scaleY;
 
-      // Dolgu alanı.
-      const grad = ctx.createLinearGradient(0, topY, 0, baseY);
-      grad.addColorStop(0, 'rgba(56,189,248,0.42)');
-      grad.addColorStop(1, 'rgba(56,189,248,0.02)');
+      const grad = ctx.createLinearGradient(0, padTop, 0, baseY);
+      grad.addColorStop(0, 'rgba(' + rgb + ', 0.32)');
+      grad.addColorStop(1, 'rgba(' + rgb + ', 0.02)');
+
       ctx.beginPath();
       ctx.moveTo(xAt(0), baseY);
       for (let i = 0; i < n; i++) ctx.lineTo(xAt(i), yAt(rateSamples[i]));
@@ -5069,33 +4583,33 @@ const dashboardHTML = `<!DOCTYPE html>
       ctx.fillStyle = grad;
       ctx.fill();
 
-      // Çizgi + neon parıltı.
       ctx.beginPath();
       for (let i = 0; i < n; i++) {
         const x = xAt(i), y = yAt(rateSamples[i]);
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.lineWidth = 1.8;
-      ctx.strokeStyle = '#38bdf8';
-      ctx.shadowColor = 'rgba(56,189,248,0.8)';
-      ctx.shadowBlur = 6;
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = green;
       ctx.stroke();
-      ctx.shadowBlur = 0;
 
-      // Son noktayı vurgula.
-      const lx = xAt(n - 1), ly = yAt(rateSamples[n - 1]);
+      // Tepe çizgisi (kesikli).
+      const py = Math.round(yAt(peak)) + 0.5;
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = 'rgba(' + rgb + ', 0.35)';
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(lx, ly, 2.6, 0, Math.PI * 2);
-      ctx.fillStyle = '#eafcff';
-      ctx.shadowColor = 'rgba(56,189,248,0.9)';
-      ctx.shadowBlur = 8;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+      ctx.moveTo(0, py);
+      ctx.lineTo(w, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Son nokta: terminal imleci gibi küçük kare.
+      const lx = xAt(n - 1), ly = yAt(rateSamples[n - 1]);
+      ctx.fillStyle = green;
+      ctx.fillRect(Math.min(lx, w - 4) - 2, ly - 2, 5, 5);
     }
 
-    // Sabit aralıkla mevcut hızı örnekler; yalnızca canlı modda akar.
     function sampleRate() {
       if (currentMode !== 'live') return;
       rateSamples.push(rateEma > 0 ? rateEma : 0);
@@ -5108,56 +4622,44 @@ const dashboardHTML = `<!DOCTYPE html>
       rateSampleTimer = setInterval(sampleRate, RATE_SAMPLE_MS);
     }
 
-    window.addEventListener('resize', drawRateChart);
+    let resizeFrame = null;
+    window.addEventListener('resize', () => {
+      if (resizeFrame !== null) return;
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        drawRateChart();
+      });
+    });
 
-    // Canlı durum her geldiğinde toplam kayıt sayısını izler; arttıysa "veri akıyor"
-    // zaman damgasını günceller (uyarıyı tetikleyen boşta kalma süresini sıfırlar).
     function noteDataActivity(state) {
       const total = Number(state.processed_total);
-      if (!Number.isFinite(total)) {
-        return;
-      }
+      if (!Number.isFinite(total)) return;
       if (lastDataValue === null || total > lastDataValue) {
         lastDataAt = performance.now();
       }
       lastDataValue = total;
     }
 
-    // Canlı izlemeyi sıfırla: yeni başlatıldığında bir tolerans süresi tanı
-    // (hemen uyarı çıkmasın).
-    function resetDataFlowWatch() {
-      lastDataValue = null;
-      lastDataAt = performance.now();
-      hideNoDataAlert();
-    }
-
     function showNoDataAlert(idleMs) {
       const secs = Math.max(0, Math.round(idleMs / 1000));
       noDataDetailEl.textContent =
         'Dinlenen porta ' + secs + ' sn’dir NetFlow kaydı ulaşmıyor — arka planda kontrol ediliyor…';
-      if (noDataEl.hidden) {
-        noDataEl.hidden = false;
-      }
+      if (noDataEl.hidden) noDataEl.hidden = false;
     }
 
     function hideNoDataAlert() {
-      if (!noDataEl.hidden) {
-        noDataEl.hidden = true;
-      }
+      if (!noDataEl.hidden) noDataEl.hidden = true;
     }
 
-    // Arka planda sürekli çalışır: yalnızca canlı + 1. sayfada anlamlıdır.
+    // Yalnızca canlı + 1. sayfada anlamlıdır.
     function evaluateDataFlow() {
       if (currentMode !== 'live' || currentPage !== 1) {
         hideNoDataAlert();
         return;
       }
       const idle = performance.now() - lastDataAt;
-      if (idle > IDLE_THRESHOLD_MS) {
-        showNoDataAlert(idle);
-      } else {
-        hideNoDataAlert();
-      }
+      if (idle > IDLE_THRESHOLD_MS) showNoDataAlert(idle);
+      else hideNoDataAlert();
     }
 
     function updateIntegrity(state) {
@@ -5168,7 +4670,7 @@ const dashboardHTML = `<!DOCTYPE html>
       const sha = state.last_sha256 || '';
       currentSha = sha;
       if (sha) {
-        sealShaEl.textContent = sha.slice(0, 12) + '…' + sha.slice(-12);
+        sealShaEl.textContent = sha.slice(0, 16) + '…' + sha.slice(-16);
         sealShaEl.title = sha;
         copyShaEl.disabled = false;
       } else {
@@ -5196,12 +4698,7 @@ const dashboardHTML = `<!DOCTYPE html>
       if (!value) return '-';
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleTimeString('tr-TR', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-      });
+      return date.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     }
 
     function formatBytes(bytesValue) {
@@ -5222,8 +4719,7 @@ const dashboardHTML = `<!DOCTYPE html>
         .replaceAll("'", '&#39;');
     }
 
-    // Yaygın (well-known) portlar → servis adı eşlemesi. Yalnızca arayüzde
-    // gösterim amaçlı; log dosyalarına yazılmaz.
+    // Yaygın portlar → servis adı. Yalnızca arayüzde gösterim amaçlı.
     const PORT_SERVICES = {
       20: 'FTP', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP',
       43: 'WHOIS', 53: 'DNS', 67: 'DHCP', 68: 'DHCP', 69: 'TFTP',
@@ -5245,15 +4741,14 @@ const dashboardHTML = `<!DOCTYPE html>
       11211: 'Memcached', 27017: 'MongoDB', 51820: 'WireGuard'
     };
 
-    // Şifreli/güvenli servisler (yeşil rozetle vurgulanır).
+    // Şifreli/güvenli servisler (kilit simgesiyle vurgulanır).
     const SECURE_SERVICES = {
       'SSH': 1, 'HTTPS': 1, 'HTTPS-Alt': 1, 'SMTPS': 1, 'IMAPS': 1,
       'POP3S': 1, 'LDAPS': 1, 'FTPS': 1, 'DoT': 1, 'SIP-TLS': 1,
       'MQTT-TLS': 1, 'OpenVPN': 1, 'WireGuard': 1, 'IPsec': 1, 'IKE': 1
     };
 
-    // Kaynak ve hedef portlardan servisi tespit eder. Sunucu portu genelde
-    // küçük/bilinen olandır; iki port da eşleşiyorsa küçük port numarasını baz alır.
+    // Sunucu portu genelde küçük/bilinen olandır; iki port da eşleşirse küçüğü baz alınır.
     function lookupService(srcPort, dstPort) {
       const s = PORT_SERVICES[srcPort];
       const d = PORT_SERVICES[dstPort];
@@ -5290,34 +4785,28 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function buildRowMarkup(record) {
       const item = parseRecord(record);
-      // Yaygın port eşleşmesi varsa TCP/UDP yerine servis adı gösterilir;
-      // yoksa taşıma protokolü gösterilir. Renk taşıma protokolüne göre kalır.
+      // Bilinen port eşleşirse servis adı, yoksa taşıma protokolü gösterilir;
+      // renk her zaman taşıma protokolüne göredir.
       const protoLabel = item.service || item.proto;
       const protoTitle = item.service
         ? item.proto + ' · Port ' + item.servicePort + ' · ' + item.service
         : item.proto;
-      const lock = (item.service && item.serviceSecure)
-        ? '<svg class="lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'
-        : '';
-      const protoClass = item.protoClass + (item.service ? ' svc' : '');
-      return [
-        '<tr>',
-        '<td class="muted-cell mono">' + escapeHtml(item.time) + '</td>',
-        '<td class="mono cell-ip-src">' + escapeHtml(item.srcIp) + '</td>',
-        '<td class="mono cell-port-src">' + escapeHtml(item.srcPort) + '</td>',
-        '<td class="mono cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>',
-        '<td class="mono cell-port-dst">' + escapeHtml(item.dstPort) + '</td>',
-        '<td class="cell-proto">'
-          + '<span class="proto ' + escapeHtml(protoClass) + '" title="' + escapeHtml(protoTitle) + '">' + lock + escapeHtml(protoLabel) + '</span>'
-          + '</td>',
-        '<td class="muted-cell mono">' + escapeHtml(item.size) + '</td>',
-        '</tr>'
-      ].join('');
+      const lock = (item.service && item.serviceSecure) ? ICON_LOCK : '';
+      return '<tr>'
+        + '<td class="cell-time">' + escapeHtml(item.time) + '</td>'
+        + '<td class="cell-ip-src">' + escapeHtml(item.srcIp) + '</td>'
+        + '<td class="num cell-port">' + escapeHtml(item.srcPort) + '</td>'
+        + '<td class="arrow" aria-hidden="true">→</td>'
+        + '<td class="cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>'
+        + '<td class="num cell-port">' + escapeHtml(item.dstPort) + '</td>'
+        + '<td><span class="proto ' + escapeHtml(item.protoClass) + '" title="' + escapeHtml(protoTitle) + '">' + lock + escapeHtml(protoLabel) + '</span></td>'
+        + '<td class="num cell-size">' + escapeHtml(item.size) + '</td>'
+        + '</tr>';
     }
 
-    const emptyRowsMarkup = '<tr><td colspan="7" class="empty"><div class="empty-title">Kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
+    const emptyRowsMarkup = '<tr class="empty-row"><td colspan="8"><div class="empty-title">kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
 
-    // Statik (geçmiş / canlı olmayan) görünüm: tam yeniden çizim, sunucu sırasıyla.
+    // Statik (geçmiş) görünüm: tam yeniden çizim, sunucu sırasıyla.
     function renderRows(records) {
       liveRowsInit = false;
       lastRowsTotal = null;
@@ -5325,31 +4814,20 @@ const dashboardHTML = `<!DOCTYPE html>
         recordsEl.innerHTML = emptyRowsMarkup;
         return;
       }
-      const rows = new Array(records.length);
-      for (let i = 0; i < records.length; i += 1) {
-        rows[i] = buildRowMarkup(records[i]);
-      }
-      recordsEl.innerHTML = rows.join('');
+      recordsEl.innerHTML = records.map(buildRowMarkup).join('');
     }
 
-    // Giriş animasyonu sınıfını ekler ve bittikten sonra kendi kendine temizler
-    // (sınıfların satırlarda birikmesini önler).
+    // Giriş vurgusunu ekler ve bittikten sonra temizler.
     function markEntered(rowEls) {
-      for (let i = 0; i < rowEls.length; i += 1) {
-        rowEls[i].classList.add('row-enter');
-      }
-      setTimeout(() => {
-        for (let i = 0; i < rowEls.length; i += 1) {
-          rowEls[i].classList.remove('row-enter');
-        }
-      }, 1500);
+      rowEls.forEach((el) => el.classList.add('row-enter'));
+      setTimeout(() => rowEls.forEach((el) => el.classList.remove('row-enter')), 1500);
     }
 
-    // Canlı görünüm: en yeni kayıtlar üstte; yalnızca yeni gelenler animasyonla eklenir.
+    // Canlı görünüm: en yeni kayıtlar üstte; yalnızca yeni gelenler vurguyla eklenir.
     function renderLiveRows(state) {
       const records = state.records || [];
       const total = Number(state.processed_total);
-      const reversed = records.slice().reverse(); // en yeni en üstte
+      const reversed = records.slice().reverse();
 
       if (!reversed.length) {
         recordsEl.innerHTML = emptyRowsMarkup;
@@ -5358,42 +4836,31 @@ const dashboardHTML = `<!DOCTYPE html>
         return;
       }
 
-      // İki yoklama arasında gelen yeni kayıt sayısı (monoton sayaçtan).
       let newCount;
       if (!liveRowsInit || lastRowsTotal === null || !Number.isFinite(total)) {
-        newCount = reversed.length; // ilk yükleme / belirsizlik → tam çizim
+        newCount = reversed.length;
       } else {
         newCount = total - lastRowsTotal;
-        if (newCount < 0) newCount = reversed.length; // sayaç tutarsızsa tam çizim
+        if (newCount < 0) newCount = reversed.length;
       }
       if (newCount > reversed.length) newCount = reversed.length;
 
-      // Taşınacak (yeniden kullanılacak) satırlar için DOM'da yeterli satır yoksa
-      // (limit büyümesi, atlanan yoklama vb.) güvenli tarafta kalıp tam yeniden çizeriz.
-      // Fazla satırlar zaten alttan kırpıldığı için yalnızca "yetersizlik" durumu önemlidir.
+      // Yeniden kullanılacak satır sayısı DOM'da yoksa güvenli tarafta kalıp tam çizeriz.
       const firstInit = !liveRowsInit;
       if (newCount !== reversed.length && recordsEl.childElementCount < reversed.length - newCount) {
         newCount = reversed.length;
       }
 
       if (newCount === 0) {
-        // Yeni kayıt yok → DOM'a dokunma (titreme olmaz).
+        // Yeni kayıt yok → DOM'a dokunma.
       } else if (newCount === reversed.length) {
-        const rows = new Array(reversed.length);
-        for (let i = 0; i < reversed.length; i += 1) {
-          rows[i] = buildRowMarkup(reversed[i]);
-        }
-        recordsEl.innerHTML = rows.join('');
+        recordsEl.innerHTML = reversed.map(buildRowMarkup).join('');
         if (!firstInit) {
-          const animateN = Math.min(recordsEl.childElementCount, 14);
-          markEntered(Array.prototype.slice.call(recordsEl.children, 0, animateN));
+          markEntered(Array.prototype.slice.call(recordsEl.children, 0, Math.min(recordsEl.childElementCount, 14)));
         }
       } else {
-        // Yalnızca yeni gelenleri en üste ekle, eskileri alttan kırp.
         let html = '';
-        for (let i = 0; i < newCount; i += 1) {
-          html += buildRowMarkup(reversed[i]);
-        }
+        for (let i = 0; i < newCount; i += 1) html += buildRowMarkup(reversed[i]);
         recordsEl.insertAdjacentHTML('afterbegin', html);
         const added = Array.prototype.slice.call(recordsEl.children, 0, newCount);
         while (recordsEl.childElementCount > reversed.length) {
@@ -5403,17 +4870,12 @@ const dashboardHTML = `<!DOCTYPE html>
       }
 
       liveRowsInit = true;
-      if (Number.isFinite(total)) {
-        lastRowsTotal = total;
-      }
+      if (Number.isFinite(total)) lastRowsTotal = total;
     }
 
     function setConnectionState(text, mode) {
       connectionEl.textContent = text;
-      connectionEl.className = 'status-badge';
-      if (mode) {
-        connectionEl.classList.add(mode);
-      }
+      connectionEl.className = 'status-badge' + (mode ? ' ' + mode : '');
     }
 
     function renderDateOptions(dates, selectedDate) {
@@ -5422,9 +4884,7 @@ const dashboardHTML = `<!DOCTYPE html>
         const option = document.createElement('option');
         option.value = date;
         option.textContent = date;
-        if (date === selectedDate) {
-          option.selected = true;
-        }
+        if (date === selectedDate) option.selected = true;
         dateSelectEl.appendChild(option);
       });
     }
@@ -5435,9 +4895,7 @@ const dashboardHTML = `<!DOCTYPE html>
         const option = document.createElement('option');
         option.value = hour;
         option.textContent = hour + ':00';
-        if (hour === selectedHour) {
-          option.selected = true;
-        }
+        if (hour === selectedHour) option.selected = true;
         hourSelectEl.appendChild(option);
       });
       hourSelectEl.disabled = !(hours && hours.length);
@@ -5445,13 +4903,12 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function applyMode(mode) {
       currentMode = mode;
-      if (mode === 'historical') {
-        liveToggleEl.classList.remove('live');
-        tableSubtitleEl.textContent = 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
-      } else {
-        liveToggleEl.classList.add('live');
-        tableSubtitleEl.textContent = 'Canlı modda yeni kayıtlar üste eklenir, eskiler aşağı kayar. En yeni 1000 kayıt sayfalı tutulur.';
-      }
+      const live = mode !== 'historical';
+      liveToggleEl.classList.toggle('live', live);
+      liveToggleLabelEl.textContent = live ? 'Canlı' : 'Canlıya dön';
+      tableSubtitleEl.textContent = live
+        ? 'Canlı modda yeni kayıtlar üste eklenir, eskiler aşağı kayar. En yeni 1000 kayıt sayfalı tutulur.'
+        : 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
     }
 
     const THREAT_RULE_LABELS = {
@@ -5460,61 +4917,41 @@ const dashboardHTML = `<!DOCTYPE html>
       hostsweep: 'Host tarama'
     };
     let lastThreatSig = null;
-    // En son alınan tehdit listesi; engel durumu değiştiğinde satırları yeniden çizmek için saklanır.
     let lastThreatList = null;
-    // Şu an manuel engelli olan IP'ler; tehdit satırındaki "Banla" butonunun durumunu
-    // belirlemek için loadBlocklist() ile güncellenir.
+    // Şu an manuel engelli IP'ler; tehdit satırındaki "Banla" butonunun durumunu belirler.
     const bannedIps = new Set();
-    // Engellenen kaynaklar listesinin son imzası; yoklamada gereksiz DOM yenilemesini önler.
     let lastBlocklistSig = null;
 
-    // Güvenlik panelini ve ribbon tehdit rozetini gelen uyarı listesine göre günceller.
     function updateThreats(threats) {
       const list = Array.isArray(threats) ? threats : [];
       lastThreatList = list;
       const count = list.length;
+      const active = count > 0;
 
-      if (threatBadgeEl) {
-        threatBadgeEl.textContent = String(count);
-        threatBadgeEl.classList.toggle('active', count > 0);
-      }
-      if (threatToggleEl) {
-        threatToggleEl.classList.toggle('active', count > 0);
-        threatToggleEl.title = count > 0
-          ? (count + ' aktif güvenlik uyarısı — görüntülemek için tıkla')
-          : 'Güvenlik uyarılarını göster';
-      }
-      if (threatToggleCountEl) {
-        threatToggleCountEl.textContent = String(count);
-        threatToggleCountEl.hidden = count === 0;
-      }
-      threatCardEl.classList.toggle('has-threats', count > 0);
-      if (threatCountEl) {
-        threatCountEl.textContent = String(count);
-        threatCountEl.hidden = count === 0;
-      }
-      if (threatStatusEl) {
-        threatStatusEl.textContent = count > 0 ? (count + ' aktif uyarı') : 'Şüpheli aktivite yok';
-        threatStatusEl.className = 'threat-status ' + (count > 0 ? 'alert' : 'ok');
-      }
+      threatBadgeEl.textContent = String(count);
+      threatBadgeEl.classList.toggle('active', active);
+      threatToggleEl.classList.toggle('active', active);
+      threatToggleEl.title = active
+        ? (count + ' aktif güvenlik uyarısı — görüntülemek için tıkla')
+        : 'Güvenlik uyarılarını göster';
+      threatToggleCountEl.textContent = String(count);
+      threatToggleCountEl.hidden = !active;
+      threatCardEl.classList.toggle('has-threats', active);
+      threatCountEl.textContent = String(count);
+      threatCountEl.hidden = !active;
+      threatStatusEl.textContent = active ? (count + ' aktif uyarı') : 'Şüpheli aktivite yok';
+      threatStatusEl.className = 'threat-status ' + (active ? 'alert' : 'ok');
 
-      // Gereksiz DOM yenilemesini önlemek için imza karşılaştırması. Banlı IP kümesi
-      // de imzaya katılır ki bir IP engellendiğinde buton durumu tazelenirken güncellensin.
+      // Banlı IP kümesi de imzaya katılır ki buton durumu tazelensin.
       const sig = JSON.stringify(list) + '|' + Array.from(bannedIps).sort().join(',');
-      if (sig === lastThreatSig) {
-        return;
-      }
+      if (sig === lastThreatSig) return;
       lastThreatSig = sig;
 
-      Array.prototype.slice.call(threatListEl.querySelectorAll('.threat-item')).forEach(function(n){ n.remove(); });
+      threatListEl.querySelectorAll('.threat-item').forEach((n) => n.remove());
+      threatEmptyEl.hidden = active;
+      if (!active) return;
 
-      if (count === 0) {
-        if (threatEmptyEl) threatEmptyEl.hidden = false;
-        return;
-      }
-      if (threatEmptyEl) threatEmptyEl.hidden = true;
-
-      const rows = list.map(function(a){
+      const rows = list.map((a) => {
         const sev = a.severity === 'high' ? 'high' : 'medium';
         const sevLabel = sev === 'high' ? 'Yüksek' : 'Orta';
         const rule = THREAT_RULE_LABELS[a.rule] || 'Şüpheli';
@@ -5522,19 +4959,15 @@ const dashboardHTML = `<!DOCTYPE html>
         const detail = a.detail ? escapeHtml(a.detail) : (rule + ' tespit edildi.');
         const ip = a.src_ip ? String(a.src_ip) : '';
         const copyIp = ip
-          ? '<button type="button" class="threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala">'
-            + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>'
-            + '<span class="threat-copy-label">' + escapeHtml(ip) + '</span>'
-            + '</button>'
+          ? '<button type="button" class="chip-btn threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala">'
+            + ICON_COPY + '<span class="threat-copy-label">' + escapeHtml(ip) + '</span></button>'
           : '';
         const banned = ip && bannedIps.has(ip);
         const banBtn = ip
-          ? '<button type="button" class="threat-ban' + (banned ? ' banned' : '') + '" data-ip="' + escapeHtml(ip) + '"'
+          ? '<button type="button" class="chip-btn threat-ban' + (banned ? ' banned' : '') + '" data-ip="' + escapeHtml(ip) + '"'
             + ' data-reason="' + escapeHtml(a.title || rule) + '"' + (banned ? ' disabled' : '')
             + ' title="Bu IP\'yi kalıcı olarak engelle">'
-            + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>'
-            + '<span>' + (banned ? 'Engellendi' : 'Banla') + '</span>'
-            + '</button>'
+            + ICON_BAN + '<span>' + (banned ? 'Engellendi' : 'Banla') + '</span></button>'
           : '';
         return '<div class="threat-item ' + sev + '">'
           + '<span class="threat-sev">' + sevLabel + '</span>'
@@ -5553,50 +4986,41 @@ const dashboardHTML = `<!DOCTYPE html>
     let pendingState = null;
 
     function commitRender(state) {
-      if ((state.mode || 'live') === 'live' && currentMode === 'historical') {
-        return;
-      }
-      applyMode(state.mode || 'live');
+      const mode = state.mode || 'live';
+      if (mode === 'live' && currentMode === 'historical') return;
+      applyMode(mode);
       currentPage = state.page || 1;
+      const totalPages = state.total_pages || 1;
       renderDateOptions(state.available_dates || [], state.selected_date || '');
       renderHourOptions(state.available_hours || [], state.selected_hour || '');
       limitSelectEl.value = String(state.limit || 50);
       updatedAtEl.textContent = formatTime(state.updated_at || '');
-      pageInfoEl.textContent = String(state.page || 1) + ' / ' + String(state.total_pages || 1);
+      pageInfoEl.textContent = currentPage + ' / ' + totalPages;
       fileSizeHourlyEl.textContent = state.file_size || '-';
       fileSizeDailyEl.textContent = state.file_size_daily || '-';
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
       updateIntegrity(state);
-      if (Array.isArray(state.threats)) {
-        updateThreats(state.threats);
-      }
-      const isLive = (state.mode || 'live') === 'live';
+      if (Array.isArray(state.threats)) updateThreats(state.threats);
+      const isLive = mode === 'live';
       if (isLive) {
         updateThroughput(state);
         noteDataActivity(state);
       } else {
         resetThroughput();
       }
-      prevPageEl.disabled = (state.page || 1) <= 1;
-      nextPageEl.disabled = (state.page || 1) >= (state.total_pages || 1);
-      if (isLive && (state.page || 1) === 1) {
-        renderLiveRows(state);
-      } else {
-        renderRows(state.records || []);
-      }
+      prevPageEl.disabled = currentPage <= 1;
+      nextPageEl.disabled = currentPage >= totalPages;
+      if (isLive && currentPage === 1) renderLiveRows(state);
+      else renderRows(state.records || []);
       evaluateDataFlow();
     }
 
     function render(state) {
       pendingState = state;
-      if (renderFrame !== null) {
-        return;
-      }
+      if (renderFrame !== null) return;
       renderFrame = requestAnimationFrame(() => {
-        if (pendingState) {
-          commitRender(pendingState);
-        }
+        if (pendingState) commitRender(pendingState);
         pendingState = null;
         renderFrame = null;
       });
@@ -5615,20 +5039,13 @@ const dashboardHTML = `<!DOCTYPE html>
 
     async function fetchState() {
       const params = new URLSearchParams();
-      if (dateSelectEl.value) {
-        params.set('date', dateSelectEl.value);
-      }
-      if (hourSelectEl.value) {
-        params.set('hour', hourSelectEl.value);
-      }
+      if (dateSelectEl.value) params.set('date', dateSelectEl.value);
+      if (hourSelectEl.value) params.set('hour', hourSelectEl.value);
       params.set('limit', limitSelectEl.value || '50');
       params.set('page', String(currentPage || 1));
 
-      const query = params.toString();
-      const response = await fetch('/api/state' + (query ? ('?' + query) : ''), { cache: 'no-store' });
-      if (!response.ok) {
-        throw new Error('Log durumu alınamadı');
-      }
+      const response = await fetch('/api/state?' + params.toString(), { cache: 'no-store' });
+      if (!response.ok) throw new Error('Log durumu alınamadı');
       const state = await response.json();
       render(state);
       return state;
@@ -5651,7 +5068,7 @@ const dashboardHTML = `<!DOCTYPE html>
         startLiveStream();
       } else {
         stopLiveStream();
-        setConnectionState('Canlı akış yalnızca 1. sayfada aktif', null);
+        setConnectionState('Canlı akış yalnızca 1. sayfada', null);
       }
     }
 
@@ -5666,13 +5083,11 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
-    // Canlı akış: SSE ile sunucudan anlık itme. Yeni NetFlow kaydı geldiği anda
-    // tablo güncellenir (sabit aralıklı yoklama yerine olay tabanlı).
+    // Canlı akış: SSE ile sunucudan anlık itme.
     function startLiveStream() {
       stopLiveStream();
       setConnectionState('Canlı', 'live');
 
-      // SSE desteklenmiyorsa saniyelik yoklamaya düş.
       if (typeof window.EventSource === 'undefined') {
         startLivePolling();
         return;
@@ -5690,21 +5105,13 @@ const dashboardHTML = `<!DOCTYPE html>
           return;
         }
         setConnectionState('Canlı', 'live');
-        // Güvenlik paneli/tehdit rozeti, log tablosunun sayfasından ve modundan
-        // bağımsız olarak her zaman güncellenir; aksi halde 2. sayfaya geçince
-        // veya geçmiş moda bakarken güvenlik izleme donuyordu.
-        if (Array.isArray(state.threats)) {
-          updateThreats(state.threats);
-        }
-        if (currentMode !== 'live' || currentPage !== 1) {
-          return;
-        }
+        // Tehdit rozeti, tablonun sayfa/modundan bağımsız olarak her zaman güncellenir.
+        if (Array.isArray(state.threats)) updateThreats(state.threats);
+        if (currentMode !== 'live' || currentPage !== 1) return;
         state.mode = 'live';
         render(state);
       });
 
-      // EventSource bağlantı koptuğunda kendiliğinden yeniden bağlanır; bu sırada
-      // durumu kullanıcıya bildiririz.
       eventSource.onerror = () => {
         setConnectionState('Yeniden bağlanıyor', 'retry');
       };
@@ -5715,9 +5122,7 @@ const dashboardHTML = `<!DOCTYPE html>
       stopLiveStream();
       setConnectionState('Canlı', 'live');
       livePollTimer = setInterval(() => {
-        if (currentMode !== 'live' || currentPage !== 1) {
-          return;
-        }
+        if (currentMode !== 'live' || currentPage !== 1) return;
         void pollLiveState();
       }, 1000);
     }
@@ -5740,9 +5145,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     hourSelectEl.addEventListener('change', async () => {
       currentPage = 1;
-      if (!dateSelectEl.value || !hourSelectEl.value) {
-        return;
-      }
+      if (!dateSelectEl.value || !hourSelectEl.value) return;
       await refreshHistorical();
     });
 
@@ -5771,15 +5174,12 @@ const dashboardHTML = `<!DOCTYPE html>
       startLiveStream();
     });
 
-    // Güvenlik uyarıları modalı: üst kontroldeki buton (ve ribbon rozeti) ile
-    // canlı akış ile güvenlik ekranı arasında geçiş sağlar.
+    // ── Güvenlik çekmecesi ─────────────────────────────────────────────
     let threatLastFocus = null;
     let securityPollTimer = null;
 
-    // refreshSecurityPanel, modal açıkken güvenlik panelini canlı tutar: güncel
-    // tehdit uyarılarını (/api/threats) ve engellenen IP listesini (/api/blocklist)
-    // tazeler. SSE'den bağımsız çalışır; böylece geçmiş modda veya tablo sayfası
-    // 1'den farklıyken bile panel güncel kalır.
+    // Çekmece açıkken tehditleri (/api/threats) ve kara listeyi (/api/blocklist)
+    // SSE'den bağımsız olarak tazeler; geçmiş modda veya 2+. sayfada da güncel kalır.
     async function refreshSecurityPanel() {
       try {
         const res = await fetch('/api/threats', { cache: 'no-store' });
@@ -5793,8 +5193,6 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function startSecurityPoll() {
       if (securityPollTimer !== null) return;
-      // 4 sn: saldırı sırasında SSE zaten anlık günceller; bu yoklama SSE'nin
-      // atladığı durumları (sayfa/mod) ve kara liste değişimlerini garanti eder.
       securityPollTimer = setInterval(refreshSecurityPanel, 4000);
     }
 
@@ -5806,12 +5204,12 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     function openThreatModal() {
-      if (!threatModalEl || !threatModalEl.hidden) return;
+      if (!threatModalEl.hidden) return;
       threatLastFocus = document.activeElement;
       threatModalEl.hidden = false;
-      if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'true');
+      document.body.style.overflow = 'hidden';
+      threatToggleEl.setAttribute('aria-expanded', 'true');
       loadWhitelist();
-      loadBlocklist();
       refreshSecurityPanel();
       startSecurityPoll();
       const closeBtn = threatModalEl.querySelector('.threat-close');
@@ -5819,82 +5217,88 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     function closeThreatModal() {
-      if (!threatModalEl || threatModalEl.hidden) return;
+      if (threatModalEl.hidden) return;
       threatModalEl.hidden = true;
+      document.body.style.overflow = '';
       stopSecurityPoll();
-      if (threatToggleEl) threatToggleEl.setAttribute('aria-expanded', 'false');
-      if (threatLastFocus && typeof threatLastFocus.focus === 'function') {
-        threatLastFocus.focus();
-      }
+      threatToggleEl.setAttribute('aria-expanded', 'false');
+      if (threatLastFocus && typeof threatLastFocus.focus === 'function') threatLastFocus.focus();
       threatLastFocus = null;
     }
 
-    function toggleThreatModal() {
-      if (threatModalEl && threatModalEl.hidden) {
-        openThreatModal();
-      } else {
-        closeThreatModal();
-      }
-    }
+    threatToggleEl.addEventListener('click', () => {
+      if (threatModalEl.hidden) openThreatModal();
+      else closeThreatModal();
+    });
 
-    if (threatToggleEl) {
-      threatToggleEl.addEventListener('click', toggleThreatModal);
-    }
-    if (threatBadgeEl) {
-      threatBadgeEl.style.cursor = 'pointer';
-      threatBadgeEl.setAttribute('role', 'button');
-      threatBadgeEl.setAttribute('tabindex', '0');
-      threatBadgeEl.setAttribute('title', 'Güvenlik uyarılarını göster');
-      threatBadgeEl.addEventListener('click', openThreatModal);
-      threatBadgeEl.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          openThreatModal();
-        }
-      });
-    }
-    if (threatModalEl) {
-      threatModalEl.addEventListener('click', (event) => {
-        if (event.target.closest('[data-threat-close]')) {
-          closeThreatModal();
-        }
-      });
-    }
-    document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') {
-        closeThreatModal();
+    threatBadgeEl.setAttribute('role', 'button');
+    threatBadgeEl.setAttribute('tabindex', '0');
+    threatBadgeEl.setAttribute('title', 'Güvenlik uyarılarını göster');
+    threatBadgeEl.addEventListener('click', openThreatModal);
+    threatBadgeEl.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openThreatModal();
       }
     });
 
-    // Whitelist yönetimi: görmezden gelinen kaynak IP/CIDR girişlerini listeler,
-    // ekler ve siler. Değişiklikler /api/whitelist üzerinden config.json'a yazılır.
-    function showWhitelistError(msg) {
-      if (!whitelistErrorEl) return;
-      if (msg) {
-        whitelistErrorEl.textContent = msg;
-        whitelistErrorEl.hidden = false;
-      } else {
-        whitelistErrorEl.textContent = '';
-        whitelistErrorEl.hidden = true;
+    threatModalEl.addEventListener('click', (event) => {
+      if (event.target.closest('[data-threat-close]')) closeThreatModal();
+    });
+
+    // Esc ile kapatma ve Tab odağını çekmece içinde tutma.
+    document.addEventListener('keydown', (event) => {
+      if (threatModalEl.hidden) return;
+      if (event.key === 'Escape') {
+        closeThreatModal();
+        return;
       }
+      if (event.key !== 'Tab') return;
+      const focusables = Array.prototype.filter.call(
+        threatCardEl.querySelectorAll('button, input, [tabindex]:not([tabindex="-1"])'),
+        (el) => !el.disabled && el.offsetParent !== null
+      );
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+
+    function showFormError(el, msg) {
+      el.textContent = msg || '';
+      el.hidden = !msg;
     }
 
+    function chipMarkup(kind, value, extra, removeAttr, removeLabel) {
+      return '<span class="entry-chip ' + kind + '">'
+        + '<span class="entry-ip">' + escapeHtml(value) + '</span>' + extra
+        + '<button type="button" class="entry-remove" ' + removeAttr + '="' + escapeHtml(value) + '" aria-label="' + escapeHtml(removeLabel) + '">' + ICON_X + '</button>'
+        + '</span>';
+    }
+
+    // Whitelist: görmezden gelinen kaynak IP/CIDR girişleri (/api/whitelist → config.json).
     function renderWhitelist(entries) {
-      if (!whitelistListEl) return;
       const list = Array.isArray(entries) ? entries : [];
-      Array.prototype.slice.call(whitelistListEl.querySelectorAll('.whitelist-chip')).forEach(function(n){ n.remove(); });
-      if (whitelistEmptyEl) whitelistEmptyEl.hidden = list.length > 0;
-      if (list.length === 0) return;
-      const html = list.map(function(entry){
-        const cidr = entry.indexOf('/') >= 0 ? ' cidr' : '';
-        return '<span class="whitelist-chip' + cidr + '">'
-          + '<span>' + escapeHtml(entry) + '</span>'
-          + '<button type="button" class="whitelist-remove" data-entry="' + escapeHtml(entry) + '" aria-label="' + escapeHtml(entry) + ' kaydını kaldır">'
-          +   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
-          + '</button>'
-          + '</span>';
-      }).join('');
+      whitelistListEl.querySelectorAll('.entry-chip').forEach((n) => n.remove());
+      whitelistEmptyEl.hidden = list.length > 0;
+      if (!list.length) return;
+      const html = list.map((entry) => chipMarkup(
+        'allowed' + (entry.indexOf('/') >= 0 ? ' cidr' : ''),
+        entry, '', 'data-entry', entry + ' kaydını kaldır'
+      )).join('');
       whitelistListEl.insertAdjacentHTML('beforeend', html);
+    }
+
+    async function jsonRequest(url, options) {
+      const response = await fetch(url, options);
+      const data = await response.json().catch(() => ({}));
+      return { ok: response.ok, data };
     }
 
     async function loadWhitelist() {
@@ -5904,118 +5308,88 @@ const dashboardHTML = `<!DOCTYPE html>
         const data = await response.json();
         renderWhitelist(data.entries);
       } catch (error) {
-        showWhitelistError('Whitelist yüklenemedi.');
+        showFormError(whitelistErrorEl, 'Whitelist yüklenemedi.');
       }
     }
 
     async function submitWhitelist(entry) {
-      showWhitelistError('');
+      showFormError(whitelistErrorEl, '');
       try {
-        const response = await fetch('/api/whitelist', {
+        const res = await jsonRequest('/api/whitelist', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ entry: entry }),
+          body: JSON.stringify({ entry: entry })
         });
-        const data = await response.json().catch(function(){ return {}; });
-        if (!response.ok) {
-          showWhitelistError(data.error || 'Giriş eklenemedi.');
+        if (!res.ok) {
+          showFormError(whitelistErrorEl, res.data.error || 'Giriş eklenemedi.');
           return false;
         }
-        renderWhitelist(data.entries);
+        renderWhitelist(res.data.entries);
         return true;
       } catch (error) {
-        showWhitelistError('Giriş eklenemedi.');
+        showFormError(whitelistErrorEl, 'Giriş eklenemedi.');
         return false;
       }
     }
 
     async function removeWhitelist(entry) {
-      showWhitelistError('');
+      showFormError(whitelistErrorEl, '');
       try {
-        const response = await fetch('/api/whitelist?entry=' + encodeURIComponent(entry), { method: 'DELETE' });
-        const data = await response.json().catch(function(){ return {}; });
-        if (!response.ok) {
-          showWhitelistError(data.error || 'Giriş kaldırılamadı.');
+        const res = await jsonRequest('/api/whitelist?entry=' + encodeURIComponent(entry), { method: 'DELETE' });
+        if (!res.ok) {
+          showFormError(whitelistErrorEl, res.data.error || 'Giriş kaldırılamadı.');
           return;
         }
-        renderWhitelist(data.entries);
+        renderWhitelist(res.data.entries);
       } catch (error) {
-        showWhitelistError('Giriş kaldırılamadı.');
+        showFormError(whitelistErrorEl, 'Giriş kaldırılamadı.');
       }
     }
 
-    if (whitelistFormEl) {
-      whitelistFormEl.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const value = (whitelistInputEl.value || '').trim();
-        if (!value) return;
-        const ok = await submitWhitelist(value);
-        if (ok) {
-          whitelistInputEl.value = '';
-          whitelistInputEl.focus();
-        }
-      });
-    }
-    if (whitelistListEl) {
-      whitelistListEl.addEventListener('click', (event) => {
-        const btn = event.target.closest('.whitelist-remove');
-        if (btn) removeWhitelist(btn.getAttribute('data-entry'));
-      });
-    }
-
-    // Manuel kara liste yönetimi: engellenen IP'leri listeler, ekler ve kaldırır.
-    // Değişiklikler /api/blocklist üzerinden blocklist.json'a yazılır (config.json'a değil).
-    function showBlocklistError(msg) {
-      if (!blocklistErrorEl) return;
-      if (msg) {
-        blocklistErrorEl.textContent = msg;
-        blocklistErrorEl.hidden = false;
-      } else {
-        blocklistErrorEl.textContent = '';
-        blocklistErrorEl.hidden = true;
+    whitelistFormEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = (whitelistInputEl.value || '').trim();
+      if (!value) return;
+      if (await submitWhitelist(value)) {
+        whitelistInputEl.value = '';
+        whitelistInputEl.focus();
       }
-    }
+    });
 
-    // syncBannedIps, verilen kayıt listesinden bannedIps kümesini yeniden kurar; tehdit
-    // satırındaki "Banla" butonlarının güncel duruma göre çizilmesi için lastThreatSig'i
-    // sıfırlayıp son tehdit listesini yeniden render eder.
+    whitelistListEl.addEventListener('click', (event) => {
+      const btn = event.target.closest('.entry-remove');
+      if (btn) removeWhitelist(btn.getAttribute('data-entry'));
+    });
+
+    // Manuel kara liste (/api/blocklist → blocklist.json; config.json'a dokunulmaz).
+    // Banlı küme değiştiyse tehdit satırları yeniden çizilir.
     function syncBannedIps(entries) {
       const next = new Set();
-      (Array.isArray(entries) ? entries : []).forEach(function(e){
+      (Array.isArray(entries) ? entries : []).forEach((e) => {
         if (e && e.ip) next.add(String(e.ip));
       });
-      // Yalnızca banlı küme gerçekten değiştiyse tehdit satırlarını yeniden çiz;
-      // aksi halde 4 sn'lik yoklama her seferinde gereksiz yeniden çizim yapardı.
       let changed = next.size !== bannedIps.size;
-      if (!changed) {
-        next.forEach(function(ip){ if (!bannedIps.has(ip)) changed = true; });
-      }
+      if (!changed) next.forEach((ip) => { if (!bannedIps.has(ip)) changed = true; });
       if (!changed) return;
       bannedIps.clear();
-      next.forEach(function(ip){ bannedIps.add(ip); });
+      next.forEach((ip) => bannedIps.add(ip));
       lastThreatSig = null;
       if (lastThreatList) updateThreats(lastThreatList);
     }
 
     function renderBlocklist(entries) {
-      if (!blocklistListEl) return;
-      const list = (Array.isArray(entries) ? entries : []).filter(function(e){ return e && e.manual; });
-      // İmza değişmediyse (yoklama sırasında sık olur) DOM'a dokunma → titreme olmaz.
-      const sig = JSON.stringify(list.map(function(e){ return [e.ip, e.rule]; }));
+      const list = (Array.isArray(entries) ? entries : []).filter((e) => e && e.manual);
+      // İmza değişmediyse DOM'a dokunma → yoklamada titreme olmaz.
+      const sig = JSON.stringify(list.map((e) => [e.ip, e.rule]));
       if (sig === lastBlocklistSig) return;
       lastBlocklistSig = sig;
-      Array.prototype.slice.call(blocklistListEl.querySelectorAll('.blocklist-chip')).forEach(function(n){ n.remove(); });
-      if (blocklistEmptyEl) blocklistEmptyEl.hidden = list.length > 0;
-      if (list.length === 0) return;
-      const html = list.map(function(e){
+      blocklistListEl.querySelectorAll('.entry-chip').forEach((n) => n.remove());
+      blocklistEmptyEl.hidden = list.length > 0;
+      if (!list.length) return;
+      const html = list.map((e) => {
         const ip = String(e.ip);
-        const rule = e.rule ? '<span class="blocklist-chip-rule">' + escapeHtml(String(e.rule)) + '</span>' : '';
-        return '<span class="blocklist-chip">'
-          + '<span>' + escapeHtml(ip) + '</span>' + rule
-          + '<button type="button" class="blocklist-remove" data-ip="' + escapeHtml(ip) + '" aria-label="' + escapeHtml(ip) + ' engelini kaldır">'
-          +   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
-          + '</button>'
-          + '</span>';
+        const rule = e.rule ? '<span class="entry-rule" title="' + escapeHtml(String(e.rule)) + '">' + escapeHtml(String(e.rule)) + '</span>' : '';
+        return chipMarkup('blocked', ip, rule, 'data-ip', ip + ' engelini kaldır');
       }).join('');
       blocklistListEl.insertAdjacentHTML('beforeend', html);
     }
@@ -6028,71 +5402,63 @@ const dashboardHTML = `<!DOCTYPE html>
         syncBannedIps(data.entries);
         renderBlocklist(data.entries);
       } catch (error) {
-        showBlocklistError('Engel listesi yüklenemedi.');
+        showFormError(blocklistErrorEl, 'Engel listesi yüklenemedi.');
       }
     }
 
     async function submitBlock(ip, reason) {
-      showBlocklistError('');
+      showFormError(blocklistErrorEl, '');
       try {
-        const response = await fetch('/api/blocklist', {
+        const res = await jsonRequest('/api/blocklist', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ip: ip, reason: reason || '' }),
+          body: JSON.stringify({ ip: ip, reason: reason || '' })
         });
-        const data = await response.json().catch(function(){ return {}; });
-        if (!response.ok) {
-          showBlocklistError(data.error || 'IP engellenemedi.');
+        if (!res.ok) {
+          showFormError(blocklistErrorEl, res.data.error || 'IP engellenemedi.');
           return false;
         }
-        syncBannedIps(data.entries);
-        renderBlocklist(data.entries);
+        syncBannedIps(res.data.entries);
+        renderBlocklist(res.data.entries);
         return true;
       } catch (error) {
-        showBlocklistError('IP engellenemedi.');
+        showFormError(blocklistErrorEl, 'IP engellenemedi.');
         return false;
       }
     }
 
     async function removeBlock(ip) {
-      showBlocklistError('');
+      showFormError(blocklistErrorEl, '');
       try {
-        const response = await fetch('/api/blocklist?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
-        const data = await response.json().catch(function(){ return {}; });
-        if (!response.ok) {
-          showBlocklistError(data.error || 'Engel kaldırılamadı.');
+        const res = await jsonRequest('/api/blocklist?ip=' + encodeURIComponent(ip), { method: 'DELETE' });
+        if (!res.ok) {
+          showFormError(blocklistErrorEl, res.data.error || 'Engel kaldırılamadı.');
           return;
         }
-        syncBannedIps(data.entries);
-        renderBlocklist(data.entries);
+        syncBannedIps(res.data.entries);
+        renderBlocklist(res.data.entries);
       } catch (error) {
-        showBlocklistError('Engel kaldırılamadı.');
+        showFormError(blocklistErrorEl, 'Engel kaldırılamadı.');
       }
     }
 
-    if (blocklistFormEl) {
-      blocklistFormEl.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const value = (blocklistInputEl.value || '').trim();
-        if (!value) return;
-        const ok = await submitBlock(value, 'Panelden elle engellendi');
-        if (ok) {
-          blocklistInputEl.value = '';
-          blocklistInputEl.focus();
-        }
-      });
-    }
-    if (blocklistListEl) {
-      blocklistListEl.addEventListener('click', (event) => {
-        const btn = event.target.closest('.blocklist-remove');
-        if (btn) removeBlock(btn.getAttribute('data-ip'));
-      });
-    }
+    blocklistFormEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const value = (blocklistInputEl.value || '').trim();
+      if (!value) return;
+      if (await submitBlock(value, 'Panelden elle engellendi')) {
+        blocklistInputEl.value = '';
+        blocklistInputEl.focus();
+      }
+    });
+
+    blocklistListEl.addEventListener('click', (event) => {
+      const btn = event.target.closest('.entry-remove');
+      if (btn) removeBlock(btn.getAttribute('data-ip'));
+    });
 
     prevPageEl.addEventListener('click', async () => {
-      if (currentPage <= 1) {
-        return;
-      }
+      if (currentPage <= 1) return;
       await changePage(currentPage - 1);
     });
 
@@ -6115,50 +5481,41 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
+    function flashCopied(el) {
+      el.classList.add('copied');
+      setTimeout(() => el.classList.remove('copied'), 1200);
+    }
+
     copyShaEl.addEventListener('click', async () => {
-      if (!currentSha) {
-        return;
-      }
+      if (!currentSha) return;
       await copyToClipboard(currentSha);
-      copyShaEl.classList.add('copied');
-      setTimeout(() => copyShaEl.classList.remove('copied'), 1200);
+      flashCopied(copyShaEl);
     });
 
-    // Güvenlik uyarılarındaki "IP kopyala" ve "Banla" butonları (dinamik içerik → event delegation).
+    // Tehdit satırlarındaki "IP kopyala" ve "Banla" butonları (event delegation).
     threatListEl.addEventListener('click', async (event) => {
       const banBtn = event.target.closest('.threat-ban');
       if (banBtn) {
         const ip = banBtn.getAttribute('data-ip');
-        if (!ip || banBtn.classList.contains('banned') || banBtn.disabled) {
-          return;
-        }
+        if (!ip || banBtn.classList.contains('banned') || banBtn.disabled) return;
         banBtn.disabled = true;
         const ok = await submitBlock(ip, banBtn.getAttribute('data-reason') || '');
-        if (!ok) {
-          banBtn.disabled = false;
-        }
+        if (!ok) banBtn.disabled = false;
         return;
       }
       const btn = event.target.closest('.threat-copy-ip');
-      if (!btn) {
-        return;
-      }
+      if (!btn) return;
       const ip = btn.getAttribute('data-ip');
-      if (!ip) {
-        return;
-      }
+      if (!ip) return;
       await copyToClipboard(ip);
-      btn.classList.add('copied');
-      setTimeout(() => btn.classList.remove('copied'), 1200);
+      flashCopied(btn);
     });
 
     drawRateChart();
     startRateSampler();
 
     fetchState().then((state) => {
-      if ((state.mode || 'live') === 'live') {
-        startLiveStream();
-      }
+      if ((state.mode || 'live') === 'live') startLiveStream();
     }).catch((error) => {
       setConnectionState(error.message, 'error');
     });
