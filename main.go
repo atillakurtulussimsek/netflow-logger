@@ -111,6 +111,7 @@ type App struct {
 	analyzer  *ThreatAnalyzer
 	whitelist *Whitelist
 	blocklist *Blocklist
+	geo       *GeoResolver
 }
 
 type FlowRecord struct {
@@ -249,6 +250,7 @@ func main() {
 		analyzer:  analyzer,
 		whitelist: whitelist,
 		blocklist: blocklist,
+		geo:       NewGeoResolver(),
 		logger: &HourlyLogger{
 			cfg:        cfg,
 			httpClient: &http.Client{Timeout: 30 * time.Second},
@@ -1744,6 +1746,7 @@ func (a *App) dashboardRouter() http.Handler {
 	mux.Handle("/api/whitelist", a.basicAuth(http.HandlerFunc(a.handleWhitelist)))
 	mux.Handle("/api/blocklist", a.basicAuth(http.HandlerFunc(a.handleBlocklistAPI)))
 	mux.Handle("/api/threats", a.basicAuth(http.HandlerFunc(a.handleThreats)))
+	mux.Handle("/api/ip", a.basicAuth(http.HandlerFunc(a.handleIPInfo)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
 	// Düz metin kara liste: OPNsense alias URL table için. Basic auth yerine
 	// token (ve opsiyonel IP kısıtı) ile korunur; firewall'lar Basic auth göndermez.
@@ -1885,6 +1888,397 @@ func (a *App) handleThreats(w http.ResponseWriter, _ *http.Request) {
 		threats = []ThreatAlert{}
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"threats": threats})
+}
+
+// IP ayrıntı modalı ayarları.
+const (
+	// geoCacheTTL, ip-api.com yanıtlarının bellekte tutulma süresidir.
+	geoCacheTTL = 24 * time.Hour
+	// geoRateLimit, ip-api.com ücretsiz katmanının dakikalık istek sınırıdır (45);
+	// güvenlik payı için biraz altında tutulur.
+	geoRateLimit = 40
+	// ipInfoTopN, trafik özetinde listelenen en çok konuşulan eş/port sayısıdır.
+	ipInfoTopN = 5
+)
+
+// IPGeo, ip-api.com'dan dönen konum ve ağ sahibi bilgisidir.
+type IPGeo struct {
+	Country     string `json:"country"`
+	CountryCode string `json:"country_code"`
+	Region      string `json:"region"`
+	City        string `json:"city"`
+	ISP         string `json:"isp"`
+	Org         string `json:"org"`
+	AS          string `json:"as"`
+	Proxy       bool   `json:"proxy"`
+	Hosting     bool   `json:"hosting"`
+	Mobile      bool   `json:"mobile"`
+}
+
+type geoCacheEntry struct {
+	geo     *IPGeo
+	errMsg  string
+	expires time.Time
+}
+
+// GeoResolver, genel IP adreslerinin konum/ASN bilgisini ip-api.com üzerinden
+// sorgular. Yanıtlar önbelleğe alınır ve dakikalık istek sınırı aşılmaz.
+type GeoResolver struct {
+	baseURL string
+	client  *http.Client
+
+	mu       sync.Mutex
+	cache    map[string]geoCacheEntry
+	requests []time.Time
+}
+
+func NewGeoResolver() *GeoResolver {
+	return &GeoResolver{
+		baseURL: "http://ip-api.com/json/",
+		client:  &http.Client{Timeout: 4 * time.Second},
+		cache:   make(map[string]geoCacheEntry),
+	}
+}
+
+// Lookup, IP'nin konum bilgisini döndürür; hata durumunda kullanıcıya
+// gösterilecek kısa bir açıklama döner.
+func (g *GeoResolver) Lookup(ctx context.Context, ip string) (*IPGeo, string) {
+	if g == nil {
+		return nil, "konum servisi devre dışı"
+	}
+	now := time.Now()
+	g.mu.Lock()
+	if e, ok := g.cache[ip]; ok && now.Before(e.expires) {
+		g.mu.Unlock()
+		return e.geo, e.errMsg
+	}
+	cutoff := now.Add(-time.Minute)
+	kept := g.requests[:0]
+	for _, t := range g.requests {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	g.requests = kept
+	if len(g.requests) >= geoRateLimit {
+		g.mu.Unlock()
+		return nil, "konum servisi istek sınırına ulaşıldı, biraz sonra tekrar deneyin"
+	}
+	g.requests = append(g.requests, now)
+	g.mu.Unlock()
+
+	geo, errMsg, cacheable := g.fetch(ctx, ip)
+	if cacheable {
+		g.mu.Lock()
+		g.cache[ip] = geoCacheEntry{geo: geo, errMsg: errMsg, expires: now.Add(geoCacheTTL)}
+		g.mu.Unlock()
+	}
+	return geo, errMsg
+}
+
+// fetch, ip-api.com'a tek bir istek atar. Ağ hataları önbelleğe alınmaz.
+func (g *GeoResolver) fetch(ctx context.Context, ip string) (*IPGeo, string, bool) {
+	url := g.baseURL + ip + "?fields=status,message,country,countryCode,regionName,city,isp,org,as,proxy,hosting,mobile"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "konum sorgusu oluşturulamadı", false
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, "konum servisine ulaşılamadı", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Sprintf("konum servisi hata döndürdü (%d)", resp.StatusCode), false
+	}
+	var body struct {
+		Status      string `json:"status"`
+		Message     string `json:"message"`
+		Country     string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		RegionName  string `json:"regionName"`
+		City        string `json:"city"`
+		ISP         string `json:"isp"`
+		Org         string `json:"org"`
+		AS          string `json:"as"`
+		Proxy       bool   `json:"proxy"`
+		Hosting     bool   `json:"hosting"`
+		Mobile      bool   `json:"mobile"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&body); err != nil {
+		return nil, "konum yanıtı okunamadı", false
+	}
+	if body.Status != "success" {
+		return nil, "konum bulunamadı: " + body.Message, true
+	}
+	return &IPGeo{
+		Country:     body.Country,
+		CountryCode: body.CountryCode,
+		Region:      body.RegionName,
+		City:        body.City,
+		ISP:         body.ISP,
+		Org:         body.Org,
+		AS:          body.AS,
+		Proxy:       body.Proxy,
+		Hosting:     body.Hosting,
+		Mobile:      body.Mobile,
+	}, "", true
+}
+
+// ipScope, IP adresinin ağ sınıfını Türkçe olarak döndürür; ikinci değer
+// adresin genel (internet üzerinde yönlendirilebilir) olup olmadığıdır.
+func ipScope(ip net.IP) (string, bool) {
+	switch {
+	case ip.IsLoopback():
+		return "Loopback", false
+	case ip.IsPrivate():
+		return "Özel ağ", false
+	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		return "Link-local", false
+	case ip.IsMulticast():
+		return "Multicast", false
+	case ip.IsUnspecified():
+		return "Belirtilmemiş", false
+	case ip.Equal(net.IPv4bcast):
+		return "Broadcast", false
+	}
+	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1]&0xC0 == 64 {
+		return "CGNAT", false
+	}
+	return "Genel", true
+}
+
+// IPPeerStat, trafik özetindeki karşı taraf IP istatistiğidir.
+type IPPeerStat struct {
+	IP    string `json:"ip"`
+	Flows int    `json:"flows"`
+	Bytes uint64 `json:"bytes"`
+}
+
+// IPPortStat, trafik özetindeki servis portu istatistiğidir.
+type IPPortStat struct {
+	Port     uint64 `json:"port"`
+	Protocol string `json:"protocol"`
+	Flows    int    `json:"flows"`
+	Bytes    uint64 `json:"bytes"`
+}
+
+// IPTrafficSummary, bellekteki kayıtlardan IP için çıkarılan trafik özetidir.
+type IPTrafficSummary struct {
+	Flows     int          `json:"flows"`
+	Outbound  int          `json:"outbound"`
+	Inbound   int          `json:"inbound"`
+	Packets   uint64       `json:"packets"`
+	Bytes     uint64       `json:"bytes"`
+	BytesOut  uint64       `json:"bytes_out"`
+	BytesIn   uint64       `json:"bytes_in"`
+	FirstSeen string       `json:"first_seen,omitempty"`
+	LastSeen  string       `json:"last_seen,omitempty"`
+	TopPeers  []IPPeerStat `json:"top_peers"`
+	TopPorts  []IPPortStat `json:"top_ports"`
+}
+
+// IPInfoResponse, /api/ip yanıtıdır.
+type IPInfoResponse struct {
+	IP          string           `json:"ip"`
+	Version     int              `json:"version"`
+	Scope       string           `json:"scope"`
+	Public      bool             `json:"public"`
+	PTR         []string         `json:"ptr"`
+	Whitelisted bool             `json:"whitelisted"`
+	Blocked     *blocklistEntry  `json:"blocked,omitempty"`
+	Threats     []ThreatAlert    `json:"threats"`
+	Geo         *IPGeo           `json:"geo,omitempty"`
+	GeoError    string           `json:"geo_error,omitempty"`
+	Summary     IPTrafficSummary `json:"summary"`
+	Records     []string         `json:"records"`
+	Scanned     int              `json:"scanned"`
+}
+
+// summarizeIPTraffic, kayıtlar içinden IP'nin kaynak veya hedef olduğu akışları
+// süzer (en yeni en üstte) ve trafik özetini çıkarır.
+func summarizeIPTraffic(records []string, ip string) ([]string, IPTrafficSummary) {
+	var sum IPTrafficSummary
+	matched := make([]string, 0)
+	peers := make(map[string]*IPPeerStat)
+	ports := make(map[string]*IPPortStat)
+	var first, last time.Time
+
+	for i := len(records) - 1; i >= 0; i-- {
+		rec := records[i]
+		parts := strings.Split(rec, "|")
+		if len(parts) < 8 {
+			continue
+		}
+		src, dst := parts[1], parts[2]
+		var peer string
+		outbound := false
+		switch ip {
+		case src:
+			peer, outbound = dst, true
+		case dst:
+			peer = src
+		default:
+			continue
+		}
+		matched = append(matched, rec)
+
+		pkts, _ := strconv.ParseUint(parts[6], 10, 64)
+		byts, _ := strconv.ParseUint(parts[7], 10, 64)
+		sum.Flows++
+		sum.Packets += pkts
+		sum.Bytes += byts
+		if outbound {
+			sum.Outbound++
+			sum.BytesOut += byts
+		} else {
+			sum.Inbound++
+			sum.BytesIn += byts
+		}
+		if t, err := time.Parse(time.RFC3339, parts[0]); err == nil {
+			if first.IsZero() || t.Before(first) {
+				first = t
+			}
+			if t.After(last) {
+				last = t
+			}
+		}
+
+		p := peers[peer]
+		if p == nil {
+			p = &IPPeerStat{IP: peer}
+			peers[peer] = p
+		}
+		p.Flows++
+		p.Bytes += byts
+
+		// Servis portu: sunucu tarafı genelde küçük numaralı porttur.
+		sp, _ := strconv.ParseUint(parts[3], 10, 64)
+		dp, _ := strconv.ParseUint(parts[4], 10, 64)
+		svc := dp
+		if sp != 0 && (dp == 0 || sp < dp) {
+			svc = sp
+		}
+		key := parts[5] + "/" + strconv.FormatUint(svc, 10)
+		ps := ports[key]
+		if ps == nil {
+			ps = &IPPortStat{Port: svc, Protocol: parts[5]}
+			ports[key] = ps
+		}
+		ps.Flows++
+		ps.Bytes += byts
+	}
+
+	if !first.IsZero() {
+		sum.FirstSeen = first.Format(time.RFC3339)
+		sum.LastSeen = last.Format(time.RFC3339)
+	}
+
+	sum.TopPeers = make([]IPPeerStat, 0, len(peers))
+	for _, p := range peers {
+		sum.TopPeers = append(sum.TopPeers, *p)
+	}
+	sort.Slice(sum.TopPeers, func(i, j int) bool {
+		if sum.TopPeers[i].Flows != sum.TopPeers[j].Flows {
+			return sum.TopPeers[i].Flows > sum.TopPeers[j].Flows
+		}
+		return sum.TopPeers[i].IP < sum.TopPeers[j].IP
+	})
+	if len(sum.TopPeers) > ipInfoTopN {
+		sum.TopPeers = sum.TopPeers[:ipInfoTopN]
+	}
+
+	sum.TopPorts = make([]IPPortStat, 0, len(ports))
+	for _, p := range ports {
+		sum.TopPorts = append(sum.TopPorts, *p)
+	}
+	sort.Slice(sum.TopPorts, func(i, j int) bool {
+		if sum.TopPorts[i].Flows != sum.TopPorts[j].Flows {
+			return sum.TopPorts[i].Flows > sum.TopPorts[j].Flows
+		}
+		return sum.TopPorts[i].Port < sum.TopPorts[j].Port
+	})
+	if len(sum.TopPorts) > ipInfoTopN {
+		sum.TopPorts = sum.TopPorts[:ipInfoTopN]
+	}
+	return matched, sum
+}
+
+// handleIPInfo, ?ip=<adres> için IP ayrıntılarını döndürür: ağ sınıfı, ters DNS,
+// whitelist/kara liste durumu, aktif tehditler, konum/ASN (yalnızca genel IP'ler
+// için ip-api.com) ve bellekteki son kayıtlardan IP'nin trafiği.
+func (a *App) handleIPInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, "desteklenmeyen metot", http.StatusMethodNotAllowed)
+		return
+	}
+	parsed := net.ParseIP(strings.TrimSpace(r.URL.Query().Get("ip")))
+	if parsed == nil {
+		writeJSONError(w, "geçersiz IP adresi", http.StatusBadRequest)
+		return
+	}
+	ip := parsed.String()
+	// lite=1: modal açıkken yapılan periyodik tazelemelerde ters DNS ve konum
+	// sorguları atlanır; yalnızca trafik ve güvenlik durumu döner.
+	lite := r.URL.Query().Get("lite") == "1"
+
+	resp := IPInfoResponse{IP: ip, Version: 6, PTR: []string{}, Threats: []ThreatAlert{}}
+	if parsed.To4() != nil {
+		resp.Version = 4
+	}
+	resp.Scope, resp.Public = ipScope(parsed)
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	if !lite {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dnsCtx, dnsCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer dnsCancel()
+			if names, err := net.DefaultResolver.LookupAddr(dnsCtx, ip); err == nil {
+				for _, n := range names {
+					resp.PTR = append(resp.PTR, strings.TrimSuffix(n, "."))
+				}
+			}
+		}()
+	}
+	if resp.Public && !lite {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp.Geo, resp.GeoError = a.geo.Lookup(ctx, ip)
+		}()
+	}
+
+	resp.Whitelisted = a.whitelist.Contains(ip)
+	for _, e := range a.blocklist.Snapshot() {
+		if e.IP == ip {
+			entry := e
+			resp.Blocked = &entry
+			break
+		}
+	}
+	if a.dashboard != nil {
+		for _, t := range a.dashboard.ThreatsSnapshot() {
+			if t.SrcIP == ip {
+				resp.Threats = append(resp.Threats, t)
+			}
+		}
+		records := a.dashboard.Snapshot().Records
+		resp.Scanned = len(records)
+		resp.Records, resp.Summary = summarizeIPTraffic(records, ip)
+	} else {
+		resp.Records, resp.Summary = summarizeIPTraffic(nil, ip)
+	}
+
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // writeBlocklist, güncel kara liste durumunu JSON olarak yazar.
@@ -4060,6 +4454,242 @@ const dashboardHTML = `<!DOCTYPE html>
 
     .drawer-divider { height: 1px; background: var(--line); }
 
+    /* ── IP bağlantıları ─────────────────────────────────────────────── */
+    .ip-link {
+      padding: 0;
+      border: 0;
+      background: none;
+      color: inherit;
+      font: inherit;
+      text-decoration: underline dotted transparent;
+      text-underline-offset: 3px;
+      transition: text-decoration-color var(--dur) var(--ease), color var(--dur) var(--ease);
+    }
+    .ip-link:hover { text-decoration-color: currentColor; color: var(--text); }
+
+    /* ── IP ayrıntı modalı ───────────────────────────────────────────── */
+    .ip-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 70;
+      display: grid;
+      place-items: center;
+      padding: var(--s5);
+    }
+    .ip-modal[hidden] { display: none; }
+
+    .ip-modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(2, 4, 5, 0.78);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+      animation: fadeIn var(--dur) var(--ease);
+    }
+
+    .ip-dialog {
+      position: relative;
+      width: min(1180px, 100%);
+      max-height: calc(100vh - 40px);
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+      animation: popIn 200ms var(--ease);
+    }
+
+    .ip-head {
+      display: flex;
+      align-items: flex-start;
+      gap: var(--s3);
+      padding: var(--s4) var(--s5);
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+
+    .ip-head-main { flex: 1; min-width: 0; display: grid; gap: var(--s2); }
+
+    .ip-title-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+
+    .ip-title {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--cyan);
+      overflow-wrap: anywhere;
+    }
+    .ip-title::before { content: "$ whois "; color: var(--text-3); font-size: 13px; font-weight: 500; letter-spacing: 0; }
+
+    .ip-ptr { font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
+    .ip-ptr::before { content: "ptr › "; color: var(--green); }
+
+    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border: 1px solid var(--line-2);
+      border-radius: 2px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--text-2);
+    }
+    .tag.ok { color: var(--green); border-color: rgba(var(--green-rgb), 0.45); background: var(--green-soft); }
+    .tag.warn { color: var(--amber); border-color: rgba(245, 184, 61, 0.45); background: var(--amber-soft); }
+    .tag.bad { color: var(--red); border-color: rgba(255, 97, 112, 0.5); background: var(--red-soft); }
+    .tag.info { color: var(--cyan); border-color: rgba(92, 202, 242, 0.4); background: var(--cyan-soft); }
+
+    .ip-head-actions { display: flex; gap: var(--s2); flex: none; }
+
+    .ip-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: var(--s4) var(--s5) var(--s5);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--s4);
+      align-content: start;
+    }
+
+    .ip-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--s3);
+    }
+
+    .ip-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+      min-width: 0;
+    }
+    .ip-card-head {
+      padding: var(--s2) var(--s3);
+      border-bottom: 1px solid var(--line);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-2);
+    }
+    .ip-card-head::before { content: "// "; color: var(--green); }
+    .ip-card-body { padding: var(--s3); display: grid; gap: 6px; }
+
+    .ip-kv { display: grid; grid-template-columns: 11ch minmax(0, 1fr); gap: var(--s2); font-size: 12px; }
+    .ip-kv dt { color: var(--text-3); }
+    .ip-kv dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+
+    .ip-note { font-size: 12px; color: var(--text-3); }
+
+    .ip-threat {
+      display: grid;
+      gap: 2px;
+      padding: var(--s2);
+      border-left: 3px solid var(--amber);
+      background: var(--bg);
+      font-size: 12px;
+    }
+    .ip-threat.high { border-left-color: var(--red); }
+    .ip-threat strong { color: var(--text); }
+    .ip-threat span { color: var(--text-2); }
+
+    .ip-stats {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+    .ip-stat { padding: var(--s3); border-right: 1px solid var(--line); min-width: 0; }
+    .ip-stat:last-child { border-right: 0; }
+    .ip-stat-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-3);
+    }
+    .ip-stat-value {
+      margin-top: 2px;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ip-stat-value.green { color: var(--green); }
+    .ip-stat-sub { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .ip-tops { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3); }
+
+    .top-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+    .top-item {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: var(--s2);
+      padding: 5px var(--s2);
+      font-size: 12px;
+      isolation: isolate;
+    }
+    .top-bar {
+      position: absolute;
+      inset: 0 auto 0 0;
+      background: rgba(var(--green-rgb), 0.08);
+      border-right: 1px solid rgba(var(--green-rgb), 0.35);
+      z-index: -1;
+    }
+    .top-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+    .top-name .ip-link { color: var(--violet); }
+    .top-val { color: var(--text-2); white-space: nowrap; }
+
+    .ip-traffic { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .ip-traffic-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--s3);
+      flex-wrap: wrap;
+      padding: var(--s2) var(--s3);
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+    .ip-traffic .table-wrap { max-height: 46vh; }
+
+    .dir {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .dir.out { color: var(--amber); }
+    .dir.in { color: var(--cyan); }
+
+    .log-table td.self { color: var(--text); font-weight: 700; }
+
+    .ip-loading {
+      padding: 48px var(--s4);
+      text-align: center;
+      color: var(--text-3);
+      font-size: 13px;
+    }
+    .ip-loading::after {
+      content: "▌";
+      margin-left: 4px;
+      color: var(--green);
+      animation: blink 1s steps(1) infinite;
+    }
+
     /* ── Animasyonlar ────────────────────────────────────────────────── */
     @keyframes blink { 50% { opacity: 0; } }
     @keyframes pulse {
@@ -4072,6 +4702,7 @@ const dashboardHTML = `<!DOCTYPE html>
       to { background-color: transparent; }
     }
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes popIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
     @keyframes slideIn { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
 
     @media (prefers-reduced-motion: reduce) {
@@ -4087,6 +4718,12 @@ const dashboardHTML = `<!DOCTYPE html>
     @media (max-width: 1180px) {
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .metric-rate { grid-column: 1 / -1; }
+    }
+
+    @media (max-width: 1000px) {
+      .ip-grid { grid-template-columns: minmax(0, 1fr); }
+      .ip-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .ip-stat:nth-child(3n) { border-right: 0; }
     }
 
     @media (max-width: 720px) {
@@ -4105,6 +4742,13 @@ const dashboardHTML = `<!DOCTYPE html>
       .drawer-head, .drawer-body { padding-left: var(--s4); padding-right: var(--s4); }
       .threat-item { grid-template-columns: 1fr; }
       .threat-time { order: -1; }
+      .ip-modal { padding: 0; }
+      .ip-dialog { max-height: 100vh; height: 100%; border: 0; border-radius: 0; }
+      .ip-head, .ip-body { padding-left: var(--s4); padding-right: var(--s4); }
+      .ip-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .ip-stat:nth-child(2n) { border-right: 0; }
+      .ip-stat { border-bottom: 1px solid var(--line); }
+      .ip-tops { grid-template-columns: minmax(0, 1fr); }
     }
   </style>
 </head>
@@ -4397,6 +5041,94 @@ const dashboardHTML = `<!DOCTYPE html>
     </section>
   </div>
 
+  <div class="ip-modal" id="ip-modal" hidden>
+    <div class="ip-modal-backdrop" data-ip-close></div>
+    <section class="ip-dialog" id="ip-dialog" role="dialog" aria-modal="true" aria-labelledby="ip-title">
+      <header class="ip-head">
+        <div class="ip-head-main">
+          <div class="ip-title-row">
+            <h2 class="ip-title" id="ip-title">-</h2>
+          </div>
+          <div class="ip-ptr" id="ip-ptr" hidden></div>
+          <div class="tag-row" id="ip-tags"></div>
+        </div>
+        <div class="ip-head-actions">
+          <button type="button" class="icon-btn" id="ip-copy" aria-label="IP adresini kopyala" title="IP adresini kopyala">
+            <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>
+            </svg>
+            <svg class="ico-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 6 9 17l-5-5"/>
+            </svg>
+          </button>
+          <button type="button" class="icon-btn ip-close" data-ip-close aria-label="IP ayrıntılarını kapat">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 6 6 18"/><path d="m6 6 12 12"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+      <div class="ip-body" id="ip-body">
+        <div class="ip-loading" id="ip-loading">IP bilgileri alınıyor</div>
+        <div class="form-error" id="ip-error" role="alert" hidden></div>
+        <div id="ip-content" hidden>
+          <div class="ip-grid">
+            <div class="ip-card">
+              <div class="ip-card-head">Kimlik</div>
+              <dl class="ip-card-body ip-kv" id="ip-identity"></dl>
+            </div>
+            <div class="ip-card">
+              <div class="ip-card-head">Konum / ASN</div>
+              <div class="ip-card-body" id="ip-geo"></div>
+            </div>
+            <div class="ip-card">
+              <div class="ip-card-head">Güvenlik</div>
+              <div class="ip-card-body" id="ip-security"></div>
+            </div>
+          </div>
+
+          <div class="ip-stats" id="ip-stats" style="margin-top: 16px"></div>
+
+          <div class="ip-tops" style="margin-top: 16px">
+            <div class="ip-card">
+              <div class="ip-card-head">En çok konuşulan eşler</div>
+              <div class="ip-card-body"><ul class="top-list" id="ip-top-peers"></ul></div>
+            </div>
+            <div class="ip-card">
+              <div class="ip-card-head">En çok kullanılan servisler</div>
+              <div class="ip-card-body"><ul class="top-list" id="ip-top-ports"></ul></div>
+            </div>
+          </div>
+
+          <div class="ip-traffic" style="margin-top: 16px">
+            <div class="ip-traffic-head">
+              <span class="panel-title">Trafik kayıtları</span>
+              <span class="panel-meta" id="ip-scan-note"></span>
+            </div>
+            <div class="table-wrap">
+              <table class="log-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Zaman</th>
+                    <th scope="col">Yön</th>
+                    <th scope="col">Kaynak IP</th>
+                    <th scope="col" class="num">Kaynak Port</th>
+                    <th scope="col" class="arrow" aria-hidden="true"></th>
+                    <th scope="col">Hedef IP</th>
+                    <th scope="col" class="num">Hedef Port</th>
+                    <th scope="col">Protokol</th>
+                    <th scope="col" class="num">Boyut</th>
+                  </tr>
+                </thead>
+                <tbody id="ip-records"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
   <script>
     'use strict';
 
@@ -4452,6 +5184,7 @@ const dashboardHTML = `<!DOCTYPE html>
     const ICON_X = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
     const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
     const ICON_BAN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>';
+    const ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
     const ICON_LOCK = '<svg class="lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>';
 
     let eventSource = null;
@@ -4783,6 +5516,20 @@ const dashboardHTML = `<!DOCTYPE html>
       };
     }
 
+    function ipLink(ip) {
+      if (!ip || ip === '-') return escapeHtml(ip);
+      return '<button type="button" class="ip-link" data-ip="' + escapeHtml(ip) + '" title="' + escapeHtml(ip) + ' ayrıntıları">' + escapeHtml(ip) + '</button>';
+    }
+
+    function protoMarkup(item) {
+      const protoLabel = item.service || item.proto;
+      const protoTitle = item.service
+        ? item.proto + ' · Port ' + item.servicePort + ' · ' + item.service
+        : item.proto;
+      const lock = (item.service && item.serviceSecure) ? ICON_LOCK : '';
+      return '<span class="proto ' + escapeHtml(item.protoClass) + '" title="' + escapeHtml(protoTitle) + '">' + lock + escapeHtml(protoLabel) + '</span>';
+    }
+
     function buildRowMarkup(record) {
       const item = parseRecord(record);
       // Bilinen port eşleşirse servis adı, yoksa taşıma protokolü gösterilir;
@@ -4794,10 +5541,10 @@ const dashboardHTML = `<!DOCTYPE html>
       const lock = (item.service && item.serviceSecure) ? ICON_LOCK : '';
       return '<tr>'
         + '<td class="cell-time">' + escapeHtml(item.time) + '</td>'
-        + '<td class="cell-ip-src">' + escapeHtml(item.srcIp) + '</td>'
+        + '<td class="cell-ip-src">' + ipLink(item.srcIp) + '</td>'
         + '<td class="num cell-port">' + escapeHtml(item.srcPort) + '</td>'
         + '<td class="arrow" aria-hidden="true">→</td>'
-        + '<td class="cell-ip-dst">' + escapeHtml(item.dstIp) + '</td>'
+        + '<td class="cell-ip-dst">' + ipLink(item.dstIp) + '</td>'
         + '<td class="num cell-port">' + escapeHtml(item.dstPort) + '</td>'
         + '<td><span class="proto ' + escapeHtml(item.protoClass) + '" title="' + escapeHtml(protoTitle) + '">' + lock + escapeHtml(protoLabel) + '</span></td>'
         + '<td class="num cell-size">' + escapeHtml(item.size) + '</td>'
@@ -4962,6 +5709,10 @@ const dashboardHTML = `<!DOCTYPE html>
           ? '<button type="button" class="chip-btn threat-copy-ip" data-ip="' + escapeHtml(ip) + '" title="Kaynak IP adresini kopyala">'
             + ICON_COPY + '<span class="threat-copy-label">' + escapeHtml(ip) + '</span></button>'
           : '';
+        const detailBtn = ip
+          ? '<button type="button" class="chip-btn ip-link-btn" data-ip="' + escapeHtml(ip) + '" title="IP ayrıntılarını ve trafiğini göster">'
+            + ICON_INFO + '<span>Ayrıntı</span></button>'
+          : '';
         const banned = ip && bannedIps.has(ip);
         const banBtn = ip
           ? '<button type="button" class="chip-btn threat-ban' + (banned ? ' banned' : '') + '" data-ip="' + escapeHtml(ip) + '"'
@@ -4974,7 +5725,7 @@ const dashboardHTML = `<!DOCTYPE html>
           + '<div class="threat-body">'
           +   '<div class="threat-item-title">' + escapeHtml(a.title || rule) + hits + '</div>'
           +   '<div class="threat-meta">' + detail + '</div>'
-          +   '<div class="threat-actions">' + copyIp + banBtn + '</div>'
+          +   '<div class="threat-actions">' + copyIp + detailBtn + banBtn + '</div>'
           + '</div>'
           + '<span class="threat-time">' + escapeHtml(formatTime(a.last_seen || '')) + '</span>'
           + '</div>';
@@ -5219,7 +5970,7 @@ const dashboardHTML = `<!DOCTYPE html>
     function closeThreatModal() {
       if (threatModalEl.hidden) return;
       threatModalEl.hidden = true;
-      document.body.style.overflow = '';
+      if (ipModalEl.hidden) document.body.style.overflow = '';
       stopSecurityPoll();
       threatToggleEl.setAttribute('aria-expanded', 'false');
       if (threatLastFocus && typeof threatLastFocus.focus === 'function') threatLastFocus.focus();
@@ -5246,28 +5997,37 @@ const dashboardHTML = `<!DOCTYPE html>
       if (event.target.closest('[data-threat-close]')) closeThreatModal();
     });
 
-    // Esc ile kapatma ve Tab odağını çekmece içinde tutma.
-    document.addEventListener('keydown', (event) => {
-      if (threatModalEl.hidden) return;
-      if (event.key === 'Escape') {
-        closeThreatModal();
-        return;
-      }
-      if (event.key !== 'Tab') return;
+    // Tab odağını verilen diyalog içinde tutar.
+    function trapFocus(event, container) {
       const focusables = Array.prototype.filter.call(
-        threatCardEl.querySelectorAll('button, input, [tabindex]:not([tabindex="-1"])'),
+        container.querySelectorAll('button, input, [tabindex]:not([tabindex="-1"])'),
         (el) => !el.disabled && el.offsetParent !== null
       );
       if (!focusables.length) return;
       const first = focusables[0];
       const last = focusables[focusables.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (event.shiftKey && (document.activeElement === first || !container.contains(document.activeElement))) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      } else if (!event.shiftKey && (document.activeElement === last || !container.contains(document.activeElement))) {
         event.preventDefault();
         first.focus();
       }
+    }
+
+    // Esc en üstteki diyaloğu kapatır; Tab odağı en üstteki diyalogda kalır.
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' && event.key !== 'Tab') return;
+      let top = null;
+      let close = null;
+      if (!ipModalEl.hidden) { top = ipDialogEl; close = closeIpModal; }
+      else if (!threatModalEl.hidden) { top = threatCardEl; close = closeThreatModal; }
+      if (!top) return;
+      if (event.key === 'Escape') {
+        close();
+        return;
+      }
+      trapFocus(event, top);
     });
 
     function showFormError(el, msg) {
@@ -5277,7 +6037,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     function chipMarkup(kind, value, extra, removeAttr, removeLabel) {
       return '<span class="entry-chip ' + kind + '">'
-        + '<span class="entry-ip">' + escapeHtml(value) + '</span>' + extra
+        + '<span class="entry-ip">' + (value.indexOf('/') >= 0 ? escapeHtml(value) : ipLink(value)) + '</span>' + extra
         + '<button type="button" class="entry-remove" ' + removeAttr + '="' + escapeHtml(value) + '" aria-label="' + escapeHtml(removeLabel) + '">' + ICON_X + '</button>'
         + '</span>';
     }
@@ -5509,6 +6269,262 @@ const dashboardHTML = `<!DOCTYPE html>
       if (!ip) return;
       await copyToClipboard(ip);
       flashCopied(btn);
+    });
+
+    // ── IP ayrıntı modalı ─────────────────────────────────────────────
+    const ipModalEl = $('ip-modal');
+    const ipDialogEl = $('ip-dialog');
+    const ipTitleEl = $('ip-title');
+    const ipPtrEl = $('ip-ptr');
+    const ipTagsEl = $('ip-tags');
+    const ipCopyEl = $('ip-copy');
+    const ipBodyEl = $('ip-body');
+    const ipLoadingEl = $('ip-loading');
+    const ipErrorEl = $('ip-error');
+    const ipContentEl = $('ip-content');
+    const ipIdentityEl = $('ip-identity');
+    const ipGeoEl = $('ip-geo');
+    const ipSecurityEl = $('ip-security');
+    const ipStatsEl = $('ip-stats');
+    const ipTopPeersEl = $('ip-top-peers');
+    const ipTopPortsEl = $('ip-top-ports');
+    const ipRecordsEl = $('ip-records');
+    const ipScanNoteEl = $('ip-scan-note');
+
+    // Modal açıkken trafik bu aralıkla tazelenir (konum/DNS tekrar sorgulanmaz).
+    const IP_REFRESH_MS = 3000;
+    let ipCurrent = '';
+    let ipLastFocus = null;
+    let ipRefreshTimer = null;
+    let ipRequestSeq = 0;
+    let ipRecordsSig = '';
+
+    const dateTimeFmt = new Intl.DateTimeFormat('tr-TR', {
+      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+
+    function formatDateTime(value) {
+      if (!value) return '-';
+      const d = new Date(value);
+      return Number.isNaN(d.getTime()) ? value : dateTimeFmt.format(d);
+    }
+
+    function kvRow(key, value) {
+      return '<dt>' + escapeHtml(key) + '</dt><dd>' + value + '</dd>';
+    }
+
+    function tag(text, kind) {
+      return '<span class="tag' + (kind ? ' ' + kind : '') + '">' + escapeHtml(text) + '</span>';
+    }
+
+    function serviceName(port) {
+      return PORT_SERVICES[port] || '';
+    }
+
+    function renderIpStatic(info) {
+      ipPtrEl.textContent = (info.ptr || []).join(', ');
+      ipPtrEl.hidden = !(info.ptr && info.ptr.length);
+
+      const tags = [tag('IPv' + info.version, 'info'), tag(info.scope, info.public ? '' : 'ok')];
+      if (info.whitelisted) tags.push(tag('Whitelist', 'ok'));
+      if (info.blocked) tags.push(tag(info.blocked.manual ? 'Elle engellendi' : 'Kara listede', 'bad'));
+      if (info.threats && info.threats.length) tags.push(tag(info.threats.length + ' aktif uyarı', 'bad'));
+      if (info.geo && info.geo.hosting) tags.push(tag('Hosting', 'warn'));
+      if (info.geo && info.geo.proxy) tags.push(tag('Proxy / VPN', 'warn'));
+      if (info.geo && info.geo.mobile) tags.push(tag('Mobil', ''));
+      ipTagsEl.innerHTML = tags.join('');
+
+      ipIdentityEl.innerHTML =
+        kvRow('Adres', escapeHtml(info.ip)) +
+        kvRow('Sürüm', 'IPv' + info.version) +
+        kvRow('Ağ sınıfı', escapeHtml(info.scope)) +
+        kvRow('Ters DNS', info.ptr && info.ptr.length ? escapeHtml(info.ptr.join(', ')) : '<span class="ip-note">kayıt yok</span>');
+
+      if (!info.public) {
+        ipGeoEl.innerHTML = '<p class="ip-note">Özel/yerel adres; konum sorgulanmaz.</p>';
+      } else if (info.geo) {
+        const g = info.geo;
+        const place = [g.city, g.region].filter(Boolean).join(', ');
+        ipGeoEl.innerHTML = '<dl class="ip-kv">'
+          + kvRow('Ülke', escapeHtml((g.country || '-') + (g.country_code ? ' (' + g.country_code + ')' : '')))
+          + kvRow('Şehir', escapeHtml(place || '-'))
+          + kvRow('ISP', escapeHtml(g.isp || '-'))
+          + kvRow('Kurum', escapeHtml(g.org || '-'))
+          + kvRow('ASN', escapeHtml(g.as || '-'))
+          + '</dl><p class="ip-note">Kaynak: ip-api.com</p>';
+      } else {
+        ipGeoEl.innerHTML = '<p class="ip-note">' + escapeHtml(info.geo_error || 'Konum bilgisi alınamadı.') + '</p>';
+      }
+
+      let sec = '<dl class="ip-kv">'
+        + kvRow('Whitelist', info.whitelisted ? '<span style="color:var(--green)">Evet — analiz dışı</span>' : 'Hayır');
+      if (info.blocked) {
+        const b = info.blocked;
+        sec += kvRow('Kara liste', '<span style="color:var(--red)">' + (b.manual ? 'Elle engellendi' : 'Otomatik') + '</span>')
+          + kvRow('Neden', escapeHtml(b.rule || '-'))
+          + (b.manual ? '' : kvRow('Bitiş', escapeHtml(formatDateTime(b.expires_at))));
+      } else {
+        sec += kvRow('Kara liste', 'Hayır');
+      }
+      sec += '</dl>';
+      if (info.threats && info.threats.length) {
+        sec += info.threats.map((t) => '<div class="ip-threat ' + (t.severity === 'high' ? 'high' : '') + '">'
+          + '<strong>' + escapeHtml(t.title || THREAT_RULE_LABELS[t.rule] || 'Şüpheli') + (t.count ? ' · ' + escapeHtml(String(t.count)) + '×' : '') + '</strong>'
+          + '<span>' + escapeHtml(t.detail || '') + '</span></div>').join('');
+      } else {
+        sec += '<p class="ip-note">Aktif tehdit uyarısı yok.</p>';
+      }
+      ipSecurityEl.innerHTML = sec;
+    }
+
+    function statCell(label, value, sub, green) {
+      return '<div class="ip-stat"><div class="ip-stat-label">' + escapeHtml(label) + '</div>'
+        + '<div class="ip-stat-value' + (green ? ' green' : '') + '" title="' + escapeHtml(value) + '">' + escapeHtml(value) + '</div>'
+        + '<div class="ip-stat-sub">' + escapeHtml(sub || '\u00a0') + '</div></div>';
+    }
+
+    function renderTopList(el, items, labelFn, emptyText) {
+      if (!items || !items.length) {
+        el.innerHTML = '<li class="ip-note">' + escapeHtml(emptyText) + '</li>';
+        return;
+      }
+      const max = Math.max.apply(null, items.map((i) => i.flows)) || 1;
+      el.innerHTML = items.map((i) => '<li class="top-item">'
+        + '<span class="top-bar" style="width:' + Math.max(2, Math.round(i.flows / max * 100)) + '%"></span>'
+        + '<span class="top-name">' + labelFn(i) + '</span>'
+        + '<span class="top-val">' + numberFmt.format(i.flows) + ' akış · ' + escapeHtml(formatBytes(i.bytes)) + '</span>'
+        + '</li>').join('');
+    }
+
+    function buildIpRowMarkup(record, ip) {
+      const item = parseRecord(record);
+      const out = item.srcIp === ip;
+      const dir = out
+        ? '<span class="dir out">↑ Giden</span>'
+        : '<span class="dir in">↓ Gelen</span>';
+      return '<tr>'
+        + '<td class="cell-time">' + escapeHtml(item.time) + '</td>'
+        + '<td>' + dir + '</td>'
+        + '<td class="cell-ip-src' + (out ? ' self' : '') + '">' + (out ? escapeHtml(item.srcIp) : ipLink(item.srcIp)) + '</td>'
+        + '<td class="num cell-port">' + escapeHtml(item.srcPort) + '</td>'
+        + '<td class="arrow" aria-hidden="true">→</td>'
+        + '<td class="cell-ip-dst' + (out ? '' : ' self') + '">' + (out ? ipLink(item.dstIp) : escapeHtml(item.dstIp)) + '</td>'
+        + '<td class="num cell-port">' + escapeHtml(item.dstPort) + '</td>'
+        + '<td>' + protoMarkup(item) + '</td>'
+        + '<td class="num cell-size">' + escapeHtml(item.size) + '</td>'
+        + '</tr>';
+    }
+
+    function renderIpTraffic(info) {
+      const s = info.summary || {};
+      ipStatsEl.innerHTML =
+        statCell('Akış', numberFmt.format(s.flows || 0), '', true) +
+        statCell('Giden', numberFmt.format(s.outbound || 0), formatBytes(s.bytes_out || 0)) +
+        statCell('Gelen', numberFmt.format(s.inbound || 0), formatBytes(s.bytes_in || 0)) +
+        statCell('Toplam veri', formatBytes(s.bytes || 0), numberFmt.format(s.packets || 0) + ' paket') +
+        statCell('İlk görülme', s.first_seen ? formatTime(s.first_seen) : '-', s.first_seen ? formatDateTime(s.first_seen) : '') +
+        statCell('Son görülme', s.last_seen ? formatTime(s.last_seen) : '-', s.last_seen ? formatDateTime(s.last_seen) : '');
+
+      renderTopList(ipTopPeersEl, s.top_peers, (p) => ipLink(p.ip), 'Kayıt yok.');
+      renderTopList(ipTopPortsEl, s.top_ports, (p) => {
+        const name = serviceName(p.port);
+        return escapeHtml(p.protocol + '/' + p.port) + (name ? ' <span style="color:var(--text-3)">· ' + escapeHtml(name) + '</span>' : '');
+      }, 'Kayıt yok.');
+
+      ipScanNoteEl.textContent = 'Bellekteki son ' + numberFmt.format(info.scanned || 0) + ' kayıt içinde ' + numberFmt.format((info.records || []).length) + ' eşleşme';
+
+      const records = info.records || [];
+      const sig = records.length + '|' + (records[0] || '');
+      if (sig === ipRecordsSig) return;
+      ipRecordsSig = sig;
+      ipRecordsEl.innerHTML = records.length
+        ? records.map((r) => buildIpRowMarkup(r, info.ip)).join('')
+        : '<tr class="empty-row"><td colspan="9"><div class="empty-title">trafik yok</div><div>Bu IP bellekteki son kayıtlarda görünmüyor.</div></td></tr>';
+    }
+
+    async function fetchIpInfo(ip, lite) {
+      const seq = ++ipRequestSeq;
+      const response = await fetch('/api/ip?ip=' + encodeURIComponent(ip) + (lite ? '&lite=1' : ''), { cache: 'no-store' });
+      const data = await response.json().catch(() => ({}));
+      if (seq !== ipRequestSeq || ip !== ipCurrent) return null;
+      if (!response.ok) throw new Error(data.error || 'IP bilgisi alınamadı');
+      return data;
+    }
+
+    async function loadIp(ip) {
+      ipCurrent = ip;
+      ipRecordsSig = '';
+      ipTitleEl.textContent = ip;
+      ipPtrEl.hidden = true;
+      ipTagsEl.innerHTML = '';
+      ipContentEl.hidden = true;
+      showFormError(ipErrorEl, '');
+      ipLoadingEl.hidden = false;
+      ipBodyEl.scrollTop = 0;
+      try {
+        const info = await fetchIpInfo(ip, false);
+        if (!info) return;
+        renderIpStatic(info);
+        renderIpTraffic(info);
+        ipContentEl.hidden = false;
+      } catch (error) {
+        showFormError(ipErrorEl, error.message);
+      } finally {
+        if (ip === ipCurrent) ipLoadingEl.hidden = true;
+      }
+    }
+
+    async function refreshIp() {
+      if (!ipCurrent || ipContentEl.hidden) return;
+      try {
+        const info = await fetchIpInfo(ipCurrent, true);
+        if (info) renderIpTraffic(info);
+      } catch (error) { /* geçici hata: sonraki yoklamada tekrar denenir */ }
+    }
+
+    function openIpModal(ip) {
+      if (!ip) return;
+      if (ipModalEl.hidden) {
+        ipLastFocus = document.activeElement;
+        ipModalEl.hidden = false;
+        document.body.style.overflow = 'hidden';
+        ipRefreshTimer = setInterval(refreshIp, IP_REFRESH_MS);
+      }
+      loadIp(ip);
+      const closeBtn = ipModalEl.querySelector('.ip-close');
+      if (closeBtn) closeBtn.focus();
+    }
+
+    function closeIpModal() {
+      if (ipModalEl.hidden) return;
+      ipModalEl.hidden = true;
+      ipCurrent = '';
+      ipRequestSeq++;
+      if (ipRefreshTimer !== null) {
+        clearInterval(ipRefreshTimer);
+        ipRefreshTimer = null;
+      }
+      if (threatModalEl.hidden) document.body.style.overflow = '';
+      if (ipLastFocus && typeof ipLastFocus.focus === 'function' && document.contains(ipLastFocus)) ipLastFocus.focus();
+      ipLastFocus = null;
+    }
+
+    ipModalEl.addEventListener('click', (event) => {
+      if (event.target.closest('[data-ip-close]')) closeIpModal();
+    });
+
+    ipCopyEl.addEventListener('click', async () => {
+      if (!ipCurrent) return;
+      await copyToClipboard(ipCurrent);
+      flashCopied(ipCopyEl);
+    });
+
+    // Sayfadaki tüm IP bağlantıları (tablo, tehditler, listeler, eşler) tek dinleyiciyle.
+    document.addEventListener('click', (event) => {
+      const link = event.target.closest('.ip-link, .ip-link-btn');
+      if (!link) return;
+      event.preventDefault();
+      openIpModal(link.getAttribute('data-ip'));
     });
 
     drawRateChart();
