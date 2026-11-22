@@ -147,6 +147,38 @@ func (s *fakeFTPServer) handle(conn net.Conn) {
 			s.mu.Lock()
 			s.files[p] = data
 			reply("226 done")
+		case "RETR", "NLST":
+			var payload []byte
+			if cmd == "RETR" {
+				data, ok := s.files[cleanRemote(arg)]
+				if !ok || dataLn == nil {
+					reply("550 not found")
+					break
+				}
+				payload = data
+			} else {
+				if dataLn == nil {
+					reply("425 no data conn")
+					break
+				}
+				dir := cleanRemote(arg)
+				for name := range s.files {
+					if cleanRemote(path.Dir(name)) == dir {
+						payload = append(payload, []byte(name+"\r\n")...)
+					}
+				}
+			}
+			ln := dataLn
+			dataLn = nil
+			s.mu.Unlock()
+			reply("150 ok")
+			if dc, err := ln.Accept(); err == nil {
+				_, _ = dc.Write(payload)
+				_ = dc.Close()
+			}
+			_ = ln.Close()
+			s.mu.Lock()
+			reply("226 done")
 		case "SIZE":
 			if data, ok := s.files[cleanRemote(arg)]; ok {
 				reply("213 %d", len(data))

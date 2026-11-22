@@ -118,6 +118,8 @@ type App struct {
 	blocklist *Blocklist
 	geo       *GeoResolver
 	archiver  *FTPArchiver
+	verifier  *FTPVerifier
+	runCtx    context.Context
 }
 
 type FlowRecord struct {
@@ -247,6 +249,14 @@ func main() {
 	cfg, err := loadConfig(defaultEnvPath)
 	if err != nil {
 		log.Fatalf("config load failed: %v", err)
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "ftp-verify" {
+		if err := runFTPVerifyCommand(context.Background(), cfg, os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "FTP doğrulaması başarısız: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "ftp-test" {
@@ -1702,6 +1712,8 @@ func (a *App) Run(ctx context.Context) error {
 	if a.cfg.FTP != nil {
 		archiver := NewFTPArchiver(*a.cfg.FTP, a.cfg.LogRoot, a.cfg.Location, a.cfg.LocalRetentionDays, a.logger.ActivePath)
 		a.archiver = archiver
+		a.verifier = NewFTPVerifier(*a.cfg.FTP, a.cfg.LogRoot, a.cfg.Location)
+		a.runCtx = ctx
 		a.logger.mu.Lock()
 		a.logger.afterSeal = archiver.Notify
 		a.logger.mu.Unlock()
@@ -1783,6 +1795,45 @@ func (a *App) Run(ctx context.Context) error {
 	}
 }
 
+// handleFTPVerify: GET doğrulama işinin durumunu, POST yeni iş başlatır
+// (from, to: YYYY-AA-GG), DELETE süren işi durdurur.
+func (a *App) handleFTPVerify(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if a.verifier == nil {
+		http.Error(w, `{"error":"FTP kapalı"}`, http.StatusConflict)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+	case http.MethodPost:
+		var req struct {
+			From string `json:"from"`
+			To   string `json:"to"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+			http.Error(w, `{"error":"geçersiz istek"}`, http.StatusBadRequest)
+			return
+		}
+		from, err1 := time.ParseInLocation("2006-01-02", strings.TrimSpace(req.From), a.cfg.Location)
+		to, err2 := time.ParseInLocation("2006-01-02", strings.TrimSpace(req.To), a.cfg.Location)
+		if err1 != nil || err2 != nil || to.Before(from) {
+			http.Error(w, `{"error":"geçersiz tarih aralığı"}`, http.StatusBadRequest)
+			return
+		}
+		if err := a.verifier.Start(a.runCtx, from, to); err != nil {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	case http.MethodDelete:
+		a.verifier.Stop()
+	default:
+		http.Error(w, `{"error":"desteklenmeyen yöntem"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(a.verifier.Snapshot())
+}
+
 // ftpStatus, dashboard için FTP durumunu döndürür; FTP kapalıysa yalnız
 // Enabled=false olan bir durum döner.
 func (a *App) ftpStatus() *FTPStatus {
@@ -1802,6 +1853,7 @@ func (a *App) dashboardRouter() http.Handler {
 	mux.Handle("/api/threats", a.basicAuth(http.HandlerFunc(a.handleThreats)))
 	mux.Handle("/api/ip", a.basicAuth(http.HandlerFunc(a.handleIPInfo)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
+	mux.Handle("/api/ftp/verify", a.basicAuth(http.HandlerFunc(a.handleFTPVerify)))
 	// Düz metin kara liste: OPNsense alias URL table için. Basic auth yerine
 	// token (ve opsiyonel IP kısıtı) ile korunur; firewall'lar Basic auth göndermez.
 	mux.Handle("/blocklist", http.HandlerFunc(a.handleBlocklist))
@@ -4811,6 +4863,31 @@ const dashboardHTML = `<!DOCTYPE html>
     }
     .archive-error strong { color: var(--red); }
 
+    .verify-box [hidden] { display: none !important; }
+    .verify-box { display: grid; gap: var(--s3); padding-top: var(--s4); border-top: 1px solid var(--line); }
+    .verify-head { display: grid; gap: 4px; }
+    .verify-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3); }
+    .date-input { min-width: 150px; padding-right: var(--s3); background: var(--bg); color-scheme: dark; cursor: text; }
+    .verify-check { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; font-size: 12px; color: var(--text-2); cursor: pointer; }
+    .verify-check input { accent-color: var(--green); }
+    .verify-status { font-size: 12px; color: var(--text-2); }
+    .verify-status.error { color: var(--red); }
+    .verify-progress { height: 6px; }
+    .verify-summary { display: flex; flex-wrap: wrap; gap: var(--s2); }
+    .vchip { padding: 3px 8px; border: 1px solid var(--line-2); border-radius: 2px; font-size: 12px; color: var(--text-2); }
+    .vchip strong { color: var(--text); }
+    .vchip.ok strong { color: var(--green); }
+    .vchip.warn strong { color: var(--amber); }
+    .vchip.error strong { color: var(--red); }
+    .verify-table { max-height: 40vh; border: 1px solid var(--line); }
+    .verify-table td.detail { white-space: normal; color: var(--text-2); min-width: 28ch; }
+    .vstate { font-weight: 700; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .vstate.ok { color: var(--green); }
+    .vstate.warn { color: var(--amber); }
+    .vstate.error { color: var(--red); }
+    .vstate.missing { color: var(--text-3); }
+
+    .archive-panel.disabled .verify-box,
     .archive-panel.disabled .archive-stats,
     .archive-panel.disabled .archive-foot { opacity: 0.45; }
 
@@ -5074,6 +5151,49 @@ const dashboardHTML = `<!DOCTYPE html>
           <span class="seal-foot" id="ftp-last-scan">Son tarama: -</span>
         </div>
         <div class="archive-error" id="ftp-error" role="alert" hidden></div>
+
+        <div class="verify-box" id="verify-box">
+          <div class="verify-head">
+            <span class="sha-label">FTP paket doğrulaması</span>
+            <span class="panel-meta">Paketler FTP'den indirilir; .log SHA-256 değeri .sha256 ve .tsr ile karşılaştırılır, eksik saatler raporlanır.</span>
+          </div>
+          <form class="toolbar verify-toolbar" id="verify-form">
+            <div class="field">
+              <label for="verify-from">Başlangıç</label>
+              <input type="date" id="verify-from" class="select date-input" required>
+            </div>
+            <div class="field">
+              <label for="verify-to">Bitiş</label>
+              <input type="date" id="verify-to" class="select date-input" required>
+            </div>
+            <button type="submit" class="btn btn-accent" id="verify-start">Doğrula</button>
+            <button type="button" class="btn btn-danger" id="verify-stop" hidden>Durdur</button>
+            <label class="verify-check"><input type="checkbox" id="verify-all"> Tüm saatleri göster</label>
+          </form>
+          <div class="verify-status" id="verify-status" aria-live="polite">Henüz doğrulama yapılmadı.</div>
+          <div class="disk-bar verify-progress" id="verify-progress" hidden><span class="disk-fill logs" id="verify-progress-fill"></span></div>
+          <div class="verify-summary" id="verify-summary" hidden>
+            <span class="vchip ok"><strong id="vs-ok">0</strong> sağlam</span>
+            <span class="vchip warn"><strong id="vs-warn">0</strong> uyarı</span>
+            <span class="vchip error"><strong id="vs-error">0</strong> hata</span>
+            <span class="vchip missing"><strong id="vs-missing">0</strong> FTP'de yok</span>
+            <span class="vchip">paket <strong id="vs-archive">-</strong> · log <strong id="vs-log">-</strong></span>
+          </div>
+          <div class="table-wrap verify-table" id="verify-table-wrap" hidden>
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th scope="col">Saat</th>
+                  <th scope="col">Durum</th>
+                  <th scope="col" class="num">Paket</th>
+                  <th scope="col" class="num">Log</th>
+                  <th scope="col">Ayrıntı</th>
+                </tr>
+              </thead>
+              <tbody id="verify-rows"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -6015,7 +6135,7 @@ const dashboardHTML = `<!DOCTYPE html>
       const scanText = ftp.scanning
         ? 'Tarama sürüyor: ' + (ftp.scan_done || 0) + ' / ' + (ftp.scan_total || 0) + ' saat'
         : 'Son tarama: ' + formatDateTime(ftp.last_scan);
-      $('ftp-last-scan').textContent = scanText + ' · servis açılışından beri ' + (ftp.uploaded_total || 0) + ' yükleme';
+      $('ftp-last-scan').textContent = scanText + ' · servis açılışından beri ' + (ftp.uploaded_total || 0) + ' yükleme (' + (ftp.readback_total || 0) + ' geri okunarak doğrulandı)';
 
       const errEl = $('ftp-error');
       if (ftp.last_error) {
@@ -6025,6 +6145,124 @@ const dashboardHTML = `<!DOCTYPE html>
         errEl.hidden = true;
       }
     }
+
+    // ── FTP paket doğrulaması ──
+    const VERIFY_LABELS = { ok: 'Sağlam', warn: 'Uyarı', error: 'Hata', missing: 'Yok' };
+    let verifyPollTimer = null;
+    let lastVerifyJob = null;
+
+    function localDateString(date) {
+      const pad = (n) => String(n).padStart(2, '0');
+      return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate());
+    }
+
+    function renderVerifyJob(job) {
+      lastVerifyJob = job;
+      const statusEl = $('verify-status');
+      const running = !!job.running;
+      $('verify-start').disabled = running;
+      $('verify-stop').hidden = !running;
+      statusEl.classList.toggle('error', !!job.error);
+
+      if (!job.started_at) {
+        statusEl.textContent = 'Henüz doğrulama yapılmadı.';
+        $('verify-progress').hidden = true;
+        $('verify-summary').hidden = true;
+        $('verify-table-wrap').hidden = true;
+        return;
+      }
+
+      const range = job.from === job.to ? job.from : job.from + ' → ' + job.to;
+      const done = job.done || 0;
+      const total = job.total || 0;
+      if (running) {
+        statusEl.textContent = 'Doğrulanıyor (' + range + '): ' + done + ' / ' + total + ' saat';
+      } else if (job.error) {
+        statusEl.textContent = 'Doğrulama (' + range + ') tamamlanamadı: ' + job.error;
+      } else {
+        statusEl.textContent = 'Doğrulama (' + range + ') tamamlandı · ' + formatDateTime(job.finished_at);
+      }
+      $('verify-progress').hidden = !running;
+      $('verify-progress-fill').style.width = (total > 0 ? done / total * 100 : 0) + '%';
+
+      const sum = job.summary || {};
+      $('verify-summary').hidden = false;
+      $('vs-ok').textContent = sum.ok || 0;
+      $('vs-warn').textContent = sum.warn || 0;
+      $('vs-error').textContent = sum.error || 0;
+      $('vs-missing').textContent = sum.missing || 0;
+      $('vs-archive').textContent = formatBytes(sum.archive_bytes || 0);
+      $('vs-log').textContent = formatBytes(sum.log_bytes || 0);
+
+      const showAll = $('verify-all').checked;
+      const results = (job.results || []).filter((r) => showAll || r.status === 'error' || r.status === 'warn');
+      $('verify-table-wrap').hidden = results.length === 0;
+      $('verify-rows').innerHTML = results.slice().reverse().map((r) => '<tr>'
+        + '<td class="cell-time">' + escapeHtml(r.hour) + ':00</td>'
+        + '<td><span class="vstate ' + escapeHtml(r.status) + '">' + escapeHtml(VERIFY_LABELS[r.status] || r.status) + '</span></td>'
+        + '<td class="num">' + (r.archive_bytes ? escapeHtml(formatBytes(r.archive_bytes)) : '-') + '</td>'
+        + '<td class="num">' + (r.log_bytes ? escapeHtml(formatBytes(r.log_bytes)) : '-') + '</td>'
+        + '<td class="detail" title="' + escapeHtml(r.remote_path) + '">' + escapeHtml(r.detail) + '</td>'
+        + '</tr>').join('');
+
+      if (running) scheduleVerifyPoll();
+    }
+
+    function scheduleVerifyPoll() {
+      if (verifyPollTimer) return;
+      verifyPollTimer = setTimeout(async () => {
+        verifyPollTimer = null;
+        await loadVerifyJob();
+      }, 1000);
+    }
+
+    async function verifyRequest(method, body) {
+      const response = await fetch('/api/ftp/verify', {
+        method,
+        cache: 'no-store',
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Doğrulama isteği başarısız');
+      return data;
+    }
+
+    async function loadVerifyJob() {
+      try {
+        renderVerifyJob(await verifyRequest('GET'));
+      } catch (err) {
+        $('verify-status').textContent = err.message;
+      }
+    }
+
+    (function initVerify() {
+      const today = new Date();
+      const yesterday = new Date(today.getTime() - 86400000);
+      $('verify-from').value = localDateString(yesterday);
+      $('verify-to').value = localDateString(today);
+      $('verify-form').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const from = $('verify-from').value;
+        const to = $('verify-to').value;
+        if (!from || !to || to < from) {
+          $('verify-status').textContent = 'Geçerli bir tarih aralığı seçin.';
+          $('verify-status').classList.add('error');
+          return;
+        }
+        try {
+          renderVerifyJob(await verifyRequest('POST', { from, to }));
+        } catch (err) {
+          $('verify-status').textContent = err.message;
+          $('verify-status').classList.add('error');
+        }
+      });
+      $('verify-stop').addEventListener('click', async () => {
+        try { renderVerifyJob(await verifyRequest('DELETE')); } catch (err) { $('verify-status').textContent = err.message; }
+      });
+      $('verify-all').addEventListener('change', () => { if (lastVerifyJob) renderVerifyJob(lastVerifyJob); });
+      loadVerifyJob();
+    })();
 
     let renderFrame = null;
     let pendingState = null;

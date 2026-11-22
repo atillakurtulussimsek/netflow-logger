@@ -2,8 +2,11 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -150,7 +153,10 @@ func ensureFTPDir(conn *ftp.ServerConn, dir string) {
 
 // uploadVerified, r içeriğini önce geçici adla yükler, sunucudaki boyutu
 // doğrular, sonra nihai ada taşır. Yarım kalan yüklemeler nihai adı bozmaz.
-func uploadVerified(conn *ftp.ServerConn, remotePath string, write func(io.Writer) error) error {
+//
+// verify nil değilse, geçici dosya nihai ada taşınmadan önce çağrılır (geri
+// okuma doğrulaması); hata dönerse geçici dosya silinir.
+func uploadVerified(conn *ftp.ServerConn, remotePath string, write func(io.Writer) error, verify func(tmpPath string) error) error {
 	ensureFTPDir(conn, path.Dir(remotePath))
 
 	tmpPath := remotePath + ".part"
@@ -174,6 +180,13 @@ func uploadVerified(conn *ftp.ServerConn, remotePath string, write func(io.Write
 		return fmt.Errorf("ftp boyut uyuşmazlığı (%s): gönderilen %d, sunucuda %d", tmpPath, counter.n, size)
 	}
 
+	if verify != nil {
+		if err := verify(tmpPath); err != nil {
+			_ = conn.Delete(tmpPath)
+			return err
+		}
+	}
+
 	_ = conn.Delete(remotePath)
 	if err := conn.Rename(tmpPath, remotePath); err != nil {
 		return fmt.Errorf("ftp yeniden adlandırma başarısız (%s): %w", remotePath, err)
@@ -195,37 +208,51 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // writeHourArchive, bir saate ait .log, .sha256 ve .tsr dosyalarını tek bir
 // tar.gz akışına yazar. Mühür dosyaları (.sha256, .tsr) yoksa paket yalnız
 // mevcut dosyalarla oluşturulur.
-func writeHourArchive(w io.Writer, logPath string) error {
+//
+// Pakete yazılan .log içeriğinin SHA-256 değeri ve boyutu döndürülür; geri
+// okuma doğrulaması bununla karşılaştırır.
+func writeHourArchive(w io.Writer, logPath string) (string, int64, error) {
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 
+	hasher := sha256.New()
+	var logBytes int64
 	for i, filePath := range []string{logPath, logPath + ".sha256", logPath + ".tsr"} {
 		if i > 0 && !fileExists(filePath) {
 			continue
 		}
-		if err := addFileToTar(tw, filePath); err != nil {
-			return err
+		var tee io.Writer
+		if i == 0 {
+			tee = hasher
+		}
+		n, err := addFileToTar(tw, filePath, tee)
+		if err != nil {
+			return "", 0, err
+		}
+		if i == 0 {
+			logBytes = n
 		}
 	}
 	if err := tw.Close(); err != nil {
-		return fmt.Errorf("tar kapatılamadı: %w", err)
+		return "", 0, fmt.Errorf("tar kapatılamadı: %w", err)
 	}
 	if err := gz.Close(); err != nil {
-		return fmt.Errorf("gzip kapatılamadı: %w", err)
+		return "", 0, fmt.Errorf("gzip kapatılamadı: %w", err)
 	}
-	return nil
+	return hex.EncodeToString(hasher.Sum(nil)), logBytes, nil
 }
 
-func addFileToTar(tw *tar.Writer, filePath string) error {
+// addFileToTar, dosyayı tar'a ekler; tee nil değilse içerik oraya da yazılır.
+func addFileToTar(tw *tar.Writer, filePath string, tee io.Writer) (int64, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("paketlenecek dosya açılamadı: %w", err)
+		return 0, fmt.Errorf("paketlenecek dosya açılamadı: %w", err)
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return fmt.Errorf("paketlenecek dosya okunamadı: %w", err)
+		return 0, fmt.Errorf("paketlenecek dosya okunamadı: %w", err)
 	}
 	header := &tar.Header{
 		Name:    filepath.Base(filePath),
@@ -234,13 +261,17 @@ func addFileToTar(tw *tar.Writer, filePath string) error {
 		ModTime: info.ModTime(),
 	}
 	if err := tw.WriteHeader(header); err != nil {
-		return fmt.Errorf("tar başlığı yazılamadı: %w", err)
+		return 0, fmt.Errorf("tar başlığı yazılamadı: %w", err)
+	}
+	var dst io.Writer = tw
+	if tee != nil {
+		dst = io.MultiWriter(tw, tee)
 	}
 	// Dosya bu sırada büyüse bile başlıktaki boyut kadar okunur.
-	if _, err := io.CopyN(tw, file, header.Size); err != nil {
-		return fmt.Errorf("tar içeriği yazılamadı: %w", err)
+	if _, err := io.CopyN(dst, file, header.Size); err != nil {
+		return 0, fmt.Errorf("tar içeriği yazılamadı: %w", err)
 	}
-	return nil
+	return header.Size, nil
 }
 
 // remoteArchivePath, bir saatin FTP üzerindeki paket yolunu döndürür.
@@ -264,11 +295,22 @@ func runFTPTest(ctx context.Context, cfg FTPConfig, out io.Writer) error {
 	err = uploadVerified(conn, testPath, func(w io.Writer) error {
 		_, err := w.Write(payload)
 		return err
+	}, func(tmpPath string) error {
+		resp, err := conn.Retr(tmpPath)
+		if err != nil {
+			return fmt.Errorf("test dosyası geri okunamadı: %w", err)
+		}
+		data, readErr := io.ReadAll(resp)
+		closeErr := resp.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(data, payload) {
+			return fmt.Errorf("test dosyası geri okuma uyuşmuyor")
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "  yazma ve boyut doğrulama: OK (%s)\n", testPath)
+	fmt.Fprintf(out, "  yazma, boyut ve geri okuma doğrulama: OK (%s)\n", testPath)
 
 	if err := conn.Delete(testPath); err != nil {
 		return fmt.Errorf("test dosyası silinemedi (%s): %w", testPath, err)
@@ -327,7 +369,9 @@ type FTPStatus struct {
 	NextDeletion string `json:"next_deletion,omitempty"`
 
 	// Servis açıldığından beri toplamlar.
-	UploadedTotal int   `json:"uploaded_total"`
+	UploadedTotal int `json:"uploaded_total"`
+	// ReadbackTotal, geri okunarak doğrulanan yükleme sayısıdır.
+	ReadbackTotal int   `json:"readback_total"`
 	DeletedTotal  int   `json:"deleted_total"`
 	DeletedBytes  int64 `json:"deleted_bytes"`
 }
@@ -524,8 +568,24 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 			}
 			if conn != nil {
 				remotePath := remoteArchivePath(a.cfg.Prefix, h.hour)
+				var logSHA string
+				var logBytes int64
+				uploadConn := conn
 				err := uploadVerified(conn, remotePath, func(w io.Writer) error {
-					return writeHourArchive(w, h.path)
+					var err error
+					logSHA, logBytes, err = writeHourArchive(w, h.path)
+					return err
+				}, func(tmpPath string) error {
+					// Geri okuma: paketi indirip içindeki log'un gönderilenle
+					// birebir aynı olduğunu doğrula.
+					check, _, err := checkRemoteArchive(uploadConn, tmpPath)
+					if err != nil {
+						return fmt.Errorf("geri okuma başarısız: %w", err)
+					}
+					if check.LogSHA != logSHA || check.LogBytes != logBytes {
+						return fmt.Errorf("geri okuma uyuşmuyor: %s", check.Detail)
+					}
+					return nil
 				})
 				if err != nil {
 					fail("%s yüklenemedi: %v (sonraki taramada yeniden denenecek)", h.path, err)
@@ -536,6 +596,7 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 					uploaded = true
 					a.updateStatus(func(st *FTPStatus) {
 						st.UploadedTotal++
+						st.ReadbackTotal++
 						st.LastUpload = a.now().In(a.location).Format(time.RFC3339)
 						st.LastUploadFile = remotePath
 					})

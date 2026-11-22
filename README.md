@@ -79,6 +79,15 @@ Bağlantı testi (bağlanır, öneki oluşturur, test dosyası yükleyip doğrul
 
 `install.sh` FTP ayarlarını kurulumda sorar ve derlemeden sonra bu testi otomatik çalıştırır.
 
+### Doğrulama
+
+- Her yükleme, geçici `.part` dosyası nihai ada taşınmadan önce FTP'den geri indirilir; paketteki log'un SHA-256 değeri gönderilenle birebir aynı değilse yükleme başarısız sayılır ve yerel dosya silinmez.
+- Belirli bir tarih aralığındaki paketler dashboard'daki "FTP paket doğrulaması" bölümünden veya komutla kontrol edilebilir. Her paket indirilir, `.log` SHA-256 değeri `.sha256` ile karşılaştırılır, `.tsr` zaman damgasının bu özeti içerdiği denetlenir ve FTP'de olmayan saatler raporlanır.
+
+`./netflow-logger ftp-verify --from 2026-11-01 --to 2026-11-22`
+
+`--all` tüm saatleri listeler (varsayılan: yalnız hata ve uyarılar). Hata bulunursa komut 1 koduyla çıkar.
+
 ## Geliştirme Ortamında Çalıştırma
 
 Go yüklü bir ortamda aşağıdaki komutları kullan:
