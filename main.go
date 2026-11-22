@@ -101,6 +101,11 @@ type Config struct {
 	// BlocklistAllowNets tanımlıysa /blocklist endpoint'ine yalnızca bu ağlardan
 	// (ör. OPNsense WAN IP'si) gelen istekler kabul edilir.
 	BlocklistAllowNets []*net.IPNet
+	// FTP, saatlik log paketlerinin yükleneceği sunucudur; nil ise kapalıdır.
+	FTP *FTPConfig
+	// LocalRetentionDays, FTP'ye yüklenmiş saatlerin yerelde tutulacağı gün
+	// sayısıdır; 0 yerel silmeyi kapatır.
+	LocalRetentionDays int
 }
 
 type App struct {
@@ -140,6 +145,8 @@ type HourlyLogger struct {
 	currentPath string
 	file        *os.File
 	sealWG      sync.WaitGroup
+	// afterSeal, bir saat başarıyla mühürlendikten sonra çağrılır (FTP).
+	afterSeal func()
 }
 
 type DashboardHub struct {
@@ -237,6 +244,18 @@ func main() {
 	cfg, err := loadConfig(defaultEnvPath)
 	if err != nil {
 		log.Fatalf("config load failed: %v", err)
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "ftp-test" {
+		if cfg.FTP == nil {
+			fmt.Fprintln(os.Stderr, "FTP kapalı: .env içinde FTP_ENABLED=true değil.")
+			os.Exit(1)
+		}
+		if err := runFTPTest(context.Background(), *cfg.FTP, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "FTP testi başarısız: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	dashboard := NewDashboardHub(dashboardMaxRecords)
@@ -405,6 +424,15 @@ func loadConfig(envPath string) (Config, error) {
 		return Config{}, err
 	}
 
+	ftpCfg, err := loadFTPConfig(env)
+	if err != nil {
+		return Config{}, err
+	}
+	retentionDays, err := loadLocalRetentionDays(env["LOCAL_RETENTION_DAYS"])
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		ListenAddress:      firstNonEmpty(env["NETFLOW_LISTEN_ADDRESS"], defaultListenAddress),
 		DashboardAddress:   firstNonEmpty(env["DASHBOARD_ADDRESS"], defaultDashboardAddress),
@@ -416,6 +444,8 @@ func loadConfig(envPath string) (Config, error) {
 		DebugFlowMapping:   strings.EqualFold(strings.TrimSpace(env["DEBUG_FLOW_MAPPING"]), "true"),
 		BlocklistToken:     strings.TrimSpace(env["BLOCKLIST_TOKEN"]),
 		BlocklistAllowNets: allowNets,
+		FTP:                ftpCfg,
+		LocalRetentionDays: retentionDays,
 	}
 
 	if cfg.DashboardUser == "" || cfg.DashboardPass == "" {
@@ -1693,6 +1723,16 @@ func (a *App) Run(ctx context.Context) error {
 		_ = httpServer.Shutdown(shutdownCtx)
 		_ = pc.Close()
 	}()
+
+	// FTP arşivleyici: mühürlenen saatleri paketleyip yükler, süresi dolanları
+	// yerelden siler.
+	if a.cfg.FTP != nil {
+		archiver := NewFTPArchiver(*a.cfg.FTP, a.cfg.LogRoot, a.cfg.Location, a.cfg.LocalRetentionDays, a.logger.ActivePath)
+		a.logger.mu.Lock()
+		a.logger.afterSeal = archiver.Notify
+		a.logger.mu.Unlock()
+		go archiver.Run(ctx)
+	}
 
 	// Tehdit analizcisinin bakım döngüsü: boşta kalan kaynakları ve süresi dolan
 	// uyarıları arka planda periyodik olarak temizler.
@@ -3323,15 +3363,27 @@ func (h *HourlyLogger) closeCurrentLocked(seal bool) error {
 		// sealHourlyLog operates only on the closed file path, so it is safe
 		// to run without the lock.
 		h.sealWG.Add(1)
+		afterSeal := h.afterSeal
 		go func(path string) {
 			defer h.sealWG.Done()
 			if err := h.sealHourlyLog(path); err != nil {
 				log.Printf("seal hourly log failed for %s: %v", path, err)
+				return
+			}
+			if afterSeal != nil {
+				afterSeal()
 			}
 		}(currentPath)
 	}
 
 	return nil
+}
+
+// ActivePath, şu an yazılan log dosyasının yolunu döndürür.
+func (h *HourlyLogger) ActivePath() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.currentPath
 }
 
 // WaitForSeals blocks until all in-flight asynchronous seal operations finish.

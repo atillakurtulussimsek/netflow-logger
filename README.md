@@ -58,6 +58,26 @@ Desteklenen değişkenler:
 - `TIMEZONE`: zaman dilimi, varsayılan `Europe/Istanbul`
 - `BLOCKLIST_TOKEN`: `/blocklist` düz metin endpoint erişim token'ı; boşsa endpoint devre dışı
 - `BLOCKLIST_ALLOW_IPS`: (opsiyonel) `/blocklist` için izin verilen IP/CIDR listesi (virgülle ayrılır)
+- `FTP_ENABLED`: `true` ise saatlik loglar FTP sunucusuna yüklenir
+- `FTP_HOST`, `FTP_PORT` (varsayılan `21`), `FTP_USER`, `FTP_PASSWORD`: FTP bağlantı bilgileri
+- `FTP_PREFIX`: (opsiyonel) FTP üzerindeki kök klasör; paketler `[FTP_PREFIX/]YYYY/MM/DD/HH.tar.gz` yoluna yazılır
+- `FTP_BACKFILL`: `true` ise FTP açılmadan önce oluşmuş loglar da geriye dönük yüklenir
+- `LOCAL_RETENTION_DAYS`: FTP'ye yüklenmiş saatlerin yerelde tutulacağı gün sayısı, varsayılan `7`; `0` yerel silmeyi kapatır
+
+## FTP Arşivleme
+
+Her saat kapanıp mühürlendiğinde (SHA-256 + TSA) `HH.log`, `HH.log.sha256` ve `HH.log.tsr` tek bir `HH.tar.gz` paketine konur ve FTP'ye yüklenir. Yükleme önce `.part` adıyla yapılır, sunucudaki boyut doğrulanır, ardından nihai ada taşınır. Başarılı yüklemeler yerelde `HH.log.ftp` işaret dosyasıyla kaydedilir; saat sonradan yeniden mühürlenirse paket yeniden yüklenir.
+
+- Bağlantı yoksa veya yükleme başarısızsa her 5 dakikada yeniden denenir; yüklenmemiş hiçbir saat yerelden silinmez.
+- Orijinal dosyalar yerelde kalır; yalnızca FTP'ye yüklenmiş saatler `LOCAL_RETENTION_DAYS` dolunca yerelden silinir.
+- `FTP_BACKFILL=false` iken FTP'nin ilk açıldığı andan (`LOG_ROOT/ftp_since`) önceki saatler yüklenmez.
+- Mühürü tamamlanmamış (`.tsr` dosyası olmayan) saatler yüklenmez.
+
+Bağlantı testi (bağlanır, öneki oluşturur, test dosyası yükleyip doğrular ve siler):
+
+`./netflow-logger ftp-test`
+
+`install.sh` FTP ayarlarını kurulumda sorar ve derlemeden sonra bu testi otomatik çalıştırır.
 
 ## Geliştirme Ortamında Çalıştırma
 

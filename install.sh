@@ -119,6 +119,9 @@ write_env_file() {
         ;;
       *)
         echo "Mevcut .env korunuyor."
+        if ! grep -q '^FTP_ENABLED=' "${ENV_FILE}"; then
+          configure_ftp
+        fi
         chown "${SERVICE_USER}:${SERVICE_GROUP}" "${ENV_FILE}"
         chmod 640 "${ENV_FILE}"
         return 0
@@ -145,6 +148,8 @@ TSA_URL=${tsa_url}
 TIMEZONE=${timezone}
 EOF
 
+  configure_ftp
+
   if grep -qv '=' "${ENV_FILE}"; then
     echo ".env oluşturulurken geçersiz satır tespit edildi. Lütfen scripti tekrar çalıştırın."
     exit 1
@@ -152,6 +157,80 @@ EOF
 
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${ENV_FILE}"
   chmod 640 "${ENV_FILE}"
+}
+
+prompt_yes_no() {
+  local prompt_text="$1"
+  local default_value="$2"
+  local result=""
+  read -r -p "${prompt_text} [${default_value}]: " result </dev/tty
+  result="${result:-${default_value}}"
+  case "${result}" in
+    e|E|evet|EVET|y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# configure_ftp, FTP arşivleme ayarlarını sorar ve .env sonuna ekler.
+configure_ftp() {
+  sed -i -E '/^(FTP_ENABLED|FTP_HOST|FTP_PORT|FTP_USER|FTP_PASSWORD|FTP_PREFIX|FTP_BACKFILL|LOCAL_RETENTION_DAYS)=/d' "${ENV_FILE}"
+
+  if ! prompt_yes_no "Saatlik loglar FTP sunucusuna yüklensin mi? (e/h)" "h"; then
+    printf 'FTP_ENABLED=false\n' >> "${ENV_FILE}"
+    return 0
+  fi
+
+  local ftp_host="" ftp_port ftp_user="" ftp_pass ftp_prefix ftp_backfill retention_days
+  while [[ -z "${ftp_host}" ]]; do
+    read -r -p "FTP sunucusu: " ftp_host </dev/tty
+  done
+  ftp_port="$(prompt_value "FTP portu" "21")"
+  while [[ -z "${ftp_user}" ]]; do
+    read -r -p "FTP kullanıcı adı: " ftp_user </dev/tty
+  done
+  ftp_pass="$(prompt_secret "FTP parolası")"
+  read -r -p "FTP klasör öneki (boş bırakılabilir, ör. firma1/netflow): " ftp_prefix </dev/tty
+  ftp_backfill="false"
+  if prompt_yes_no "Şimdiye kadar oluşmuş loglar da geriye dönük yüklensin mi? (e/h)" "h"; then
+    ftp_backfill="true"
+  fi
+  retention_days="$(prompt_value "FTP'ye yüklenen loglar yerelde kaç gün tutulsun? (0 = silme)" "7")"
+
+  {
+    printf 'FTP_ENABLED=true\n'
+    printf 'FTP_HOST=%s\n' "${ftp_host}"
+    printf 'FTP_PORT=%s\n' "${ftp_port}"
+    printf 'FTP_USER=%s\n' "${ftp_user}"
+    printf 'FTP_PASSWORD=%s\n' "${ftp_pass}"
+    printf 'FTP_PREFIX=%s\n' "${ftp_prefix}"
+    printf 'FTP_BACKFILL=%s\n' "${ftp_backfill}"
+    printf 'LOCAL_RETENTION_DAYS=%s\n' "${retention_days}"
+  } >> "${ENV_FILE}"
+}
+
+# test_ftp_connection, FTP açıksa derlenen binary ile bağlantıyı uçtan uca dener.
+test_ftp_connection() {
+  if ! grep -q '^FTP_ENABLED=true' "${ENV_FILE}"; then
+    return 0
+  fi
+
+  while true; do
+    if (cd "${INSTALL_DIR}" && runuser -u "${SERVICE_USER}" -- "${BIN_PATH}" ftp-test); then
+      return 0
+    fi
+    echo "FTP bağlantı testi başarısız."
+    if prompt_yes_no "FTP ayarları yeniden girilsin mi? (e/h)" "e"; then
+      configure_ftp
+      chown "${SERVICE_USER}:${SERVICE_GROUP}" "${ENV_FILE}"
+      chmod 640 "${ENV_FILE}"
+      if ! grep -q '^FTP_ENABLED=true' "${ENV_FILE}"; then
+        return 0
+      fi
+    else
+      echo "Uyarı: FTP ayarları hatalı olabilir; servis yüklemeyi her 5 dakikada yeniden deneyecek."
+      return 0
+    fi
+  done
 }
 
 build_binary() {
@@ -222,6 +301,7 @@ main() {
   prepare_permissions
   write_env_file
   build_binary
+  test_ftp_connection
   write_service_file
   enable_and_start_service
 
