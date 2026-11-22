@@ -288,7 +288,7 @@ func TestFTPArchiverUploadsPackagesAndRetention(t *testing.T) {
 	archiver.now = func() time.Time { return now }
 
 	// Geriye dönük yükleme kapalı: FTP'nin açıldığı andan önceki saatler atlanır.
-	since := recentHour
+	since := shaOnlyHourStart(now)
 	archiver.RunOnce(context.Background(), since)
 
 	if _, ok := srv.file(remoteArchivePath(cfg.Prefix, oldHour)); ok {
@@ -311,8 +311,37 @@ func TestFTPArchiverUploadsPackagesAndRetention(t *testing.T) {
 	if _, err := os.Stat(recentPath); err != nil {
 		t.Fatal("saklama süresi dolmamış saat yerelde kalmalı")
 	}
-	if len(srv.fileNames()) != 1 {
-		t.Fatalf("yalnız bir paket olmalı (mühürsüz/aktif saat yüklenmemeli): %v", srv.fileNames())
+	// Mühürsüz saat de (yalnız .log ile) yüklenir; aktif saat yüklenmez.
+	data, ok = srv.file("netflow/site1/2026/11/22/13.tar.gz")
+	if !ok {
+		t.Fatalf("mühürsüz saat yüklenmeli; sunucudaki dosyalar: %v", srv.fileNames())
+	}
+	if files := readTarGz(t, data); len(files) != 1 || files["13.log"] != "x\n" {
+		t.Fatalf("mühürsüz paket içeriği hatalı: %v", files)
+	}
+	if len(srv.fileNames()) != 2 {
+		t.Fatalf("aktif saat yüklenmemeli: %v", srv.fileNames())
+	}
+
+	// Mühür sonradan tamamlanırsa paket mühür dosyalarıyla yeniden yüklenir.
+	writeSealedHour(t, root, unsealedHour, "x\n", "eee")
+	archiver.RunOnce(context.Background(), since)
+	data, _ = srv.file("netflow/site1/2026/11/22/13.tar.gz")
+	if files := readTarGz(t, data); len(files) != 3 || files["13.log.tsr"] != "tsr-eee" {
+		t.Fatalf("mühürlenen saat yeniden yüklenmeli: %v", files)
+	}
+
+	// Yalnız .sha256 olan (TSA başarısız) saat de yüklenir.
+	shaOnlyHour := now.Add(-3 * time.Hour).Truncate(time.Hour)
+	shaOnlyPath := writeSealedHour(t, root, shaOnlyHour, "sha-only\n", "fff")
+	_ = os.Remove(shaOnlyPath + ".tsr")
+	archiver.RunOnce(context.Background(), since)
+	data, ok = srv.file("netflow/site1/2026/11/22/11.tar.gz")
+	if !ok {
+		t.Fatal(".tsr olmayan saat yüklenmeli")
+	}
+	if files := readTarGz(t, data); len(files) != 2 || files["11.log.sha256"] != "fff\n" {
+		t.Fatalf(".tsr olmayan paket içeriği hatalı: %v", files)
 	}
 
 	// Geriye dönük yükleme açık: eski saat yüklenir ve süresi dolduğu için silinir.
@@ -337,6 +366,10 @@ func TestFTPArchiverUploadsPackagesAndRetention(t *testing.T) {
 	if readTarGz(t, data)["12.log"] != "recent-data\nlate\n" || readMarker(recentPath) != "ddd" {
 		t.Fatal("yeniden mühürlenen saat yeniden yüklenmeli")
 	}
+}
+
+func shaOnlyHourStart(now time.Time) time.Time {
+	return now.Add(-3 * time.Hour).Truncate(time.Hour)
 }
 
 func TestFTPArchiverKeepsLocalWhenServerDown(t *testing.T) {

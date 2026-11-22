@@ -193,12 +193,16 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 }
 
 // writeHourArchive, bir saate ait .log, .sha256 ve .tsr dosyalarını tek bir
-// tar.gz akışına yazar.
+// tar.gz akışına yazar. Mühür dosyaları (.sha256, .tsr) yoksa paket yalnız
+// mevcut dosyalarla oluşturulur.
 func writeHourArchive(w io.Writer, logPath string) error {
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 
-	for _, filePath := range []string{logPath, logPath + ".sha256", logPath + ".tsr"} {
+	for i, filePath := range []string{logPath, logPath + ".sha256", logPath + ".tsr"} {
+		if i > 0 && !fileExists(filePath) {
+			continue
+		}
 		if err := addFileToTar(tw, filePath); err != nil {
 			return err
 		}
@@ -371,8 +375,9 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 		if !h.hour.Before(currentHour) || h.path == active {
 			continue
 		}
-		digest, sealed := readSealDigest(h.path)
-		if !sealed {
+		digest, err := hourUploadKey(h.path)
+		if err != nil {
+			log.Printf("ftp: %s okunamadı: %v", h.path, err)
 			continue
 		}
 		uploaded := readMarker(h.path) == digest
@@ -484,18 +489,31 @@ func (a *FTPArchiver) scanHourLogs() ([]hourLog, error) {
 	return result, nil
 }
 
-// readSealDigest, saatin mühür (SHA-256 + TSR) dosyaları tamamsa SHA-256
-// değerini döndürür.
-func readSealDigest(logPath string) (string, bool) {
-	if _, err := os.Stat(logPath + ".tsr"); err != nil {
-		return "", false
-	}
-	data, err := os.ReadFile(logPath + ".sha256")
+// hourUploadKey, saatin yüklenecek içeriğini temsil eden anahtarı döndürür.
+// İşaret dosyasındaki anahtar bununla uyuşmuyorsa paket (yeniden) yüklenir:
+//   - mühür tamsa (.sha256 + .tsr): SHA-256 değeri
+//   - yalnız .sha256 varsa: SHA-256 + "+notsr" (TSR sonradan gelirse yeniden yüklenir)
+//   - mühür yoksa: dosya boyutu ve değişiklik zamanı (her taramada hash
+//     hesaplamamak için)
+func hourUploadKey(logPath string) (string, error) {
+	info, err := os.Stat(logPath)
 	if err != nil {
-		return "", false
+		return "", err
 	}
-	digest := strings.TrimSpace(string(data))
-	return digest, digest != ""
+	if data, err := os.ReadFile(logPath + ".sha256"); err == nil {
+		if digest := strings.TrimSpace(string(data)); digest != "" {
+			if fileExists(logPath + ".tsr") {
+				return digest, nil
+			}
+			return digest + "+notsr", nil
+		}
+	}
+	return fmt.Sprintf("nosha:%d:%d", info.Size(), info.ModTime().UnixNano()), nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func readMarker(logPath string) string {

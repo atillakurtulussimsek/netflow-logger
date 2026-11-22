@@ -3368,8 +3368,8 @@ func (h *HourlyLogger) closeCurrentLocked(seal bool) error {
 			defer h.sealWG.Done()
 			if err := h.sealHourlyLog(path); err != nil {
 				log.Printf("seal hourly log failed for %s: %v", path, err)
-				return
 			}
+			// Mühür başarısız olsa da saat kapandı; FTP yüklemesini tetikle.
 			if afterSeal != nil {
 				afterSeal()
 			}

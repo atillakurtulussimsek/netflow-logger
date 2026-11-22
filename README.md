@@ -71,7 +71,7 @@ Her saat kapanıp mühürlendiğinde (SHA-256 + TSA) `HH.log`, `HH.log.sha256` v
 - Bağlantı yoksa veya yükleme başarısızsa her 5 dakikada yeniden denenir; yüklenmemiş hiçbir saat yerelden silinmez.
 - Orijinal dosyalar yerelde kalır; yalnızca FTP'ye yüklenmiş saatler `LOCAL_RETENTION_DAYS` dolunca yerelden silinir.
 - `FTP_BACKFILL=false` iken FTP'nin ilk açıldığı andan (`LOG_ROOT/ftp_since`) önceki saatler yüklenmez.
-- Mühürü tamamlanmamış (`.tsr` dosyası olmayan) saatler yüklenmez.
+- Mühürü tamamlanmamış saatler de (eksik `.sha256`/`.tsr` olmadan) yüklenir; mühür sonradan tamamlanırsa paket yeniden yüklenir.
 
 Bağlantı testi (bağlanır, öneki oluşturur, test dosyası yükleyip doğrular ve siler):
 
