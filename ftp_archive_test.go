@@ -585,3 +585,19 @@ func TestFTPArchiverDeletesExpiredWhenMarkerUnwritable(t *testing.T) {
 		t.Fatalf("tarama ilerlemesi hatalı: %+v", st)
 	}
 }
+
+// Yüklenecek saat olmasa da tarama sunucuya erişimi denetler.
+func TestFTPArchiverHealthCheckWithoutUploads(t *testing.T) {
+	srv := newFakeFTPServer(t)
+	cfg := srv.config()
+	archiver := NewFTPArchiver(cfg, t.TempDir(), time.UTC, 7, nil)
+	archiver.RunOnce(context.Background(), time.Now())
+	if st := archiver.Status(); st.State != "ok" {
+		t.Fatalf("sunucu erişilebilirken durum ok olmalı: %+v", st)
+	}
+	archiver.cfg.Password = "yanlis"
+	archiver.RunOnce(context.Background(), time.Now())
+	if st := archiver.Status(); st.State != "error" || st.LastError == "" {
+		t.Fatalf("sunucuya erişilemiyorsa durum hata olmalı: %+v", st)
+	}
+}

@@ -1795,6 +1795,29 @@ func (a *App) Run(ctx context.Context) error {
 	}
 }
 
+// handleFTPTest, FTP bağlantısını uçtan uca dener (POST) ve çıktıyı döndürür.
+func (a *App) handleFTPTest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"desteklenmeyen yöntem"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if a.cfg.FTP == nil {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "FTP kapalı"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	var out bytes.Buffer
+	err := runFTPTest(ctx, *a.cfg.FTP, &out)
+	resp := map[string]any{"ok": err == nil, "output": strings.TrimSpace(out.String())}
+	if err != nil {
+		resp["error"] = err.Error()
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // handleFTPVerify: GET doğrulama işinin durumunu, POST yeni iş başlatır
 // (from, to: YYYY-AA-GG), DELETE süren işi durdurur.
 func (a *App) handleFTPVerify(w http.ResponseWriter, r *http.Request) {
@@ -1854,6 +1877,7 @@ func (a *App) dashboardRouter() http.Handler {
 	mux.Handle("/api/ip", a.basicAuth(http.HandlerFunc(a.handleIPInfo)))
 	mux.Handle("/events", a.basicAuth(http.HandlerFunc(a.handleDashboardEvents)))
 	mux.Handle("/api/ftp/verify", a.basicAuth(http.HandlerFunc(a.handleFTPVerify)))
+	mux.Handle("/api/ftp/test", a.basicAuth(http.HandlerFunc(a.handleFTPTest)))
 	// Düz metin kara liste: OPNsense alias URL table için. Basic auth yerine
 	// token (ve opsiyonel IP kısıtı) ile korunur; firewall'lar Basic auth göndermez.
 	mux.Handle("/blocklist", http.HandlerFunc(a.handleBlocklist))
@@ -3629,684 +3653,838 @@ const dashboardHTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="dark">
-  <title>netflow logger panel</title>
+  <meta name="color-scheme" content="light dark">
+  <title>NetFlow Logger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <script>
+    // Tema, ilk boyamadan önce uygulanır (açık tema varsayılan).
+    (function () {
+      var theme = 'light';
+      try { theme = localStorage.getItem('netflow-theme') || 'light'; } catch (e) {}
+      document.documentElement.setAttribute('data-theme', theme === 'dark' ? 'dark' : 'light');
+    })();
+  </script>
   <style>
-    /* ── Tasarım belirteçleri ─────────────────────────────────────────── */
+    /* ══ Tasarım belirteçleri (design tokens) ═════════════════════════════
+       Renkleri, boşlukları ve köşe yuvarlaklıklarını buradan değiştirin.
+       Açık tema varsayılandır; koyu tema [data-theme="dark"] ile gelir. */
     :root {
-      color-scheme: dark;
-      --bg: #060809;
-      --surface: #0b1011;
-      --surface-2: #0f1617;
-      --surface-3: #152021;
-      --line: #1b2729;
-      --line-2: #2a3a3c;
-      --text: #d6e4df;
-      --text-2: #a0b5ae;
-      --text-3: #72887f;
-      --green: #3ee08a;
-      --green-rgb: 62, 224, 138;
-      --green-soft: rgba(62, 224, 138, 0.10);
-      --cyan: #5ccaf2;
-      --cyan-soft: rgba(92, 202, 242, 0.10);
-      --amber: #f5b83d;
-      --amber-soft: rgba(245, 184, 61, 0.10);
-      --red: #ff6170;
-      --red-soft: rgba(255, 97, 112, 0.10);
-      --violet: #b59dff;
-      --violet-soft: rgba(181, 157, 255, 0.10);
-      --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
-      --radius: 3px;
+      color-scheme: light;
+
+      /* Zemin ve yüzeyler */
+      --bg: #f7f8fa;
+      --surface: #ffffff;
+      --surface-2: #f9fafb;
+      --surface-3: #f1f3f6;
+      --line: #e7e9ee;
+      --line-2: #d9dde4;
+      --overlay: rgba(17, 24, 39, 0.32);
+
+      /* Metin */
+      --text: #16181d;
+      --text-2: #4b5260;
+      --text-3: #687082;
+      --text-on-accent: #ffffff;
+
+      /* Durum renkleri: -fg metin, -bg yumuşak zemin, -dot nokta, -line kenar */
+      --success-fg: #18794e;
+      --success-bg: #e9f7ef;
+      --success-dot: #2fb36f;
+      --success-line: #bfe6cf;
+      --warn-fg: #8a5300;
+      --warn-bg: #fdf4e3;
+      --warn-dot: #e3a52a;
+      --warn-line: #f3d9a4;
+      --danger-fg: #b4233f;
+      --danger-bg: #fdedf0;
+      --danger-dot: #e55b72;
+      --danger-line: #f5c2cc;
+      --info-fg: #4338ca;
+      --info-bg: #eef0ff;
+      --info-dot: #6366f1;
+      --info-line: #cdd2fb;
+      --violet-fg: #6d3fc0;
+      --violet-bg: #f3eefc;
+      --neutral-bg: #f1f3f6;
+      --neutral-dot: #a3aab8;
+
+      /* Grafik ve disk çubukları */
+      --chart: #2fb36f;
+      --disk-logs: #6366f1;
+      --disk-other: #b4bbc8;
+
+      /* Grafik JS'i --green ve --green-rgb okur (canvas). */
+      --green: #2fb36f;
+      --green-rgb: 47, 179, 111;
+
+      /* Tipografi */
+      --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+      /* Boşluk, köşe, gölge, hareket */
+      --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px; --s7: 32px;
+      --radius-sm: 8px;
+      --radius: 10px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --radius-pill: 999px;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.04);
+      --shadow-lg: 0 12px 32px rgba(16, 24, 40, 0.12), 0 2px 6px rgba(16, 24, 40, 0.06);
       --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
       --dur: 180ms;
-      --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px;
+      --content-width: 1440px;
     }
 
-    *, *::before, *::after { box-sizing: border-box; }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0f1115;
+      --surface: #16181d;
+      --surface-2: #1a1d23;
+      --surface-3: #21252c;
+      --line: #262a33;
+      --line-2: #333844;
+      --overlay: rgba(5, 7, 10, 0.6);
 
+      --text: #e7e9ee;
+      --text-2: #b0b6c2;
+      --text-3: #8b93a3;
+      --text-on-accent: #ffffff;
+
+      --success-fg: #6fd8a2;
+      --success-bg: rgba(77, 200, 138, 0.12);
+      --success-dot: #4dc88a;
+      --success-line: rgba(77, 200, 138, 0.3);
+      --warn-fg: #f2c46d;
+      --warn-bg: rgba(242, 184, 77, 0.12);
+      --warn-dot: #e9b04c;
+      --warn-line: rgba(242, 184, 77, 0.32);
+      --danger-fg: #f593a4;
+      --danger-bg: rgba(238, 104, 126, 0.13);
+      --danger-dot: #ee687e;
+      --danger-line: rgba(238, 104, 126, 0.34);
+      --info-fg: #a9b3ff;
+      --info-bg: rgba(129, 140, 248, 0.14);
+      --info-dot: #818cf8;
+      --info-line: rgba(129, 140, 248, 0.34);
+      --violet-fg: #c4a8ff;
+      --violet-bg: rgba(167, 139, 250, 0.13);
+      --neutral-bg: #23272f;
+      --neutral-dot: #6b7282;
+
+      --chart: #4dc88a;
+      --disk-logs: #818cf8;
+      --disk-other: #4b5263;
+      --green: #4dc88a;
+      --green-rgb: 77, 200, 138;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+      --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    /* ══ Temel ═════════════════════════════════════════════════════════ */
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html { -webkit-text-size-adjust: 100%; }
 
     body {
       margin: 0;
       min-height: 100vh;
-      background-color: var(--bg);
-      background-image:
-        linear-gradient(rgba(var(--green-rgb), 0.025) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(var(--green-rgb), 0.025) 1px, transparent 1px);
-      background-size: 32px 32px;
+      background: var(--bg);
       color: var(--text);
-      font-family: var(--font-mono);
+      font-family: var(--font-sans);
       font-size: 14px;
       line-height: 1.5;
-      font-variant-numeric: tabular-nums;
-      font-feature-settings: "zero" 1, "calt" 0;
+      font-feature-settings: "cv11", "ss01";
+      -webkit-font-smoothing: antialiased;
+      transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
     }
 
-    /* CRT tarama çizgileri: çok düşük opaklıkta, yalnızca doku için. */
-    body::after {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 3px);
-      opacity: 0.35;
-      z-index: 100;
-    }
-
-    ::selection { background: rgba(var(--green-rgb), 0.28); color: #fff; }
-
+    ::selection { background: var(--info-bg); color: var(--text); }
     button, input, select { font: inherit; color: inherit; }
     button { cursor: pointer; touch-action: manipulation; }
     button:disabled { cursor: not-allowed; }
-
-    :focus-visible {
-      outline: 2px solid var(--green);
-      outline-offset: 2px;
-    }
-
+    :focus-visible { outline: 2px solid var(--info-dot); outline-offset: 2px; border-radius: 6px; }
     svg { display: block; flex: none; }
-
-    .mono { font-family: var(--font-mono); }
+    .mono, code { font-family: var(--font-mono); font-size: 0.93em; }
+    .num-tab { font-variant-numeric: tabular-nums; }
 
     .skip-link {
       position: absolute;
       left: var(--s4);
       top: -48px;
       padding: var(--s2) var(--s3);
-      background: var(--green);
-      color: #041109;
-      font-weight: 700;
+      border-radius: var(--radius);
+      background: var(--info-dot);
+      color: var(--text-on-accent);
+      font-weight: 600;
       z-index: 200;
       transition: top var(--dur) var(--ease);
     }
     .skip-link:focus { top: var(--s2); }
 
-    /* ── Üst çubuk ───────────────────────────────────────────────────── */
+    /* ══ Üst başlık ════════════════════════════════════════════════════ */
     .topbar {
       position: sticky;
       top: 0;
       z-index: 40;
-      background: rgba(6, 8, 9, 0.92);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
+      background: color-mix(in srgb, var(--surface) 86%, transparent);
+      backdrop-filter: saturate(160%) blur(10px);
+      -webkit-backdrop-filter: saturate(160%) blur(10px);
       border-bottom: 1px solid var(--line);
     }
-
     .topbar-inner {
-      width: min(1600px, 100%);
+      width: min(var(--content-width), 100%);
       margin: 0 auto;
-      padding: var(--s3) var(--s5);
+      padding: 14px var(--s6);
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: var(--s4);
     }
-
     .brand { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
-
     .brand-mark {
-      width: 36px; height: 36px;
+      width: 38px; height: 38px;
       display: grid; place-items: center;
-      border: 1px solid rgba(var(--green-rgb), 0.45);
-      border-radius: var(--radius);
-      color: var(--green);
-      background: var(--green-soft);
+      border-radius: var(--radius-md);
+      background: var(--info-bg);
+      color: var(--info-fg);
     }
     .brand-mark svg { width: 20px; height: 20px; }
-
     .brand-text { min-width: 0; }
-
-    .brand-title {
-      margin: 0;
-      font-size: 16px;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-      color: var(--text);
-      display: flex;
-      align-items: center;
-      white-space: nowrap;
-    }
-    .brand-title .host { color: var(--green); }
-    .brand-title .sep { color: var(--text-3); }
-    .brand-title .path { color: var(--cyan); }
-
-    .caret {
-      display: inline-block;
-      width: 8px; height: 16px;
-      margin-left: 6px;
-      background: var(--green);
-      animation: blink 1.1s steps(1) infinite;
-    }
-
-    .brand-sub {
-      margin: 2px 0 0;
-      font-size: 12px;
-      color: var(--text-3);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
+    .brand-title { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .brand-sub { margin: 1px 0 0; font-size: 12.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .actions { display: flex; align-items: center; gap: var(--s2); flex: none; }
 
-    /* ── Butonlar ────────────────────────────────────────────────────── */
+    /* ══ Butonlar ══════════════════════════════════════════════════════ */
     .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: var(--s2);
-      min-height: 40px;
-      padding: 0 var(--s4);
+      min-height: 36px;
+      padding: 0 14px;
       border: 1px solid var(--line-2);
       border-radius: var(--radius);
-      background: var(--surface-2);
+      background: var(--surface);
       color: var(--text-2);
       font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      font-weight: 500;
       white-space: nowrap;
-      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
+      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
     }
     .btn svg { width: 16px; height: 16px; }
-    .btn:hover:not(:disabled) { color: var(--text); border-color: var(--text-3); background: var(--surface-3); }
+    .btn:hover:not(:disabled) { color: var(--text); background: var(--surface-2); border-color: var(--line-2); }
     .btn:active:not(:disabled) { transform: translateY(1px); }
-    .btn:disabled { opacity: 0.4; }
+    .btn:disabled { opacity: 0.45; }
 
-    .btn-live .dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: var(--text-3);
-    }
-    .btn-live.live {
-      color: var(--green);
-      border-color: rgba(var(--green-rgb), 0.5);
-      background: var(--green-soft);
-    }
-    .btn-live.live .dot {
-      background: var(--green);
-      box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0.6);
-      animation: pulse 1.8s var(--ease) infinite;
-    }
+    /* "Canlı" pill'i */
+    .btn-live { border-radius: var(--radius-pill); padding: 0 14px 0 12px; }
+    .btn-live .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--neutral-dot); }
+    .btn-live.live { color: var(--success-fg); background: var(--success-bg); border-color: var(--success-line); }
+    .btn-live.live:hover:not(:disabled) { color: var(--success-fg); background: var(--success-bg); border-color: var(--success-dot); }
+    .btn-live.live .dot { background: var(--success-dot); animation: softPulse 2s var(--ease) infinite; }
 
+    /* Güvenlik butonu */
     .btn-threat .count {
-      min-width: 22px;
-      padding: 1px 6px;
-      border-radius: 2px;
-      background: var(--red);
-      color: #1a0306;
-      font-size: 12px;
-      font-weight: 800;
+      min-width: 20px;
+      padding: 0 6px;
+      border-radius: var(--radius-pill);
+      background: var(--neutral-bg);
+      color: var(--text-2);
+      font-size: 11.5px;
+      font-weight: 600;
+      line-height: 20px;
       text-align: center;
     }
-    .btn-threat.active {
-      color: var(--red);
-      border-color: rgba(255, 97, 112, 0.55);
-      background: var(--red-soft);
-    }
+    .btn-threat .count[hidden] { display: none; }
+    .btn-threat.active { color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger-line); }
+    .btn-threat.active:hover:not(:disabled) { color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger-dot); }
+    .btn-threat.active .count { background: var(--danger-dot); color: #fff; }
     .btn-threat[aria-expanded="true"] { border-color: var(--text-3); }
 
+    .btn-accent { color: var(--text-on-accent); background: var(--info-dot); border-color: var(--info-dot); }
+    .btn-accent:hover:not(:disabled) { color: var(--text-on-accent); background: var(--info-fg); border-color: var(--info-fg); }
+    .btn-danger { color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger-line); }
+    .btn-danger:hover:not(:disabled) { color: var(--danger-fg); background: var(--danger-bg); border-color: var(--danger-dot); }
+
     .icon-btn {
-      width: 40px; height: 40px;
-      display: inline-grid; place-items: center;
+      position: relative;
+      width: 36px; height: 36px;
+      display: grid; place-items: center;
       border: 1px solid var(--line-2);
       border-radius: var(--radius);
-      background: var(--surface-2);
+      background: var(--surface);
       color: var(--text-2);
-      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+      transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
     }
     .icon-btn svg { width: 16px; height: 16px; }
-    .icon-btn:hover:not(:disabled) { color: var(--green); border-color: rgba(var(--green-rgb), 0.5); }
-    .icon-btn:disabled { opacity: 0.35; }
+    .icon-btn:hover:not(:disabled) { color: var(--text); background: var(--surface-2); }
+    .icon-btn:disabled { opacity: 0.45; }
     .icon-btn .ico-done { display: none; }
-    .icon-btn.copied { color: var(--green); border-color: var(--green); }
+    .icon-btn.copied { color: var(--success-fg); background: var(--success-bg); border-color: var(--success-line); }
     .icon-btn.copied .ico-copy { display: none; }
     .icon-btn.copied .ico-done { display: block; }
-
-    /* ── Durum satırı (tmux/vim status bar) ──────────────────────────── */
-    .statusline {
-      border-bottom: 1px solid var(--line);
-      background: var(--surface);
-    }
-
-    .statusline-inner {
-      width: min(1600px, 100%);
-      margin: 0 auto;
-      padding: 0 var(--s5);
-      display: flex;
-      align-items: stretch;
-      overflow-x: auto;
-      scrollbar-width: none;
-    }
-    .statusline-inner::-webkit-scrollbar { display: none; }
-
-    .sl-item {
-      display: flex;
-      align-items: center;
-      gap: var(--s2);
-      padding: var(--s2) var(--s4);
-      border-right: 1px solid var(--line);
+    /* Kopyalandı bildirimi */
+    .icon-btn.copied::after {
+      content: "Kopyalandı";
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 4px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--text);
+      color: var(--surface);
+      font-size: 12px;
+      font-weight: 500;
       white-space: nowrap;
-      min-height: 40px;
-    }
-    .sl-item:first-child { padding-left: 0; }
-    .sl-item:last-child { border-right: 0; }
-
-    .sl-key {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text-3);
+      pointer-events: none;
+      animation: popIn 160ms var(--ease);
     }
 
-    .sl-val { font-size: 13px; color: var(--text); }
+    .theme-toggle .ico-moon { display: none; }
+    :root[data-theme="dark"] .theme-toggle .ico-sun { display: none; }
+    :root[data-theme="dark"] .theme-toggle .ico-moon { display: block; }
 
-    .sl-file { min-width: 0; }
-    .sl-file .sl-val {
-      max-width: 38ch;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      color: var(--cyan);
-    }
-
-    /* Durum etiketleri: renk + metin + işaret birlikte kullanılır. */
-    .status-badge, .seal-badge, .threat-badge {
+    /* ══ Durum pill'leri ═══════════════════════════════════════════════ */
+    .status-badge, .seal-badge, .threat-badge, .threat-status {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      font-size: 13px;
-      font-weight: 600;
+      padding: 2px 10px 2px 8px;
+      border-radius: var(--radius-pill);
+      background: var(--neutral-bg);
       color: var(--text-2);
+      font-size: 12.5px;
+      font-weight: 500;
+      line-height: 20px;
+      white-space: nowrap;
+      text-decoration: none;
+      transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
     }
-    .status-badge::before, .seal-badge::before {
+    .status-badge::before, .seal-badge::before, .threat-status::before {
       content: "";
-      width: 7px; height: 7px;
+      width: 6px; height: 6px;
       border-radius: 50%;
-      background: var(--text-3);
+      background: var(--neutral-dot);
     }
-    .status-badge.live { color: var(--green); }
-    .status-badge.live::before { background: var(--green); animation: pulse 1.8s var(--ease) infinite; }
-    .status-badge.retry { color: var(--amber); }
-    .status-badge.retry::before { background: var(--amber); animation: blink 0.9s steps(1) infinite; }
-    .status-badge.error { color: var(--red); }
-    .status-badge.error::before { background: var(--red); }
-
-    .seal-badge.ok { color: var(--green); }
-    .seal-badge.ok::before { background: var(--green); }
-    .seal-badge.error { color: var(--red); }
-    .seal-badge.error::before { background: var(--red); }
+    .status-badge.live, .seal-badge.ok, .threat-status.ok { color: var(--success-fg); background: var(--success-bg); }
+    .status-badge.live::before, .seal-badge.ok::before, .threat-status.ok::before { background: var(--success-dot); }
+    .status-badge.live::before { animation: softPulse 2s var(--ease) infinite; }
+    .status-badge.retry, .seal-badge.warn { color: var(--warn-fg); background: var(--warn-bg); }
+    .status-badge.retry::before, .seal-badge.warn::before { background: var(--warn-dot); }
+    .status-badge.error, .seal-badge.error, .threat-status.alert { color: var(--danger-fg); background: var(--danger-bg); }
+    .status-badge.error::before, .seal-badge.error::before, .threat-status.alert::before { background: var(--danger-dot); }
+    a.seal-badge:hover { filter: brightness(0.97); }
 
     .threat-badge {
-      min-width: 28px;
       justify-content: center;
-      padding: 2px 8px;
-      border: 1px solid var(--line-2);
-      border-radius: 2px;
-      background: transparent;
+      min-width: 32px;
+      padding: 2px 10px;
+      border: 0;
       cursor: pointer;
+      font-variant-numeric: tabular-nums;
     }
-    .threat-badge:hover { border-color: var(--text-3); color: var(--text); }
-    .threat-badge.active {
-      color: #1a0306;
-      background: var(--red);
-      border-color: var(--red);
-    }
+    .threat-badge:hover { color: var(--text); }
+    .threat-badge.active { color: var(--danger-fg); background: var(--danger-bg); }
 
-    /* ── Ana yerleşim ────────────────────────────────────────────────── */
-    .shell {
-      width: min(1600px, 100%);
+    /* ══ Durum şeridi ══════════════════════════════════════════════════ */
+    .statusline-inner {
+      width: min(var(--content-width), 100%);
       margin: 0 auto;
-      padding: var(--s5);
+      padding: var(--s6) var(--s6) 0;
       display: grid;
-      gap: var(--s4);
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: var(--s3);
+    }
+    .sl-item {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-rows: auto auto;
+      column-gap: var(--s3);
+      row-gap: 4px;
+      align-items: center;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow);
+      min-width: 0;
+    }
+    .sl-icon {
+      grid-row: 1 / span 2;
+      width: 34px; height: 34px;
+      display: grid; place-items: center;
+      border-radius: var(--radius);
+      background: var(--surface-3);
+      color: var(--text-2);
+    }
+    .sl-icon svg { width: 17px; height: 17px; }
+    .sl-key { font-size: 12px; font-weight: 500; color: var(--text-3); }
+    .sl-item > :last-child { justify-self: start; min-width: 0; max-width: 100%; }
+    .sl-val { font-size: 13.5px; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sl-file .sl-val { font-family: var(--font-mono); font-size: 12.5px; }
+
+    /* ══ Ana yerleşim ve kartlar ═══════════════════════════════════════ */
+    .shell {
+      width: min(var(--content-width), 100%);
+      margin: 0 auto;
+      padding: var(--s5) var(--s6) var(--s7);
+      display: grid;
+      gap: var(--s5);
     }
 
     .panel {
       background: var(--surface);
       border: 1px solid var(--line);
-      border-radius: var(--radius);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
       min-width: 0;
+      transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
     }
 
     .panel-head {
       display: flex;
       align-items: center;
-      gap: var(--s2);
-      padding: var(--s2) var(--s4);
-      min-height: 40px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-2);
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: var(--s5) var(--s6) 0;
+      min-height: 0;
     }
-
-    .panel-tag {
-      font-size: 11px;
-      font-weight: 700;
-      color: var(--green);
-      letter-spacing: 0.06em;
-    }
-    .panel-tag::before { content: "["; color: var(--text-3); }
-    .panel-tag::after { content: "]"; color: var(--text-3); }
-
-    .panel-title {
-      margin: 0;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
+    .panel-icon {
+      width: 30px; height: 30px;
+      display: grid; place-items: center;
+      border-radius: var(--radius-sm);
+      background: var(--surface-3);
       color: var(--text-2);
+      flex: none;
     }
-
+    .panel-icon svg { width: 16px; height: 16px; }
+    .panel-tag { display: none; }
+    .panel-title { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.005em; color: var(--text); }
     .panel-head .spacer { flex: 1; }
+    .panel-meta { font-size: 12.5px; color: var(--text-3); }
+    .panel-sub { margin: 4px 0 0; font-size: 13px; color: var(--text-3); }
 
-    .panel-meta { font-size: 12px; color: var(--text-3); }
-
-    .panel-sub {
-      margin: 2px 0 0;
-      font-size: 12px;
-      color: var(--text-3);
-    }
-
-    /* ── Gösterge kartları ───────────────────────────────────────────── */
     .metrics {
       display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr);
-      gap: var(--s4);
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: var(--s5);
     }
+    .metric-body { padding: var(--s4) var(--s6) var(--s6); display: grid; gap: var(--s3); align-content: start; }
 
-    .metric-body { padding: var(--s4); display: grid; gap: var(--s3); }
-
-    .live-dot {
-      width: 8px; height: 8px;
-      border-radius: 50%;
-      background: var(--line-2);
-      transition: background-color var(--dur) var(--ease);
-    }
-    .live-dot.active { background: var(--green); animation: pulse 1.8s var(--ease) infinite; }
-
-    .rate-top {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: var(--s3);
-      flex-wrap: wrap;
-    }
-
+    /* ══ Akış hızı ═════════════════════════════════════════════════════ */
+    .rate-top { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--s3); flex-wrap: wrap; }
     .metric-value { display: flex; align-items: baseline; gap: var(--s2); }
-
     .stat-number {
       font-size: 40px;
-      font-weight: 700;
-      line-height: 1;
-      letter-spacing: -0.02em;
-      color: var(--green);
-      text-shadow: 0 0 18px rgba(var(--green-rgb), 0.25);
-    }
-
-    .stat-unit {
-      font-size: 13px;
       font-weight: 600;
-      color: var(--text-3);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+      line-height: 1;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
     }
+    .stat-unit { font-size: 13px; font-weight: 500; color: var(--text-3); }
+    .rate-legend { display: flex; gap: var(--s3); font-size: 12.5px; color: var(--text-3); }
+    .rate-legend strong { color: var(--text-2); font-weight: 600; font-variant-numeric: tabular-nums; }
 
-    .rate-legend { display: flex; gap: var(--s3); font-size: 12px; color: var(--text-3); }
-    .rate-legend strong { color: var(--text-2); font-weight: 600; }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--neutral-dot); }
+    .live-dot.active { background: var(--success-dot); animation: softPulse 2s var(--ease) infinite; }
 
     .rate-chart {
       position: relative;
-      height: 88px;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      background:
-        linear-gradient(rgba(var(--green-rgb), 0.05) 1px, transparent 1px) 0 0 / 100% 25%,
-        var(--bg);
+      height: 104px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(to bottom, transparent 0 calc(100% - 1px), var(--line) calc(100% - 1px));
     }
     .rate-chart canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-
-    .sha-label {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
+    .rate-empty {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      border: 1px dashed var(--line-2);
+      border-radius: var(--radius-md);
+      background: var(--surface-2);
       color: var(--text-3);
+      font-size: 13px;
+      text-align: center;
     }
+    .rate-empty svg { width: 20px; height: 20px; color: var(--neutral-dot); }
+    .rate-chart.is-empty .rate-empty { display: flex; }
 
+    /* ══ Bütünlük mührü ════════════════════════════════════════════════ */
+    .sha-label { font-size: 12.5px; font-weight: 500; color: var(--text-3); }
     .sha-row { display: flex; align-items: center; gap: var(--s2); }
-
     .seal-sha {
       flex: 1;
       min-width: 0;
-      padding: var(--s2) var(--s3);
       min-height: 40px;
       display: flex;
       align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      background: var(--bg);
-      color: var(--cyan);
-      font-size: 13px;
+      padding: 9px 12px;
+      border-radius: var(--radius);
+      background: var(--surface-3);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12.5px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .seal-foot { font-size: 12.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    .seal-foot {
-      font-size: 12px;
+    /* TSA durumu pill olarak; renk, üst şeritteki mühür durumundan gelir. */
+    #seal-detail {
+      justify-self: start;
+      max-width: 100%;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 10px 2px 8px;
+      border-radius: var(--radius-pill);
+      background: var(--neutral-bg);
       color: var(--text-2);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      line-height: 20px;
     }
-    .seal-foot::before { content: "› "; color: var(--green); }
+    #seal-detail::before { content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--neutral-dot); }
+    :root:has(#seal-badge.ok) #seal-detail { color: var(--success-fg); background: var(--success-bg); }
+    :root:has(#seal-badge.ok) #seal-detail::before { background: var(--success-dot); }
+    :root:has(#seal-badge.error) #seal-detail { color: var(--danger-fg); background: var(--danger-bg); }
+    :root:has(#seal-badge.error) #seal-detail::before { background: var(--danger-dot); }
 
-    .kv { margin: 0; display: grid; gap: 2px; }
-
+    /* ══ Dosya boyutları ═══════════════════════════════════════════════ */
+    .kv { margin: 0; display: grid; }
     .kv-row {
       display: flex;
-      align-items: baseline;
-      gap: var(--s2);
-      padding: 6px 0;
-    }
-    .kv-row dt {
-      display: flex;
       align-items: center;
-      gap: var(--s2);
-      color: var(--text-2);
-      font-size: 13px;
+      justify-content: space-between;
+      gap: var(--s3);
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
     }
-    .kv-row dt { flex: 1; min-width: 0; }
-    .kv-row dt::after {
+    .kv-row:last-child { border-bottom: 0; }
+    .kv-row dt { display: flex; align-items: center; gap: 10px; color: var(--text-2); font-size: 13.5px; }
+    .kv-row dd { margin: 0; font-size: 14px; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
+    .kv-row.total {
+      margin-top: 6px;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: var(--radius);
+      background: var(--surface-3);
+    }
+    .kv-row.total dt { color: var(--text); font-weight: 600; }
+    .kv-row.total dd { font-size: 16px; font-weight: 600; }
+
+    .kv-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .kv-dot.hourly { background: var(--info-dot); }
+    .kv-dot.daily { background: #a78bfa; }
+    .kv-dot.monthly { background: var(--warn-dot); }
+    .kv-dot.total { background: var(--success-dot); }
+
+    /* ══ FTP arşivleme ve disk ═════════════════════════════════════════ */
+    .archive-panel { position: relative; overflow: hidden; }
+    .archive-panel::before {
       content: "";
-      flex: 1;
-      min-width: 16px;
-      border-bottom: 1px dotted var(--line-2);
-      transform: translateY(4px);
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: transparent;
+      transition: background-color var(--dur) var(--ease);
     }
-    .kv-row dd { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
-    .kv-row.total { margin-top: var(--s1); padding-top: var(--s2); border-top: 1px solid var(--line); }
-    .kv-row.total dt { color: var(--text); font-weight: 700; }
-    .kv-row.total dd { color: var(--green); }
+    .archive-panel:has(.disk-pct.warn) { border-color: var(--warn-line); }
+    .archive-panel:has(.disk-pct.warn)::before { background: var(--warn-dot); }
+    .archive-panel:has(.disk-pct.error) { border-color: var(--danger-line); }
+    .archive-panel:has(.disk-pct.error)::before { background: var(--danger-dot); }
+    #ftp-target { font-family: var(--font-mono); font-size: 12px; }
 
-    .kv-dot { width: 8px; height: 8px; border-radius: 1px; }
-    .kv-dot.hourly { background: var(--cyan); }
-    .kv-dot.daily { background: var(--violet); }
-    .kv-dot.monthly { background: var(--amber); }
-    .kv-dot.total { background: var(--green); }
+    .archive-body { padding: var(--s5) var(--s6) var(--s6); display: grid; gap: var(--s5); }
 
-    /* ── "Log gelmiyor" uyarısı ──────────────────────────────────────── */
+    .disk-row { display: grid; gap: 10px; }
+    .disk-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+    .disk-pct { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--text); font-variant-numeric: tabular-nums; }
+    .disk-pct.warn { color: var(--warn-fg); }
+    .disk-pct.error { color: var(--danger-fg); }
+
+    .disk-bar {
+      display: flex;
+      height: 12px;
+      border-radius: var(--radius-pill);
+      background: var(--surface-3);
+      overflow: hidden;
+    }
+    .disk-fill { display: block; height: 100%; width: 0; transition: width 0.5s var(--ease), background-color var(--dur) var(--ease); }
+    .disk-fill.logs { background: var(--disk-logs); }
+    .disk-fill.other { background: var(--disk-other); }
+    .archive-panel:has(.disk-pct.warn) #disk-fill-logs { background: var(--warn-dot); }
+    .archive-panel:has(.disk-pct.warn) #disk-fill-other { background: color-mix(in srgb, var(--warn-dot) 55%, var(--surface-3)); }
+    .archive-panel:has(.disk-pct.error) #disk-fill-logs { background: var(--danger-dot); }
+    .archive-panel:has(.disk-pct.error) #disk-fill-other { background: color-mix(in srgb, var(--danger-dot) 55%, var(--surface-3)); }
+
+    .disk-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); font-size: 12.5px; color: var(--text-3); }
+    .disk-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .disk-legend strong { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .kv-dot.disk-logs { background: var(--disk-logs); }
+    .kv-dot.disk-other { background: var(--disk-other); }
+    .kv-dot.disk-free { background: var(--surface-3); box-shadow: inset 0 0 0 1px var(--line-2); }
+
+    .disk-alert {
+      display: none;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .disk-alert svg { width: 16px; height: 16px; margin-top: 1px; }
+    .disk-alert .when-error { display: none; }
+    .archive-panel:has(.disk-pct.warn) .disk-alert { display: flex; color: var(--warn-fg); background: var(--warn-bg); }
+    .archive-panel:has(.disk-pct.error) .disk-alert { display: flex; color: var(--danger-fg); background: var(--danger-bg); }
+    .archive-panel:has(.disk-pct.error) .disk-alert .when-warn { display: none; }
+    .archive-panel:has(.disk-pct.error) .disk-alert .when-error { display: inline; }
+
+    /* İstatistik kutuları (FTP paneli ve IP ayrıntısı) */
+    .ip-stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--s3); }
+    .ip-stat {
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface-2);
+      min-width: 0;
+    }
+    .ip-stat-label { font-size: 12.5px; font-weight: 500; color: var(--text-3); line-height: 1.35; }
+    .ip-stat-value {
+      margin-top: 6px;
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ip-stat-value.green { color: var(--success-fg); }
+    .ip-stat-value.warn { color: var(--warn-fg); }
+    .ip-stat-sub { margin-top: 2px; font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+
+    .archive-foot { display: flex; flex-wrap: wrap; gap: 6px var(--s6); }
+    .archive-foot .seal-foot { min-width: 0; white-space: normal; }
+
+    .archive-error {
+      padding: 12px 14px;
+      border-left: 3px solid var(--danger-dot);
+      border-radius: var(--radius);
+      background: var(--danger-bg);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+    .archive-error strong { display: block; margin-bottom: 2px; font-family: var(--font-sans); font-size: 13px; font-weight: 600; color: var(--danger-fg); }
+    .archive-error[hidden] { display: none; }
+    .archive-panel.disabled .verify-box,
+    .archive-panel.disabled .archive-stats,
+    .archive-panel.disabled .archive-foot { opacity: 0.5; }
+
+    /* FTP paket doğrulaması */
+    .verify-box [hidden] { display: none !important; }
+    .verify-box { display: grid; gap: var(--s3); padding-top: var(--s5); border-top: 1px solid var(--line); }
+    .verify-head { display: grid; gap: 2px; }
+    .verify-head .sha-label { font-size: 14px; font-weight: 600; color: var(--text); }
+    .verify-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3); }
+    .select.date-input { min-width: 156px; padding-right: var(--s3); background: var(--surface); cursor: text; }
+    .verify-check { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; font-size: 13px; color: var(--text-2); cursor: pointer; }
+    .verify-check input { width: 16px; height: 16px; accent-color: var(--info-dot); }
+    .verify-status { font-size: 13px; color: var(--text-2); }
+    .verify-status.error { color: var(--danger-fg); }
+    .verify-progress { height: 6px; }
+    .verify-progress .disk-fill { background: var(--info-dot); }
+    .verify-summary { display: flex; flex-wrap: wrap; gap: var(--s2); }
+    .vchip { padding: 3px 10px; border-radius: var(--radius-pill); background: var(--neutral-bg); font-size: 12.5px; color: var(--text-2); }
+    .vchip strong { color: var(--text); font-weight: 600; }
+    .vchip.ok { background: var(--success-bg); color: var(--success-fg); }
+    .vchip.warn { background: var(--warn-bg); color: var(--warn-fg); }
+    .vchip.error { background: var(--danger-bg); color: var(--danger-fg); }
+    .vchip.ok strong, .vchip.warn strong, .vchip.error strong { color: inherit; }
+    .verify-table { max-height: 40vh; border: 1px solid var(--line); border-radius: var(--radius-md); }
+    .verify-table td.detail { white-space: normal; color: var(--text-2); min-width: 28ch; }
+    .vstate { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 12px; font-weight: 500; background: var(--neutral-bg); color: var(--text-2); }
+    .vstate.ok { background: var(--success-bg); color: var(--success-fg); }
+    .vstate.warn { background: var(--warn-bg); color: var(--warn-fg); }
+    .vstate.error { background: var(--danger-bg); color: var(--danger-fg); }
+
+    /* ══ "Log verisi gelmiyor" uyarısı ═════════════════════════════════ */
     .alert-banner {
       display: flex;
       align-items: center;
-      gap: var(--s3);
-      padding: var(--s3) var(--s4);
-      border: 1px solid rgba(245, 184, 61, 0.5);
-      border-left-width: 4px;
-      border-radius: var(--radius);
-      background: var(--amber-soft);
-      color: var(--amber);
+      gap: 14px;
+      padding: 14px 16px 14px 18px;
+      border: 1px solid var(--warn-line);
+      border-radius: var(--radius-lg);
+      background: var(--warn-bg);
+      color: var(--warn-fg);
+      animation: popIn 200ms var(--ease);
     }
-    .alert-banner[hidden] { display: none; }
-    .alert-icon svg { width: 20px; height: 20px; }
+    .alert-banner[hidden], .alert-banner.dismissed { display: none; }
+    .alert-icon {
+      width: 36px; height: 36px;
+      display: grid; place-items: center;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--warn-dot) 18%, transparent);
+      flex: none;
+    }
+    .alert-icon svg { width: 18px; height: 18px; }
     .alert-text { flex: 1; min-width: 0; }
-    .alert-title {
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-    .alert-detail { font-size: 13px; color: var(--text); }
-    .alert-pulse {
-      width: 10px; height: 10px;
-      background: var(--amber);
-      animation: blink 1s steps(1) infinite;
-    }
+    .alert-title { font-size: 14px; font-weight: 600; }
+    .alert-detail { font-size: 13px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+    .alert-pulse { display: none; }
+    .alert-close { width: 32px; height: 32px; border-color: transparent; background: transparent; color: var(--warn-fg); }
+    .alert-close:hover:not(:disabled) { background: color-mix(in srgb, var(--warn-dot) 16%, transparent); color: var(--warn-fg); }
 
-    /* ── Log tablosu ─────────────────────────────────────────────────── */
+    /* ══ Log tablosu ═══════════════════════════════════════════════════ */
+    .log-panel { overflow: hidden; }
     .log-head {
       display: flex;
       align-items: flex-end;
       justify-content: space-between;
       gap: var(--s4);
       flex-wrap: wrap;
-      padding: var(--s3) var(--s4);
+      padding: var(--s5) var(--s6);
       border-bottom: 1px solid var(--line);
-      background: var(--surface-2);
     }
-
-    .log-title { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }
-    .log-title .panel-title { font-size: 13px; }
+    .log-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
 
     .toolbar { display: flex; align-items: flex-end; gap: var(--s3); flex-wrap: wrap; }
-
-    .field { display: grid; gap: 4px; }
-    .field label, .field .field-label {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text-3);
-    }
+    .field { display: grid; gap: 6px; }
+    .field label, .field .field-label { font-size: 12px; font-weight: 500; color: var(--text-3); }
 
     .select {
       appearance: none;
       -webkit-appearance: none;
-      min-width: 132px;
-      min-height: 40px;
-      padding: 0 34px 0 var(--s3);
+      min-width: 140px;
+      min-height: 36px;
+      padding: 0 34px 0 12px;
       border: 1px solid var(--line-2);
       border-radius: var(--radius);
       background:
-        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2372887f' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center / 14px,
-        var(--bg);
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23878fa0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center / 15px,
+        var(--surface);
       color: var(--text);
       font-size: 13px;
       cursor: pointer;
-      transition: border-color var(--dur) var(--ease);
+      box-shadow: var(--shadow);
+      transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
     }
     .select:hover:not(:disabled) { border-color: var(--text-3); }
-    .select:disabled { opacity: 0.4; cursor: not-allowed; }
-    .select option { background: var(--surface-2); color: var(--text); }
+    .select:focus-visible { outline: none; border-color: var(--info-dot); box-shadow: 0 0 0 3px var(--info-bg); }
+    .select:disabled { opacity: 0.5; cursor: not-allowed; }
+    .select option { background: var(--surface); color: var(--text); }
 
-    .pager { display: flex; align-items: center; gap: var(--s2); }
-    .pager .btn { padding: 0 var(--s3); }
-    .pager-info {
-      min-width: 72px;
-      text-align: center;
-      font-size: 13px;
-      color: var(--text);
+    .pager {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--line-2);
+      border-radius: var(--radius);
+      background: var(--surface-3);
     }
+    .pager .btn { min-height: 30px; width: 32px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; }
+    .pager .btn:hover:not(:disabled) { background: var(--surface); box-shadow: var(--shadow); }
+    .pager-info { min-width: 64px; text-align: center; font-size: 13px; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
 
-    .table-wrap {
-      overflow: auto;
-      max-height: 72vh;
-    }
+    .table-wrap { overflow: auto; max-height: 70vh; -webkit-overflow-scrolling: touch; }
 
-    .log-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-    }
-
+    .log-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
     .log-table thead th {
       position: sticky;
       top: 0;
       z-index: 1;
       padding: 10px var(--s4);
       background: var(--surface-2);
-      border-bottom: 1px solid var(--line-2);
+      border-bottom: 1px solid var(--line);
       text-align: left;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
+      font-size: 12px;
+      font-weight: 500;
       color: var(--text-3);
       white-space: nowrap;
     }
+    .log-table thead th:first-child, .log-table tbody td:first-child { padding-left: var(--s6); }
+    .log-table thead th:last-child, .log-table tbody td:last-child { padding-right: var(--s6); }
     .log-table th.num, .log-table td.num { text-align: right; }
-
     .log-table tbody td {
-      padding: 7px var(--s4);
+      padding: 9px var(--s4);
       border-bottom: 1px solid var(--line);
       white-space: nowrap;
       color: var(--text);
+      transition: background-color 150ms var(--ease);
     }
-    .log-table tbody tr { transition: background-color var(--dur) var(--ease); }
-    .log-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.012); }
-    .log-table tbody tr:hover { background: var(--surface-3); }
+    .log-table tbody tr:last-child td { border-bottom: 0; }
+    .log-table tbody tr:hover td { background: var(--surface-2); }
 
-    .cell-time { color: var(--text-3); }
-    .cell-ip-src { color: var(--cyan); }
-    .cell-ip-dst { color: var(--violet); }
-    .cell-port { color: var(--text-2); }
-    .cell-size { color: var(--text-2); }
+    .cell-time { color: var(--text-3); font-variant-numeric: tabular-nums; }
+    .cell-ip-src, .cell-ip-dst, .cell-port, .cell-size { font-family: var(--font-mono); font-size: 12.5px; }
+    .cell-ip-src { color: var(--info-fg); }
+    .cell-ip-dst { color: var(--violet-fg); }
+    .cell-port, .cell-size { color: var(--text-2); }
+    .log-table td.self { color: var(--text); font-weight: 600; }
+    .arrow { color: var(--neutral-dot); padding-left: 0 !important; padding-right: 0 !important; width: 1ch; }
 
-    .arrow { color: var(--text-3); padding: 0 !important; width: 1ch; }
-
-    .row-enter { animation: rowEnter 1.4s var(--ease); }
-    .row-enter td:first-child { box-shadow: inset 2px 0 0 var(--green); }
+    .row-enter { animation: rowEnter 1.2s var(--ease); }
 
     .proto {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
-      padding: 1px 7px;
-      border: 1px solid currentColor;
-      border-radius: 2px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
+      gap: 4px;
+      padding: 1px 8px;
+      border-radius: 6px;
+      background: var(--neutral-bg);
       color: var(--text-2);
+      font-size: 11.5px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
     }
-    .proto .lock { width: 11px; height: 11px; color: var(--green); }
-    .proto.tcp { color: var(--cyan); background: var(--cyan-soft); }
-    .proto.udp { color: var(--amber); background: var(--amber-soft); }
-    .proto.icmp, .proto.icmpv6 { color: var(--violet); background: var(--violet-soft); }
+    .proto .lock { width: 11px; height: 11px; color: var(--success-fg); }
+    .proto.tcp { color: var(--info-fg); background: var(--info-bg); }
+    .proto.udp { color: var(--warn-fg); background: var(--warn-bg); }
+    .proto.icmp, .proto.icmpv6 { color: var(--violet-fg); background: var(--violet-bg); }
 
-    .empty-row td { padding: 56px var(--s4) !important; text-align: center; color: var(--text-3); white-space: normal !important; }
-    .empty-title { color: var(--text-2); font-weight: 700; margin-bottom: 4px; }
-    .empty-title::before { content: "$ "; color: var(--green); }
-
-    /* ── Güvenlik çekmecesi ──────────────────────────────────────────── */
-    .threat-modal {
-      position: fixed;
-      inset: 0;
-      z-index: 60;
-      display: flex;
-      justify-content: flex-end;
+    .empty-row td { padding: 56px var(--s4) !important; text-align: center; color: var(--text-3); white-space: normal !important; background: transparent !important; }
+    .empty-row td::before {
+      content: "";
+      display: block;
+      width: 44px; height: 44px;
+      margin: 0 auto 12px;
+      border-radius: 50%;
+      background-color: var(--surface-3);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23878fa0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='22 12 16 12 14 15 10 15 8 12 2 12'/%3E%3Cpath d='M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 22px;
     }
+    .empty-title { color: var(--text); font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+    .empty-title::first-letter { text-transform: uppercase; }
+
+    /* ══ Güvenlik çekmecesi ════════════════════════════════════════════ */
+    .threat-modal { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: flex-end; }
     .threat-modal[hidden] { display: none; }
-
     .threat-modal-backdrop {
       position: absolute;
       inset: 0;
-      background: rgba(2, 4, 5, 0.72);
-      backdrop-filter: blur(3px);
-      -webkit-backdrop-filter: blur(3px);
+      background: var(--overlay);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
       animation: fadeIn var(--dur) var(--ease);
     }
-
     .threat-modal-panel {
       position: relative;
       width: min(600px, 100%);
@@ -4314,597 +4492,305 @@ const dashboardHTML = `<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       background: var(--surface);
-      border-left: 1px solid var(--line-2);
-      box-shadow: -24px 0 48px rgba(0, 0, 0, 0.5);
+      border-left: 1px solid var(--line);
+      border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+      box-shadow: var(--shadow-lg);
       animation: slideIn 240ms var(--ease);
       overscroll-behavior: contain;
     }
-    .threat-modal-panel.has-threats { border-left-color: rgba(255, 97, 112, 0.6); }
-
-    .drawer-head {
-      display: grid;
-      gap: var(--s3);
-      padding: var(--s4) var(--s5);
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-2);
-    }
-
+    .drawer-head { display: grid; gap: var(--s3); padding: var(--s5) var(--s6); border-bottom: 1px solid var(--line); }
     .drawer-title-row { display: flex; align-items: flex-start; gap: var(--s3); }
-
     .threat-mark {
-      width: 36px; height: 36px;
+      width: 38px; height: 38px;
       display: grid; place-items: center;
-      border: 1px solid var(--line-2);
-      border-radius: var(--radius);
-      color: var(--green);
+      border-radius: var(--radius-md);
+      background: var(--success-bg);
+      color: var(--success-fg);
       flex: none;
     }
     .threat-mark svg { width: 18px; height: 18px; }
-    .has-threats .threat-mark { color: var(--red); border-color: rgba(255, 97, 112, 0.55); background: var(--red-soft); }
-
+    .has-threats .threat-mark { color: var(--danger-fg); background: var(--danger-bg); }
     .drawer-title-text { flex: 1; min-width: 0; }
-
-    .threat-title {
-      margin: 0;
-      display: flex;
-      align-items: center;
-      gap: var(--s2);
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-
-    .threat-count {
-      padding: 1px 7px;
-      border-radius: 2px;
-      background: var(--red);
-      color: #1a0306;
-      font-size: 12px;
-      font-weight: 800;
-    }
-
-    .threat-subtitle { margin: 4px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.55; }
-
-    .threat-status {
-      display: inline-flex;
-      align-items: center;
-      gap: var(--s2);
-      justify-self: start;
-      padding: 4px 10px;
-      border: 1px solid currentColor;
-      border-radius: 2px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    .threat-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-    .threat-status.ok { color: var(--green); background: var(--green-soft); }
-    .threat-status.alert { color: var(--red); background: var(--red-soft); }
-    .threat-status.alert::before { animation: blink 0.9s steps(1) infinite; }
-
-    .drawer-body {
-      flex: 1;
-      overflow-y: auto;
-      padding: var(--s4) var(--s5) var(--s6);
-      display: grid;
-      align-content: start;
-      gap: var(--s5);
-    }
-
+    .threat-title { margin: 0; display: flex; align-items: center; gap: var(--s2); font-size: 16px; font-weight: 600; }
+    .threat-count { padding: 0 8px; border-radius: var(--radius-pill); background: var(--danger-bg); color: var(--danger-fg); font-size: 12px; font-weight: 600; line-height: 20px; }
+    .threat-count[hidden] { display: none; }
+    .threat-subtitle { margin: 4px 0 0; font-size: 13px; color: var(--text-3); line-height: 1.55; }
+    .threat-status { justify-self: start; }
+    .drawer-body { flex: 1; overflow-y: auto; padding: var(--s5) var(--s6) var(--s6); display: grid; align-content: start; gap: var(--s6); }
     .drawer-section { display: grid; gap: var(--s3); }
-
     .section-head { display: grid; gap: 4px; }
-
-    .section-title {
-      display: flex;
-      align-items: center;
-      gap: var(--s2);
-      margin: 0;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--text-2);
-    }
-    .section-title svg { width: 14px; height: 14px; color: var(--text-3); }
-    .section-title::before { content: "//"; color: var(--green); }
-
-    .section-sub { margin: 0; font-size: 12px; color: var(--text-3); line-height: 1.6; }
+    .section-title { display: flex; align-items: center; gap: var(--s2); margin: 0; font-size: 14px; font-weight: 600; color: var(--text); }
+    .section-sub { margin: 0; font-size: 13px; color: var(--text-3); line-height: 1.6; }
     .section-sub .mono { color: var(--text-2); }
-
     .threat-list { display: grid; gap: var(--s2); }
-
     .threat-empty {
       display: flex;
       align-items: center;
       gap: var(--s3);
       padding: var(--s4);
       border: 1px dashed var(--line-2);
-      border-radius: var(--radius);
+      border-radius: var(--radius-md);
       font-size: 13px;
       color: var(--text-2);
     }
     .threat-empty[hidden] { display: none; }
-    .threat-empty svg { width: 18px; height: 18px; color: var(--green); }
-
+    .threat-empty svg { width: 18px; height: 18px; color: var(--success-dot); }
     .threat-item {
       display: grid;
       grid-template-columns: auto 1fr auto;
       gap: var(--s3);
-      padding: var(--s3);
+      padding: 14px;
       border: 1px solid var(--line);
-      border-left: 3px solid var(--amber);
-      border-radius: var(--radius);
-      background: var(--surface-2);
+      border-left: 3px solid var(--warn-dot);
+      border-radius: var(--radius-md);
+      background: var(--surface);
     }
-    .threat-item.high { border-left-color: var(--red); }
-
-    .threat-sev {
-      align-self: start;
-      padding: 2px 6px;
-      border: 1px solid currentColor;
-      border-radius: 2px;
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--amber);
-    }
-    .threat-item.high .threat-sev { color: var(--red); background: var(--red-soft); }
-
+    .threat-item.high { border-left-color: var(--danger-dot); }
+    .threat-sev { align-self: start; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; color: var(--warn-fg); background: var(--warn-bg); }
+    .threat-item.high .threat-sev { color: var(--danger-fg); background: var(--danger-bg); }
     .threat-body { min-width: 0; display: grid; gap: 4px; }
-
-    .threat-item-title {
-      display: flex;
-      align-items: center;
-      gap: var(--s2);
-      flex-wrap: wrap;
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--text);
-    }
-
-    .threat-hits {
-      padding: 0 6px;
-      border-radius: 2px;
-      background: var(--surface-3);
-      color: var(--text-2);
-      font-size: 11px;
-      font-weight: 700;
-    }
-
-    .threat-meta { font-size: 12px; color: var(--text-2); line-height: 1.55; overflow-wrap: anywhere; }
-
+    .threat-item-title { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: 13.5px; font-weight: 600; color: var(--text); }
+    .threat-hits { padding: 0 7px; border-radius: var(--radius-pill); background: var(--neutral-bg); color: var(--text-2); font-size: 11.5px; font-weight: 500; }
+    .threat-meta { font-size: 12.5px; color: var(--text-2); line-height: 1.55; overflow-wrap: anywhere; }
     .threat-actions { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: 4px; }
+    .threat-time { align-self: start; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
     .chip-btn {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      min-height: 32px;
+      min-height: 30px;
       padding: 0 10px;
       border: 1px solid var(--line-2);
-      border-radius: 2px;
-      background: var(--bg);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
       color: var(--text-2);
-      font-size: 12px;
-      font-weight: 600;
+      font-size: 12.5px;
+      font-weight: 500;
       transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background-color var(--dur) var(--ease);
     }
     .chip-btn svg { width: 13px; height: 13px; }
-    .chip-btn:hover:not(:disabled) { color: var(--text); border-color: var(--text-3); }
-
-    .threat-copy-ip { color: var(--cyan); }
-    .threat-copy-ip.copied { color: var(--green); border-color: var(--green); }
-    .threat-copy-ip.copied .threat-copy-label::after { content: " ✓"; }
-
-    .threat-ban { color: var(--red); border-color: rgba(255, 97, 112, 0.45); }
-    .threat-ban:hover:not(:disabled) { color: #1a0306; background: var(--red); border-color: var(--red); }
+    .chip-btn:hover:not(:disabled) { color: var(--text); background: var(--surface-2); }
+    .threat-copy-ip { font-family: var(--font-mono); color: var(--info-fg); }
+    .threat-copy-ip.copied { color: var(--success-fg); background: var(--success-bg); border-color: var(--success-line); }
+    .threat-copy-ip.copied .threat-copy-label::after { content: " · kopyalandı"; font-family: var(--font-sans); }
+    .threat-ban { color: var(--danger-fg); border-color: var(--danger-line); background: var(--danger-bg); }
+    .threat-ban:hover:not(:disabled) { color: var(--danger-fg); border-color: var(--danger-dot); background: var(--danger-bg); }
     .threat-ban.banned, .threat-ban:disabled { color: var(--text-3); border-color: var(--line-2); background: transparent; opacity: 1; }
 
-    .threat-time { align-self: start; font-size: 12px; color: var(--text-3); }
-
     .inline-form { display: flex; gap: var(--s2); }
-
     .text-input {
       flex: 1;
       min-width: 0;
-      min-height: 40px;
-      padding: 0 var(--s3);
+      min-height: 36px;
+      padding: 0 12px;
       border: 1px solid var(--line-2);
       border-radius: var(--radius);
-      background: var(--bg);
+      background: var(--surface);
       color: var(--text);
+      font-family: var(--font-mono);
       font-size: 13px;
-      transition: border-color var(--dur) var(--ease);
+      transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
     }
     .text-input::placeholder { color: var(--text-3); }
     .text-input:hover { border-color: var(--text-3); }
-    .text-input:focus-visible { outline-offset: 0; border-color: var(--green); }
+    .text-input:focus-visible { outline: none; border-color: var(--info-dot); box-shadow: 0 0 0 3px var(--info-bg); }
 
-    .btn-danger { color: var(--red); border-color: rgba(255, 97, 112, 0.5); background: var(--red-soft); }
-    .btn-danger:hover:not(:disabled) { color: #1a0306; background: var(--red); border-color: var(--red); }
-
-    .btn-accent { color: var(--green); border-color: rgba(var(--green-rgb), 0.5); background: var(--green-soft); }
-    .btn-accent:hover:not(:disabled) { color: #041109; background: var(--green); border-color: var(--green); }
-
-    .form-error {
-      padding: var(--s2) var(--s3);
-      border: 1px solid rgba(255, 97, 112, 0.5);
-      border-radius: 2px;
-      background: var(--red-soft);
-      color: var(--red);
-      font-size: 12px;
-    }
-    .form-error::before { content: "ERR "; font-weight: 800; }
+    .form-error { padding: 10px 12px; border-radius: var(--radius); background: var(--danger-bg); color: var(--danger-fg); font-size: 13px; }
     .form-error[hidden] { display: none; }
-
     .chip-list { display: flex; flex-wrap: wrap; gap: var(--s2); }
-
-    .list-empty { font-size: 12px; color: var(--text-3); }
-    .list-empty::before { content: "∅ "; }
+    .list-empty { font-size: 13px; color: var(--text-3); }
     .list-empty[hidden] { display: none; }
-
     .entry-chip {
       display: inline-flex;
       align-items: center;
       gap: var(--s2);
-      min-height: 32px;
-      padding: 0 4px 0 10px;
+      min-height: 30px;
+      padding: 0 4px 0 12px;
       border: 1px solid var(--line-2);
-      border-radius: 2px;
+      border-radius: var(--radius-pill);
       background: var(--surface-2);
-      font-size: 12px;
+      font-size: 12.5px;
       color: var(--text);
     }
     .entry-chip.cidr { border-style: dashed; }
-    .entry-chip.blocked { border-color: rgba(255, 97, 112, 0.45); }
-    .entry-chip.blocked .entry-ip { color: var(--red); }
-    .entry-chip.allowed .entry-ip { color: var(--green); }
-
-    .entry-rule { color: var(--text-3); font-size: 11px; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
+    .entry-ip { font-family: var(--font-mono); }
+    .entry-chip.blocked { border-color: var(--danger-line); background: var(--danger-bg); }
+    .entry-chip.blocked .entry-ip { color: var(--danger-fg); }
+    .entry-chip.allowed .entry-ip { color: var(--success-fg); }
+    .entry-rule { color: var(--text-3); font-size: 11.5px; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .entry-remove {
-      width: 26px; height: 26px;
+      width: 24px; height: 24px;
       display: grid; place-items: center;
       border: 0;
-      border-radius: 2px;
+      border-radius: 50%;
       background: transparent;
       color: var(--text-3);
       transition: color var(--dur) var(--ease), background-color var(--dur) var(--ease);
     }
     .entry-remove svg { width: 12px; height: 12px; }
-    .entry-remove:hover { color: var(--red); background: var(--red-soft); }
-
+    .entry-remove:hover { color: var(--danger-fg); background: var(--danger-bg); }
     .drawer-divider { height: 1px; background: var(--line); }
 
-    /* ── IP bağlantıları ─────────────────────────────────────────────── */
+    /* ══ IP bağlantıları ve IP ayrıntı modalı ═════════════════════════ */
     .ip-link {
       padding: 0;
       border: 0;
       background: none;
       color: inherit;
       font: inherit;
-      text-decoration: underline dotted transparent;
+      text-decoration: underline transparent;
       text-underline-offset: 3px;
-      transition: text-decoration-color var(--dur) var(--ease), color var(--dur) var(--ease);
+      transition: text-decoration-color var(--dur) var(--ease);
     }
-    .ip-link:hover { text-decoration-color: currentColor; color: var(--text); }
+    .ip-link:hover { text-decoration-color: currentColor; }
 
-    /* ── IP ayrıntı modalı ───────────────────────────────────────────── */
-    .ip-modal {
-      position: fixed;
-      inset: 0;
-      z-index: 70;
-      display: grid;
-      place-items: center;
-      padding: var(--s5);
-    }
+    .ip-modal { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; padding: var(--s6); }
     .ip-modal[hidden] { display: none; }
-
     .ip-modal-backdrop {
       position: absolute;
       inset: 0;
-      background: rgba(2, 4, 5, 0.78);
-      backdrop-filter: blur(3px);
-      -webkit-backdrop-filter: blur(3px);
+      background: var(--overlay);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
       animation: fadeIn var(--dur) var(--ease);
     }
-
     .ip-dialog {
       position: relative;
       width: min(1180px, 100%);
-      max-height: calc(100vh - 40px);
+      max-height: calc(100vh - 48px);
       display: flex;
       flex-direction: column;
       background: var(--surface);
-      border: 1px solid var(--line-2);
-      border-radius: var(--radius);
-      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
-      animation: popIn 200ms var(--ease);
-    }
-
-    .ip-head {
-      display: flex;
-      align-items: flex-start;
-      gap: var(--s3);
-      padding: var(--s4) var(--s5);
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-2);
-    }
-
-    .ip-head-main { flex: 1; min-width: 0; display: grid; gap: var(--s2); }
-
-    .ip-title-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
-
-    .ip-title {
-      margin: 0;
-      font-size: 22px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      color: var(--cyan);
-      overflow-wrap: anywhere;
-    }
-    .ip-title::before { content: "$ whois "; color: var(--text-3); font-size: 13px; font-weight: 500; letter-spacing: 0; }
-
-    .ip-ptr { font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
-    .ip-ptr::before { content: "ptr › "; color: var(--green); }
-
-    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
-
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 2px 8px;
-      border: 1px solid var(--line-2);
-      border-radius: 2px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      color: var(--text-2);
-    }
-    .tag.ok { color: var(--green); border-color: rgba(var(--green-rgb), 0.45); background: var(--green-soft); }
-    .tag.warn { color: var(--amber); border-color: rgba(245, 184, 61, 0.45); background: var(--amber-soft); }
-    .tag.bad { color: var(--red); border-color: rgba(255, 97, 112, 0.5); background: var(--red-soft); }
-    .tag.info { color: var(--cyan); border-color: rgba(92, 202, 242, 0.4); background: var(--cyan-soft); }
-
-    .ip-head-actions { display: flex; gap: var(--s2); flex: none; }
-
-    .ip-body {
-      flex: 1;
-      overflow-y: auto;
-      padding: var(--s4) var(--s5) var(--s5);
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: var(--s4);
-      align-content: start;
-    }
-
-    .ip-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: var(--s3);
-    }
-
-    .ip-card {
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-      min-width: 0;
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      animation: popIn 200ms var(--ease);
+      overflow: hidden;
     }
-    .ip-card-head {
-      padding: var(--s2) var(--s3);
-      border-bottom: 1px solid var(--line);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--text-2);
-    }
-    .ip-card-head::before { content: "// "; color: var(--green); }
-    .ip-card-body { padding: var(--s3); display: grid; gap: 6px; }
-
-    .ip-kv { display: grid; grid-template-columns: 11ch minmax(0, 1fr); gap: var(--s2); font-size: 12px; }
+    .ip-head { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s5) var(--s6); border-bottom: 1px solid var(--line); }
+    .ip-head-main { flex: 1; min-width: 0; display: grid; gap: var(--s2); }
+    .ip-title-row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+    .ip-title { margin: 0; font-family: var(--font-mono); font-size: 22px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); overflow-wrap: anywhere; }
+    .ip-ptr { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-2); overflow-wrap: anywhere; }
+    .ip-ptr::before { content: "PTR  "; font-family: var(--font-sans); font-weight: 600; color: var(--text-3); }
+    .ip-ptr[hidden] { display: none; }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px; border-radius: var(--radius-pill); background: var(--neutral-bg); color: var(--text-2); font-size: 12px; font-weight: 500; }
+    .tag.ok { color: var(--success-fg); background: var(--success-bg); }
+    .tag.warn { color: var(--warn-fg); background: var(--warn-bg); }
+    .tag.bad { color: var(--danger-fg); background: var(--danger-bg); }
+    .tag.info { color: var(--info-fg); background: var(--info-bg); }
+    .ip-head-actions { display: flex; gap: var(--s2); flex: none; }
+    .ip-body { flex: 1; overflow-y: auto; padding: var(--s5) var(--s6) var(--s6); display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s4); align-content: start; }
+    .ip-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s3); }
+    .ip-card { border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); min-width: 0; }
+    .ip-card-head { padding: 12px 14px 0; font-size: 13px; font-weight: 600; color: var(--text); }
+    .ip-card-body { padding: 10px 14px 14px; display: grid; gap: 6px; }
+    .ip-kv { display: grid; grid-template-columns: 11ch minmax(0, 1fr); gap: 6px var(--s2); font-size: 12.5px; }
     .ip-kv dt { color: var(--text-3); }
     .ip-kv dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
-
-    .ip-note { font-size: 12px; color: var(--text-3); }
-
-    .ip-threat {
-      display: grid;
-      gap: 2px;
-      padding: var(--s2);
-      border-left: 3px solid var(--amber);
-      background: var(--bg);
-      font-size: 12px;
-    }
-    .ip-threat.high { border-left-color: var(--red); }
+    .ip-note { font-size: 12.5px; color: var(--text-3); }
+    .ip-threat { display: grid; gap: 2px; padding: 8px 10px; border-left: 3px solid var(--warn-dot); border-radius: var(--radius-sm); background: var(--warn-bg); font-size: 12.5px; }
+    .ip-threat.high { border-left-color: var(--danger-dot); background: var(--danger-bg); }
     .ip-threat strong { color: var(--text); }
     .ip-threat span { color: var(--text-2); }
-
-    .ip-stats {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: var(--surface-2);
-    }
-    .ip-stat { padding: var(--s3); border-right: 1px solid var(--line); min-width: 0; }
-    .ip-stat:last-child { border-right: 0; }
-    .ip-stat-label {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text-3);
-    }
-    .ip-stat-value {
-      margin-top: 2px;
-      font-size: 18px;
-      font-weight: 700;
-      color: var(--text);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .ip-stat-value.green { color: var(--green); }
-    .ip-stat-value.warn { color: var(--amber); }
-    .ip-stat-sub { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
     .ip-tops { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3); }
-
     .top-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
-    .top-item {
-      position: relative;
-      display: flex;
-      align-items: center;
-      gap: var(--s2);
-      padding: 5px var(--s2);
-      font-size: 12px;
-      isolation: isolate;
-    }
-    .top-bar {
-      position: absolute;
-      inset: 0 auto 0 0;
-      background: rgba(var(--green-rgb), 0.08);
-      border-right: 1px solid rgba(var(--green-rgb), 0.35);
-      z-index: -1;
-    }
-    .top-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-    .top-name .ip-link { color: var(--violet); }
-    .top-val { color: var(--text-2); white-space: nowrap; }
-
-    .ip-traffic { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-    .ip-traffic-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: var(--s3);
-      flex-wrap: wrap;
-      padding: var(--s2) var(--s3);
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-2);
-    }
+    .top-item { position: relative; display: flex; align-items: center; gap: var(--s2); padding: 6px 10px; font-size: 12.5px; isolation: isolate; border-radius: var(--radius-sm); overflow: hidden; }
+    .top-bar { position: absolute; inset: 0 auto 0 0; background: var(--info-bg); z-index: -1; }
+    .top-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-family: var(--font-mono); }
+    .top-name .ip-link { color: var(--violet-fg); }
+    .top-val { color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .ip-traffic { border: 1px solid var(--line); border-radius: var(--radius-md); overflow: hidden; }
+    .ip-traffic-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .ip-traffic .panel-title { font-size: 13.5px; }
     .ip-traffic .table-wrap { max-height: 46vh; }
+    .ip-traffic .log-table thead th:first-child, .ip-traffic .log-table tbody td:first-child { padding-left: 14px; }
+    .dir { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600; }
+    .dir.out { color: var(--warn-fg); background: var(--warn-bg); }
+    .dir.in { color: var(--info-fg); background: var(--info-bg); }
+    .ip-loading { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 48px var(--s4); color: var(--text-3); font-size: 13px; }
+    .ip-loading::before { content: ""; width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--info-dot); animation: spin 0.8s linear infinite; }
+    .ip-loading[hidden] { display: none; }
 
-    .dir {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    .dir.out { color: var(--amber); }
-    .dir.in { color: var(--cyan); }
+    /* ══ Canlı değer vurgusu ═══════════════════════════════════════════ */
+    .flash { animation: valueFlash 600ms var(--ease); border-radius: 6px; }
 
-    .log-table td.self { color: var(--text); font-weight: 700; }
+    /* ══ FTP butonu ve modalı ══════════════════════════════════════════ */
+    .btn-ftp .seal-badge { padding: 0 8px 0 6px; font-size: 12px; line-height: 18px; }
+    .btn-ftp.has-error { border-color: var(--danger-line); }
 
-    .ip-loading {
-      padding: 48px var(--s4);
-      text-align: center;
-      color: var(--text-3);
-      font-size: 13px;
-    }
-    .ip-loading::after {
-      content: "▌";
-      margin-left: 4px;
-      color: var(--green);
-      animation: blink 1s steps(1) infinite;
-    }
-
-    /* ── FTP arşivleme ve disk ───────────────────────────────────────── */
-    a.seal-badge { text-decoration: none; }
-    a.seal-badge:hover { color: var(--text); }
-    .seal-badge.warn { color: var(--amber); }
-    .seal-badge.warn::before { background: var(--amber); }
-
-    .archive-body { padding: var(--s4); display: grid; gap: var(--s4); }
-
-    .disk-row { display: grid; gap: var(--s2); }
-    .disk-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
-    .disk-pct { font-size: 18px; font-weight: 700; color: var(--text); }
-    .disk-pct.warn { color: var(--amber); }
-    .disk-pct.error { color: var(--red); }
-
-    .disk-bar {
+    .ftp-modal { position: fixed; inset: 0; z-index: 65; display: grid; place-items: center; padding: var(--s6); }
+    .ftp-dialog {
+      position: relative;
+      width: min(1100px, 100%);
+      max-height: calc(100vh - 48px);
       display: flex;
-      height: 12px;
+      flex-direction: column;
+      background: var(--surface);
       border: 1px solid var(--line);
-      border-radius: 2px;
-      background: var(--bg);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      animation: popIn 200ms var(--ease);
       overflow: hidden;
     }
-    .disk-fill { display: block; height: 100%; width: 0; transition: width 0.4s var(--ease); }
-    .disk-fill.logs { background: var(--cyan); }
-    .disk-fill.other { background: var(--text-3); }
+    .ftp-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: var(--s5) var(--s6);
+      border-bottom: 1px solid var(--line);
+    }
+    .ftp-head .panel-title { font-size: 16px; }
+    .ftp-dialog .archive-body { overflow-y: auto; }
 
-    .disk-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); font-size: 12px; color: var(--text-3); }
-    .disk-legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .disk-legend strong { color: var(--text); font-weight: 600; }
-    .kv-dot.disk-logs { background: var(--cyan); }
-    .kv-dot.disk-other { background: var(--text-3); }
-    .kv-dot.disk-free { background: var(--bg); border: 1px solid var(--line-2); }
-
-    .archive-foot { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); }
-    .archive-foot .seal-foot { min-width: 0; }
-
-    .archive-error {
-      padding: var(--s2) var(--s3);
-      border-left: 3px solid var(--red);
-      background: var(--bg);
-      font-size: 12px;
-      color: var(--text-2);
+    .ftp-section { display: grid; gap: var(--s3); padding-top: var(--s5); border-top: 1px solid var(--line); }
+    .test-row { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+    .test-output {
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: var(--radius);
+      background: var(--surface-3);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
-    .archive-error strong { color: var(--red); }
+    .test-output.error { background: var(--danger-bg); color: var(--danger-fg); }
+    .btn.is-loading { pointer-events: none; opacity: 0.7; }
+    .btn.is-loading::before { content: ""; width: 14px; height: 14px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: spin 0.8s linear infinite; }
 
-    .verify-box [hidden] { display: none !important; }
-    .verify-box { display: grid; gap: var(--s3); padding-top: var(--s4); border-top: 1px solid var(--line); }
-    .verify-head { display: grid; gap: 4px; }
-    .verify-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3); }
-    .date-input { min-width: 150px; padding-right: var(--s3); background: var(--bg); color-scheme: dark; cursor: text; }
-    .verify-check { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; font-size: 12px; color: var(--text-2); cursor: pointer; }
-    .verify-check input { accent-color: var(--green); }
-    .verify-status { font-size: 12px; color: var(--text-2); }
-    .verify-status.error { color: var(--red); }
-    .verify-progress { height: 6px; }
-    .verify-summary { display: flex; flex-wrap: wrap; gap: var(--s2); }
-    .vchip { padding: 3px 8px; border: 1px solid var(--line-2); border-radius: 2px; font-size: 12px; color: var(--text-2); }
-    .vchip strong { color: var(--text); }
-    .vchip.ok strong { color: var(--green); }
-    .vchip.warn strong { color: var(--amber); }
-    .vchip.error strong { color: var(--red); }
-    .verify-table { max-height: 40vh; border: 1px solid var(--line); }
-    .verify-table td.detail { white-space: normal; color: var(--text-2); min-width: 28ch; }
-    .vstate { font-weight: 700; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
-    .vstate.ok { color: var(--green); }
-    .vstate.warn { color: var(--amber); }
-    .vstate.error { color: var(--red); }
-    .vstate.missing { color: var(--text-3); }
+    /* Ana ekran uyarıları (FTP hatası, disk doluluğu) */
+    .alert-banner.danger { border-color: var(--danger-line); background: var(--danger-bg); color: var(--danger-fg); }
+    .alert-banner.danger .alert-icon { background: color-mix(in srgb, var(--danger-dot) 18%, transparent); }
+    .alert-action { flex: none; }
+    .alert-banner .alert-action.btn { background: var(--surface); color: var(--text); border-color: var(--line-2); }
+    #ftp-alert-detail { font-family: var(--font-mono); font-size: 12.5px; overflow-wrap: anywhere; }
+    .alerts { display: grid; gap: var(--s3); }
+    .alerts:not(:has(> :not([hidden]))) { display: none; }
 
-    .archive-panel.disabled .verify-box,
-    .archive-panel.disabled .archive-stats,
-    .archive-panel.disabled .archive-foot { opacity: 0.45; }
+    /* Log tablosu ekrana sığar; sayfa yerine tablo içinde kayar. */
+    .log-panel .table-wrap { height: calc(100vh - 200px); min-height: 380px; max-height: none; }
+    .log-meta { display: flex; align-items: center; gap: var(--s2); font-size: 12.5px; color: var(--text-3); }
 
-    /* ── Animasyonlar ────────────────────────────────────────────────── */
-    @keyframes blink { 50% { opacity: 0; } }
-    @keyframes pulse {
-      0% { box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0.55); }
-      70% { box-shadow: 0 0 0 6px rgba(var(--green-rgb), 0); }
-      100% { box-shadow: 0 0 0 0 rgba(var(--green-rgb), 0); }
+    /* ══ Animasyonlar ══════════════════════════════════════════════════ */
+    @keyframes softPulse {
+      0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--success-dot) 45%, transparent); }
+      70% { box-shadow: 0 0 0 6px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
     }
-    @keyframes rowEnter {
-      from { background-color: rgba(var(--green-rgb), 0.16); }
-      to { background-color: transparent; }
-    }
+    @keyframes rowEnter { from { background-color: color-mix(in srgb, var(--info-bg) 70%, transparent); } to { background-color: transparent; } }
+    @keyframes valueFlash { 0% { background-color: var(--info-bg); } 100% { background-color: transparent; } }
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    @keyframes popIn { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+    @keyframes popIn { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
     @keyframes slideIn { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes blink { 50% { opacity: 0; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -4912,43 +4798,59 @@ const dashboardHTML = `<!DOCTYPE html>
         animation-iteration-count: 1 !important;
         transition-duration: 0.01ms !important;
       }
-      .caret { opacity: 1; }
     }
 
-    /* ── Duyarlı düzen ───────────────────────────────────────────────── */
+    /* ══ Duyarlı düzen ═════════════════════════════════════════════════ */
     @media (max-width: 1180px) {
+      .statusline-inner { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .btn-ftp .btn-text { display: none; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .metric-rate { grid-column: 1 / -1; }
+      .ip-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
 
     @media (max-width: 1000px) {
       .ip-grid { grid-template-columns: minmax(0, 1fr); }
-      .ip-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .ip-stat:nth-child(3n) { border-right: 0; }
     }
 
     @media (max-width: 720px) {
-      .topbar-inner, .statusline-inner, .shell { padding-left: var(--s4); padding-right: var(--s4); }
-      .shell { padding-top: var(--s4); padding-bottom: var(--s4); }
+      .topbar-inner { padding: 12px var(--s4); }
+      .statusline-inner { padding: var(--s4) var(--s4) 0; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .shell { padding: var(--s4) var(--s4) var(--s6); gap: var(--s4); }
       .brand-sub { display: none; }
-      .brand-mark { display: none; }
+      .brand-mark { width: 34px; height: 34px; }
       .btn .btn-text { display: none; }
-      .btn { padding: 0 var(--s3); }
-      .metrics { grid-template-columns: minmax(0, 1fr); }
+      .btn-live #live-toggle-label { display: none; }
+      .btn-live { padding: 0 12px; }
+      .btn { padding: 0 12px; }
+      .metrics { grid-template-columns: minmax(0, 1fr); gap: var(--s4); }
+      .panel-head { padding: var(--s4) var(--s4) 0; }
+      .metric-body { padding: var(--s3) var(--s4) var(--s4); }
+      .archive-body { padding: var(--s4); }
+      .log-head { padding: var(--s4); }
+      .log-table thead th:first-child, .log-table tbody td:first-child { padding-left: var(--s4); }
+      .log-table thead th:last-child, .log-table tbody td:last-child { padding-right: var(--s4); }
       .stat-number { font-size: 34px; }
+      .sl-item { padding: 10px 12px; column-gap: 10px; }
+      .sl-icon { width: 30px; height: 30px; }
       .toolbar { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
       .toolbar .field-pager { grid-column: 1 / -1; }
       .select { width: 100%; min-width: 0; }
       .pager { justify-content: space-between; }
+      .ip-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #ftp-target { width: 100%; }
       .drawer-head, .drawer-body { padding-left: var(--s4); padding-right: var(--s4); }
+      .threat-modal-panel { border-radius: 0; }
       .threat-item { grid-template-columns: 1fr; }
       .threat-time { order: -1; }
-      .ip-modal { padding: 0; }
+      .ip-modal, .ftp-modal { padding: 0; }
+      .ftp-dialog { max-height: 100vh; height: 100%; border: 0; border-radius: 0; }
+      .ftp-head { padding: var(--s4); }
+      .alert-banner { flex-wrap: wrap; }
+      .alert-action { width: 100%; }
+      .log-panel .table-wrap { height: calc(100vh - 160px); }
       .ip-dialog { max-height: 100vh; height: 100%; border: 0; border-radius: 0; }
       .ip-head, .ip-body { padding-left: var(--s4); padding-right: var(--s4); }
-      .ip-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .ip-stat:nth-child(2n) { border-right: 0; }
-      .ip-stat { border-bottom: 1px solid var(--line); }
       .ip-tops { grid-template-columns: minmax(0, 1fr); }
     }
   </style>
@@ -4959,14 +4861,10 @@ const dashboardHTML = `<!DOCTYPE html>
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 12h4l2 6 4-14 2 8h6"/>
-          </svg>
-        </span>
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
         <div class="brand-text">
-          <h1 class="brand-title"><span class="host">netflow</span><span class="sep">@</span><span>logger</span><span class="sep">:</span><span class="path">~</span><span class="sep">$</span><span class="caret" aria-hidden="true"></span></h1>
-          <p class="brand-sub">NetFlow v9 · saatlik mühürlü kayıt paneli</p>
+          <h1 class="brand-title">NetFlow Logger</h1>
+          <p class="brand-sub">Saatlik mühürlü kayıt paneli</p>
         </div>
       </div>
       <nav class="actions" aria-label="Görünüm">
@@ -4974,12 +4872,19 @@ const dashboardHTML = `<!DOCTYPE html>
           <span class="dot" aria-hidden="true"></span>
           <span id="live-toggle-label">Canlı</span>
         </button>
+        <button type="button" class="btn btn-ftp" id="ftp-open" data-ftp-open hidden aria-haspopup="dialog" aria-controls="ftp-modal" title="FTP arşivleme, disk ve doğrulama">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 13v8"/><path d="M4 14.9A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.24"/><path d="m8 17 4-4 4 4"/></svg>
+          <span class="btn-text">FTP bilgileri</span>
+          <span class="seal-badge" id="ftp-badge">Kapalı</span>
+        </button>
         <button type="button" class="btn btn-threat" id="threat-toggle" aria-haspopup="dialog" aria-expanded="false" aria-controls="threat-modal" title="Güvenlik uyarılarını göster">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 2 4 5v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V5z"/><path d="M12 8v4"/><path d="M12 16h.01"/>
-          </svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
           <span class="btn-text">Güvenlik</span>
           <span class="count" id="threat-toggle-count" hidden>0</span>
+        </button>
+        <button type="button" class="icon-btn theme-toggle" id="theme-toggle" aria-label="Temayı değiştir" title="Açık / koyu tema">
+          <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+          <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
         </button>
       </nav>
     </div>
@@ -4988,26 +4893,27 @@ const dashboardHTML = `<!DOCTYPE html>
   <div class="statusline">
     <div class="statusline-inner">
       <div class="sl-item">
+        <span class="sl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.86a10 10 0 0 1 14 0"/><path d="M8.5 16.43a5 5 0 0 1 7 0"/></svg></span>
         <span class="sl-key">Bağlantı</span>
         <span class="status-badge" id="connection" role="status" aria-live="polite">Bağlanıyor</span>
       </div>
       <div class="sl-item">
+        <span class="sl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></span>
         <span class="sl-key">Güncelleme</span>
         <span class="sl-val" id="updated-at">-</span>
       </div>
       <div class="sl-item sl-file">
+        <span class="sl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg></span>
         <span class="sl-key">Dosya</span>
         <span class="sl-val" id="active-file" title="Aktif log dosyası">-</span>
       </div>
       <div class="sl-item">
+        <span class="sl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span>
         <span class="sl-key">Mühür</span>
         <span class="seal-badge" id="seal-badge">Bekliyor</span>
       </div>
       <div class="sl-item">
-        <span class="sl-key">FTP</span>
-        <a class="seal-badge" id="ftp-badge" href="#archive-panel">Kapalı</a>
-      </div>
-      <div class="sl-item">
+        <span class="sl-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg></span>
         <span class="sl-key">Tehdit</span>
         <span class="threat-badge" id="threat-badge">0</span>
       </div>
@@ -5015,10 +4921,28 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 
   <main class="shell">
+    <div class="alerts">
+      <div class="alert-banner danger" id="ftp-alert" role="alert" hidden>
+        <span class="alert-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m2 2 20 20"/><path d="M5.78 5.78A7 7 0 0 0 9 19h8.5a4.5 4.5 0 0 0 1.31-.2"/><path d="M21.53 16.39A4.5 4.5 0 0 0 17.5 10h-1.79A7 7 0 0 0 10.4 5.2"/></svg></span>
+        <div class="alert-text">
+          <div class="alert-title">FTP arşivlemede sorun var</div>
+          <div class="alert-detail" id="ftp-alert-detail">-</div>
+        </div>
+        <button type="button" class="btn alert-action" data-ftp-open>FTP bilgileri <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+      </div>
+      <div class="alert-banner" id="disk-alert-main" role="alert" hidden>
+        <span class="alert-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/></svg></span>
+        <div class="alert-text">
+          <div class="alert-title" id="disk-alert-title">Disk dolmaya başladı</div>
+          <div class="alert-detail" id="disk-alert-detail">-</div>
+        </div>
+        <button type="button" class="btn alert-action" id="disk-alert-action" data-ftp-open>FTP bilgileri <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+      </div>
+    </div>
     <section class="metrics" aria-label="Özet göstergeler">
       <article class="panel metric-rate">
         <header class="panel-head">
-          <span class="panel-tag">01</span>
+          <span class="panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/></svg></span>
           <h2 class="panel-title">Akış hızı</h2>
           <span class="spacer"></span>
           <span class="live-dot" id="rate-dot" aria-hidden="true"></span>
@@ -5034,15 +4958,16 @@ const dashboardHTML = `<!DOCTYPE html>
               <span>son 2 dk</span>
             </div>
           </div>
-          <div class="rate-chart">
+          <div class="rate-chart is-empty">
             <canvas id="rate-spark" role="img" aria-label="Son 2 dakikalık paket akış hızı grafiği"></canvas>
+            <div class="rate-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Son 2 dakikada trafik yok</span></div>
           </div>
         </div>
       </article>
 
       <article class="panel">
         <header class="panel-head">
-          <span class="panel-tag">02</span>
+          <span class="panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h16"/><path d="M4 15h16"/><path d="M10 3 8 21"/><path d="m16 3-2 18"/></svg></span>
           <h2 class="panel-title">Bütünlük mührü</h2>
         </header>
         <div class="metric-body">
@@ -5064,7 +4989,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
       <article class="panel">
         <header class="panel-head">
-          <span class="panel-tag">03</span>
+          <span class="panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg></span>
           <h2 class="panel-title">Dosya boyutları</h2>
         </header>
         <div class="metric-body">
@@ -5090,170 +5015,28 @@ const dashboardHTML = `<!DOCTYPE html>
       </article>
     </section>
 
-    <section class="panel archive-panel" id="archive-panel" aria-labelledby="archive-title">
-      <header class="panel-head">
-        <span class="panel-tag">05</span>
-        <h2 class="panel-title" id="archive-title">FTP arşivleme ve disk</h2>
-        <span class="seal-badge" id="ftp-state">Kapalı</span>
-        <span class="spacer"></span>
-        <span class="panel-meta" id="ftp-target">-</span>
-      </header>
-      <div class="archive-body">
-        <div class="disk-row">
-          <div class="disk-head">
-            <span class="sha-label">Disk doluluğu</span>
-            <span class="disk-pct" id="disk-pct">-</span>
-          </div>
-          <div class="disk-bar" role="progressbar" aria-label="Disk doluluğu" aria-valuemin="0" aria-valuemax="100" id="disk-bar">
-            <span class="disk-fill logs" id="disk-fill-logs"></span>
-            <span class="disk-fill other" id="disk-fill-other"></span>
-          </div>
-          <div class="disk-legend">
-            <span><i class="kv-dot disk-logs" aria-hidden="true"></i>Log dizini <strong id="disk-logs">-</strong></span>
-            <span><i class="kv-dot disk-other" aria-hidden="true"></i>Diğer <strong id="disk-other">-</strong></span>
-            <span><i class="kv-dot disk-free" aria-hidden="true"></i>Boş <strong id="disk-free">-</strong> / <span id="disk-total">-</span></span>
-          </div>
-        </div>
-        <div class="ip-stats archive-stats">
-          <div class="ip-stat">
-            <div class="ip-stat-label">Yüklendi, yerelde</div>
-            <div class="ip-stat-value green" id="ftp-uploaded">-</div>
-            <div class="ip-stat-sub" id="ftp-uploaded-size">-</div>
-          </div>
-          <div class="ip-stat">
-            <div class="ip-stat-label">Yükleme bekliyor</div>
-            <div class="ip-stat-value" id="ftp-pending">-</div>
-            <div class="ip-stat-sub" id="ftp-pending-size">-</div>
-          </div>
-          <div class="ip-stat">
-            <div class="ip-stat-label">Atlanan (geriye dönük kapalı)</div>
-            <div class="ip-stat-value" id="ftp-skipped">-</div>
-            <div class="ip-stat-sub" id="ftp-skipped-size">-</div>
-          </div>
-          <div class="ip-stat">
-            <div class="ip-stat-label">Silinen (bu oturum)</div>
-            <div class="ip-stat-value" id="ftp-deleted">-</div>
-            <div class="ip-stat-sub" id="ftp-deleted-size">-</div>
-          </div>
-          <div class="ip-stat">
-            <div class="ip-stat-label">Yerel saklama</div>
-            <div class="ip-stat-value" id="ftp-retention">-</div>
-            <div class="ip-stat-sub" id="ftp-oldest">-</div>
-          </div>
-          <div class="ip-stat">
-            <div class="ip-stat-label">Sonraki silme</div>
-            <div class="ip-stat-value" id="ftp-next-delete">-</div>
-            <div class="ip-stat-sub" id="ftp-next-delete-date">-</div>
-          </div>
-        </div>
-        <div class="archive-foot">
-          <span class="seal-foot" id="ftp-last-upload">Son yükleme: -</span>
-          <span class="seal-foot" id="ftp-last-scan">Son tarama: -</span>
-        </div>
-        <div class="archive-error" id="ftp-error" role="alert" hidden></div>
-
-        <div class="verify-box" id="verify-box">
-          <div class="verify-head">
-            <span class="sha-label">FTP paket doğrulaması</span>
-            <span class="panel-meta">Paketler FTP'den indirilir; .log SHA-256 değeri .sha256 ve .tsr ile karşılaştırılır, eksik saatler raporlanır.</span>
-          </div>
-          <form class="toolbar verify-toolbar" id="verify-form">
-            <div class="field">
-              <label for="verify-from">Başlangıç</label>
-              <input type="date" id="verify-from" class="select date-input" required>
-            </div>
-            <div class="field">
-              <label for="verify-to">Bitiş</label>
-              <input type="date" id="verify-to" class="select date-input" required>
-            </div>
-            <button type="submit" class="btn btn-accent" id="verify-start">Doğrula</button>
-            <button type="button" class="btn btn-danger" id="verify-stop" hidden>Durdur</button>
-            <label class="verify-check"><input type="checkbox" id="verify-all"> Tüm saatleri göster</label>
-          </form>
-          <div class="verify-status" id="verify-status" aria-live="polite">Henüz doğrulama yapılmadı.</div>
-          <div class="disk-bar verify-progress" id="verify-progress" hidden><span class="disk-fill logs" id="verify-progress-fill"></span></div>
-          <div class="verify-summary" id="verify-summary" hidden>
-            <span class="vchip ok"><strong id="vs-ok">0</strong> sağlam</span>
-            <span class="vchip warn"><strong id="vs-warn">0</strong> uyarı</span>
-            <span class="vchip error"><strong id="vs-error">0</strong> hata</span>
-            <span class="vchip missing"><strong id="vs-missing">0</strong> FTP'de yok</span>
-            <span class="vchip">paket <strong id="vs-archive">-</strong> · log <strong id="vs-log">-</strong></span>
-          </div>
-          <div class="table-wrap verify-table" id="verify-table-wrap" hidden>
-            <table class="log-table">
-              <thead>
-                <tr>
-                  <th scope="col">Saat</th>
-                  <th scope="col">Durum</th>
-                  <th scope="col" class="num">Paket</th>
-                  <th scope="col" class="num">Log</th>
-                  <th scope="col">Ayrıntı</th>
-                </tr>
-              </thead>
-              <tbody id="verify-rows"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <div class="alert-banner" id="no-data-alert" role="alert" hidden>
-      <span class="alert-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 9v4"/><path d="M12 17h.01"/>
-          <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
-        </svg>
-      </span>
+      <span class="alert-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></span>
       <div class="alert-text">
         <div class="alert-title">Log verisi gelmiyor</div>
         <div class="alert-detail" id="no-data-detail">Dinlenen porta NetFlow kaydı ulaşmıyor — arka planda kontrol ediliyor…</div>
       </div>
       <span class="alert-pulse" aria-hidden="true"></span>
+      <button type="button" class="icon-btn alert-close" id="no-data-close" aria-label="Uyarıyı kapat" title="Kapat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
     </div>
 
     <section class="panel log-panel" id="log-panel" tabindex="-1" aria-labelledby="log-title">
       <header class="log-head">
         <div>
           <div class="log-title">
-            <span class="panel-tag">04</span>
+            <span class="panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/></svg></span>
             <h2 class="panel-title" id="log-title">Log kayıtları</h2>
           </div>
-          <p class="panel-sub" id="table-subtitle">Canlı modda bellekte tutulan en yeni 1000 kayıt sayfalı olarak gösterilir.</p>
+          <p class="panel-sub" id="table-subtitle">Yeni kayıtlar anlık olarak üste eklenir.</p>
         </div>
-        <div class="toolbar">
-          <div class="field">
-            <label for="date-select">Gün</label>
-            <select id="date-select" class="select">
-              <option value="">Canlı görünüm</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="hour-select">Saat</label>
-            <select id="hour-select" class="select" disabled>
-              <option value="">Saat seç</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="limit-select">Satır</label>
-            <select id="limit-select" class="select">
-              <option value="50" selected>50</option>
-              <option value="100">100</option>
-              <option value="250">250</option>
-              <option value="500">500</option>
-            </select>
-          </div>
-          <div class="field field-pager">
-            <span class="field-label" id="pager-label">Sayfa</span>
-            <div class="pager" role="group" aria-labelledby="pager-label">
-              <button type="button" class="btn" id="prev-page" aria-label="Önceki sayfa">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
-              </button>
-              <span class="pager-info" id="page-info" aria-live="polite">1 / 1</span>
-              <button type="button" class="btn" id="next-page" aria-label="Sonraki sayfa">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
-              </button>
-            </div>
-          </div>
+        <div class="log-meta">
+          <span class="live-dot active" aria-hidden="true"></span>
+          <span>En yeni 250 kayıt</span>
         </div>
       </header>
       <div class="table-wrap">
@@ -5347,6 +5130,133 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="form-error" id="whitelist-error" role="alert" hidden></div>
           <div class="chip-list" id="whitelist-list">
             <div class="list-empty" id="whitelist-empty">Henüz görmezden gelinen kaynak eklenmedi.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="ftp-modal" id="ftp-modal" hidden>
+    <div class="ip-modal-backdrop" data-ftp-close></div>
+    <section class="ftp-dialog archive-panel" id="archive-panel" role="dialog" aria-modal="true" aria-labelledby="archive-title">
+      <header class="ftp-head">
+        <span class="panel-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/></svg></span>
+        <h2 class="panel-title" id="archive-title">FTP bilgileri</h2>
+        <span class="seal-badge" id="ftp-state">Kapalı</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="panel-meta" id="ftp-target">-</span>
+        <button type="button" class="icon-btn" data-ftp-close aria-label="FTP bilgilerini kapat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+      </header>
+      <div class="archive-body">
+        <div class="disk-row">
+          <div class="disk-head">
+            <span class="sha-label">Disk doluluğu</span>
+            <span class="disk-pct" id="disk-pct">-</span>
+          </div>
+          <div class="disk-bar" role="progressbar" aria-label="Disk doluluğu" aria-valuemin="0" aria-valuemax="100" id="disk-bar">
+            <span class="disk-fill logs" id="disk-fill-logs"></span>
+            <span class="disk-fill other" id="disk-fill-other"></span>
+          </div>
+          <div class="disk-legend">
+            <span><i class="kv-dot disk-logs" aria-hidden="true"></i>Log dizini <strong id="disk-logs">-</strong></span>
+            <span><i class="kv-dot disk-other" aria-hidden="true"></i>Diğer <strong id="disk-other">-</strong></span>
+            <span><i class="kv-dot disk-free" aria-hidden="true"></i>Boş <strong id="disk-free">-</strong> / <span id="disk-total">-</span></span>
+          </div>
+        </div>
+        <div class="disk-alert" role="status">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+          <span><span class="when-warn">Disk doluluğu %80'in üzerinde. Yerel saklama süresini kısaltmayı veya FTP yüklemelerini kontrol etmeyi düşünün.</span><span class="when-error">Disk kritik seviyede dolu. Yeni kayıtlar yazılamayabilir; FTP'ye yüklenen eski saatler silindikçe alan açılacak.</span></span>
+        </div>
+        <div class="ip-stats archive-stats">
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yüklendi, yerelde</div>
+            <div class="ip-stat-value green" id="ftp-uploaded">-</div>
+            <div class="ip-stat-sub" id="ftp-uploaded-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yükleme bekliyor</div>
+            <div class="ip-stat-value" id="ftp-pending">-</div>
+            <div class="ip-stat-sub" id="ftp-pending-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Atlanan (geriye dönük kapalı)</div>
+            <div class="ip-stat-value" id="ftp-skipped">-</div>
+            <div class="ip-stat-sub" id="ftp-skipped-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Silinen (bu oturum)</div>
+            <div class="ip-stat-value" id="ftp-deleted">-</div>
+            <div class="ip-stat-sub" id="ftp-deleted-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yerel saklama</div>
+            <div class="ip-stat-value" id="ftp-retention">-</div>
+            <div class="ip-stat-sub" id="ftp-oldest">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Sonraki silme</div>
+            <div class="ip-stat-value" id="ftp-next-delete">-</div>
+            <div class="ip-stat-sub" id="ftp-next-delete-date">-</div>
+          </div>
+        </div>
+        <div class="archive-foot">
+          <span class="seal-foot" id="ftp-last-upload">Son yükleme: -</span>
+          <span class="seal-foot" id="ftp-last-scan">Son tarama: -</span>
+        </div>
+        <div class="archive-error" id="ftp-error" role="alert" hidden></div>
+
+        <div class="ftp-section" id="ftp-test-box">
+          <div class="verify-head">
+            <span class="sha-label">Bağlantı testi</span>
+            <span class="panel-meta">Sunucuya bağlanır, oturum açar, önek klasörüne küçük bir dosya yükleyip geri okur ve siler.</span>
+          </div>
+          <div class="test-row">
+            <button type="button" class="btn btn-accent" id="ftp-test-run"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg><span>Bağlantıyı test et</span></button>
+            <span class="vstate" id="ftp-test-result" hidden></span>
+          </div>
+          <pre class="test-output" id="ftp-test-output" hidden></pre>
+        </div>
+
+        <div class="verify-box" id="verify-box">
+          <div class="verify-head">
+            <span class="sha-label">FTP paket doğrulaması</span>
+            <span class="panel-meta">Paketler FTP'den indirilir; .log SHA-256 değeri .sha256 ve .tsr ile karşılaştırılır, eksik saatler raporlanır.</span>
+          </div>
+          <form class="toolbar verify-toolbar" id="verify-form">
+            <div class="field">
+              <label for="verify-from">Başlangıç</label>
+              <input type="date" id="verify-from" class="select date-input" required>
+            </div>
+            <div class="field">
+              <label for="verify-to">Bitiş</label>
+              <input type="date" id="verify-to" class="select date-input" required>
+            </div>
+            <button type="submit" class="btn btn-accent" id="verify-start">Doğrula</button>
+            <button type="button" class="btn btn-danger" id="verify-stop" hidden>Durdur</button>
+            <label class="verify-check"><input type="checkbox" id="verify-all"> Tüm saatleri göster</label>
+          </form>
+          <div class="verify-status" id="verify-status" aria-live="polite">Henüz doğrulama yapılmadı.</div>
+          <div class="disk-bar verify-progress" id="verify-progress" hidden><span class="disk-fill logs" id="verify-progress-fill"></span></div>
+          <div class="verify-summary" id="verify-summary" hidden>
+            <span class="vchip ok"><strong id="vs-ok">0</strong> sağlam</span>
+            <span class="vchip warn"><strong id="vs-warn">0</strong> uyarı</span>
+            <span class="vchip error"><strong id="vs-error">0</strong> hata</span>
+            <span class="vchip missing"><strong id="vs-missing">0</strong> FTP'de yok</span>
+            <span class="vchip">paket <strong id="vs-archive">-</strong> · log <strong id="vs-log">-</strong></span>
+          </div>
+          <div class="table-wrap verify-table" id="verify-table-wrap" hidden>
+            <table class="log-table">
+              <thead>
+                <tr>
+                  <th scope="col">Saat</th>
+                  <th scope="col">Durum</th>
+                  <th scope="col" class="num">Paket</th>
+                  <th scope="col" class="num">Log</th>
+                  <th scope="col">Ayrıntı</th>
+                </tr>
+              </thead>
+              <tbody id="verify-rows"></tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -5449,15 +5359,11 @@ const dashboardHTML = `<!DOCTYPE html>
     const updatedAtEl = $('updated-at');
     const recordsEl = $('records');
     const connectionEl = $('connection');
-    const dateSelectEl = $('date-select');
-    const hourSelectEl = $('hour-select');
-    const limitSelectEl = $('limit-select');
+    // Ana ekran yalnız canlı akışı gösterir; tablo en yeni LIVE_LIMIT kaydı tutar.
+    const LIVE_LIMIT = 250;
     const liveToggleEl = $('live-toggle');
     const liveToggleLabelEl = $('live-toggle-label');
     const tableSubtitleEl = $('table-subtitle');
-    const prevPageEl = $('prev-page');
-    const nextPageEl = $('next-page');
-    const pageInfoEl = $('page-info');
     const fileSizeHourlyEl = $('file-size-hourly');
     const fileSizeDailyEl = $('file-size-daily');
     const fileSizeMonthlyEl = $('file-size-monthly');
@@ -5554,10 +5460,13 @@ const dashboardHTML = `<!DOCTYPE html>
         lastProcessedAt = now;
         return;
       }
-      if (lastProcessed !== null && now > lastProcessedAt) {
+      if (lastProcessed !== null) {
         const dt = (now - lastProcessedAt) / 1000;
+        // 0,4 sn'den kısa aralıklarda referans korunur; aksi halde sık gelen
+        // güncellemelerde hız hiç hesaplanamaz ve 0'da kalır.
+        if (dt < 0.4) return;
         const delta = total - lastProcessed;
-        if (dt >= 0.4 && delta >= 0) {
+        if (delta >= 0) {
           const instant = delta / dt;
           rateEma = rateEma === 0 ? instant : rateEma * 0.6 + instant * 0.4;
         }
@@ -5605,9 +5514,10 @@ const dashboardHTML = `<!DOCTYPE html>
       ratePeakEl.innerHTML = 'tepe <strong>' + formatRate(peak) + '</strong>';
       rateSparkEl.setAttribute('aria-label', 'Son 2 dakikalık paket akış hızı grafiği, tepe ' + formatRate(peak) + ' paket/sn');
 
+      rateSparkEl.parentElement.classList.toggle('is-empty', n < 2 || peak <= 0);
       if (n < 2 || peak <= 0) return;
 
-      const green = cssVar('--green') || '#3ee08a';
+      const green = cssVar('--green') || '#2fb36f';
       const rgb = cssVar('--green-rgb') || '62, 224, 138';
       const padTop = 8;
       const baseY = h - 1;
@@ -5618,8 +5528,8 @@ const dashboardHTML = `<!DOCTYPE html>
       const yAt = (v) => baseY - v * scaleY;
 
       const grad = ctx.createLinearGradient(0, padTop, 0, baseY);
-      grad.addColorStop(0, 'rgba(' + rgb + ', 0.32)');
-      grad.addColorStop(1, 'rgba(' + rgb + ', 0.02)');
+      grad.addColorStop(0, 'rgba(' + rgb + ', 0.22)');
+      grad.addColorStop(1, 'rgba(' + rgb + ', 0)');
 
       ctx.beginPath();
       ctx.moveTo(xAt(0), baseY);
@@ -5635,14 +5545,15 @@ const dashboardHTML = `<!DOCTYPE html>
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.lineJoin = 'round';
-      ctx.lineWidth = 1.5;
+      ctx.lineCap = 'round';
+      ctx.lineWidth = 2;
       ctx.strokeStyle = green;
       ctx.stroke();
 
       // Tepe çizgisi (kesikli).
       const py = Math.round(yAt(peak)) + 0.5;
       ctx.setLineDash([3, 4]);
-      ctx.strokeStyle = 'rgba(' + rgb + ', 0.35)';
+      ctx.strokeStyle = 'rgba(' + rgb + ', 0.28)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, py);
@@ -5650,10 +5561,12 @@ const dashboardHTML = `<!DOCTYPE html>
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Son nokta: terminal imleci gibi küçük kare.
-      const lx = xAt(n - 1), ly = yAt(rateSamples[n - 1]);
+      // Son nokta: küçük yuvarlak işaret.
+      const lx = Math.min(xAt(n - 1), w - 4), ly = yAt(rateSamples[n - 1]);
       ctx.fillStyle = green;
-      ctx.fillRect(Math.min(lx, w - 4) - 2, ly - 2, 5, 5);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+      ctx.fill();
     }
 
     function sampleRate() {
@@ -5864,7 +5777,7 @@ const dashboardHTML = `<!DOCTYPE html>
         + '</tr>';
     }
 
-    const emptyRowsMarkup = '<tr class="empty-row"><td colspan="8"><div class="empty-title">kayıt bulunamadı</div><div>Seçilen gün ve saat için gösterilecek log kaydı yok.</div></td></tr>';
+    const emptyRowsMarkup = '<tr class="empty-row"><td colspan="8"><div class="empty-title">Henüz log kaydı yok</div><div>NetFlow kayıtları geldikçe burada anlık olarak görünecek.</div></td></tr>';
 
     // Statik (geçmiş) görünüm: tam yeniden çizim, sunucu sırasıyla.
     function renderRows(records) {
@@ -5938,37 +5851,12 @@ const dashboardHTML = `<!DOCTYPE html>
       connectionEl.className = 'status-badge' + (mode ? ' ' + mode : '');
     }
 
-    function renderDateOptions(dates, selectedDate) {
-      dateSelectEl.innerHTML = '<option value="">Canlı görünüm</option>';
-      (dates || []).forEach((date) => {
-        const option = document.createElement('option');
-        option.value = date;
-        option.textContent = date;
-        if (date === selectedDate) option.selected = true;
-        dateSelectEl.appendChild(option);
-      });
-    }
-
-    function renderHourOptions(hours, selectedHour) {
-      hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
-      (hours || []).forEach((hour) => {
-        const option = document.createElement('option');
-        option.value = hour;
-        option.textContent = hour + ':00';
-        if (hour === selectedHour) option.selected = true;
-        hourSelectEl.appendChild(option);
-      });
-      hourSelectEl.disabled = !(hours && hours.length);
-    }
-
     function applyMode(mode) {
       currentMode = mode;
       const live = mode !== 'historical';
       liveToggleEl.classList.toggle('live', live);
       liveToggleLabelEl.textContent = live ? 'Canlı' : 'Canlıya dön';
-      tableSubtitleEl.textContent = live
-        ? 'Canlı modda yeni kayıtlar üste eklenir, eskiler aşağı kayar. En yeni 1000 kayıt sayfalı tutulur.'
-        : 'Seçilen saatlik log dosyasının başından belirlenen satır sayısı gösterilir.';
+      tableSubtitleEl.textContent = 'Yeni kayıtlar anlık olarak üste eklenir.';
     }
 
     const THREAT_RULE_LABELS = {
@@ -6080,7 +5968,7 @@ const dashboardHTML = `<!DOCTYPE html>
         if (total > 0) {
           const pct = used / total * 100;
           pctEl.textContent = '%' + pct.toFixed(1) + ' dolu';
-          pctEl.className = 'disk-pct' + (pct >= 95 ? ' error' : pct >= 85 ? ' warn' : '');
+          pctEl.className = 'disk-pct' + (pct >= 95 ? ' error' : pct >= 80 ? ' warn' : '');
           $('disk-fill-logs').style.width = Math.min(100, logs / total * 100) + '%';
           $('disk-fill-other').style.width = Math.min(100, other / total * 100) + '%';
           $('disk-bar').setAttribute('aria-valuenow', pct.toFixed(0));
@@ -6100,7 +5988,10 @@ const dashboardHTML = `<!DOCTYPE html>
       archivePanelEl.classList.toggle('disabled', !ftp.enabled);
       $('ftp-retention').textContent = ftp.retention_days > 0 ? ftp.retention_days + ' gün' : 'silme kapalı';
 
+      $('ftp-open').hidden = !ftp.enabled;
+      $('ftp-open').classList.toggle('has-error', ftp.state === 'error');
       if (!ftp.enabled) {
+        closeFtpModal();
         setBadge(badgeEl, 'Kapalı', '');
         setBadge(stateEl, 'Kapalı', '');
         $('ftp-target').textContent = 'FTP_ENABLED=false';
@@ -6271,19 +6162,15 @@ const dashboardHTML = `<!DOCTYPE html>
       const mode = state.mode || 'live';
       if (mode === 'live' && currentMode === 'historical') return;
       applyMode(mode);
-      currentPage = state.page || 1;
-      const totalPages = state.total_pages || 1;
-      renderDateOptions(state.available_dates || [], state.selected_date || '');
-      renderHourOptions(state.available_hours || [], state.selected_hour || '');
-      limitSelectEl.value = String(state.limit || 50);
+      currentPage = 1;
       updatedAtEl.textContent = formatTime(state.updated_at || '');
-      pageInfoEl.textContent = currentPage + ' / ' + totalPages;
       fileSizeHourlyEl.textContent = state.file_size || '-';
       fileSizeDailyEl.textContent = state.file_size_daily || '-';
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
       updateIntegrity(state);
       updateArchive(state);
+      updateMainAlerts(state);
       if (Array.isArray(state.threats)) updateThreats(state.threats);
       const isLive = mode === 'live';
       if (isLive) {
@@ -6292,9 +6179,7 @@ const dashboardHTML = `<!DOCTYPE html>
       } else {
         resetThroughput();
       }
-      prevPageEl.disabled = currentPage <= 1;
-      nextPageEl.disabled = currentPage >= totalPages;
-      if (isLive && currentPage === 1) renderLiveRows(state);
+      if (isLive) renderLiveRows(state);
       else renderRows(state.records || []);
       evaluateDataFlow();
     }
@@ -6322,37 +6207,14 @@ const dashboardHTML = `<!DOCTYPE html>
 
     async function fetchState() {
       const params = new URLSearchParams();
-      if (dateSelectEl.value) params.set('date', dateSelectEl.value);
-      if (hourSelectEl.value) params.set('hour', hourSelectEl.value);
-      params.set('limit', limitSelectEl.value || '50');
-      params.set('page', String(currentPage || 1));
+      params.set('limit', String(LIVE_LIMIT));
+      params.set('page', '1');
 
       const response = await fetch('/api/state?' + params.toString(), { cache: 'no-store' });
       if (!response.ok) throw new Error('Log durumu alınamadı');
       const state = await response.json();
       render(state);
       return state;
-    }
-
-    async function refreshHistorical() {
-      stopLiveStream();
-      setConnectionState('Geçmiş görünüm', null);
-      await fetchState();
-    }
-
-    async function changePage(page) {
-      currentPage = page;
-      if (currentMode === 'historical') {
-        await refreshHistorical();
-        return;
-      }
-      await fetchState();
-      if (currentPage === 1) {
-        startLiveStream();
-      } else {
-        stopLiveStream();
-        setConnectionState('Canlı akış yalnızca 1. sayfada', null);
-      }
     }
 
     async function pollLiveState() {
@@ -6377,7 +6239,7 @@ const dashboardHTML = `<!DOCTYPE html>
       }
 
       const params = new URLSearchParams();
-      params.set('limit', limitSelectEl.value || '50');
+      params.set('limit', String(LIVE_LIMIT));
       eventSource = new EventSource('/events?' + params.toString());
 
       eventSource.addEventListener('state', (event) => {
@@ -6410,49 +6272,10 @@ const dashboardHTML = `<!DOCTYPE html>
       }, 1000);
     }
 
-    dateSelectEl.addEventListener('change', async () => {
-      currentPage = 1;
-      hourSelectEl.value = '';
-      if (!dateSelectEl.value) {
-        currentMode = 'live';
-        await fetchState();
-        startLiveStream();
-        return;
-      }
-      stopLiveStream();
-      currentMode = 'historical';
-      await fetchState();
-      setConnectionState('Saat seçimi bekleniyor', null);
-      applyMode('historical');
-    });
-
-    hourSelectEl.addEventListener('change', async () => {
-      currentPage = 1;
-      if (!dateSelectEl.value || !hourSelectEl.value) return;
-      await refreshHistorical();
-    });
-
-    limitSelectEl.addEventListener('change', async () => {
-      currentPage = 1;
-      if (dateSelectEl.value && hourSelectEl.value) {
-        await refreshHistorical();
-        return;
-      }
-      if (!dateSelectEl.value && !hourSelectEl.value) {
-        await fetchState();
-        startLiveStream();
-        return;
-      }
-      await fetchState();
-    });
-
     liveToggleEl.addEventListener('click', async () => {
       closeThreatModal();
       currentMode = 'live';
       currentPage = 1;
-      dateSelectEl.value = '';
-      hourSelectEl.innerHTML = '<option value="">Saat seç</option>';
-      hourSelectEl.disabled = true;
       await fetchState();
       startLiveStream();
     });
@@ -6749,14 +6572,6 @@ const dashboardHTML = `<!DOCTYPE html>
       if (btn) removeBlock(btn.getAttribute('data-ip'));
     });
 
-    prevPageEl.addEventListener('click', async () => {
-      if (currentPage <= 1) return;
-      await changePage(currentPage - 1);
-    });
-
-    nextPageEl.addEventListener('click', async () => {
-      await changePage(currentPage + 1);
-    });
 
     async function copyToClipboard(text) {
       try {
@@ -7067,6 +6882,143 @@ const dashboardHTML = `<!DOCTYPE html>
     }).catch((error) => {
       setConnectionState(error.message, 'error');
     });
+
+    // ── Ana ekran uyarıları: FTP hatası ve disk doluluğu ──
+    function updateMainAlerts(state) {
+      const ftp = state.ftp;
+      const disk = state.disk;
+      const ftpOn = !!(ftp && ftp.enabled);
+
+      if (ftp) {
+        const ftpAlert = $('ftp-alert');
+        ftpAlert.hidden = !(ftpOn && ftp.state === 'error');
+        if (!ftpAlert.hidden) {
+          $('ftp-alert-detail').textContent = (ftp.last_error_at ? formatDateTime(ftp.last_error_at) + ' · ' : '') + (ftp.last_error || 'Bağlantı kurulamıyor');
+        }
+        $('disk-alert-action').hidden = !ftpOn;
+      }
+
+      if (disk) {
+        const total = Number(disk.total) || 0;
+        const used = Number(disk.used) || 0;
+        const pct = total > 0 ? used / total * 100 : 0;
+        const diskAlert = $('disk-alert-main');
+        diskAlert.hidden = pct < 80;
+        if (!diskAlert.hidden) {
+          const critical = pct >= 95;
+          diskAlert.classList.toggle('danger', critical);
+          $('disk-alert-title').textContent = critical ? 'Disk kritik seviyede dolu' : 'Disk dolmaya başladı';
+          $('disk-alert-detail').textContent = 'Doluluk %' + pct.toFixed(1) + ' · boş ' + formatBytes(disk.free) + ' / ' + formatBytes(total)
+            + (critical ? ' — yeni kayıtlar yazılamayabilir.' : '');
+        }
+      }
+    }
+
+    // ── FTP bilgileri modalı ──
+    const ftpModalEl = $('ftp-modal');
+    let ftpLastFocus = null;
+
+    function openFtpModal() {
+      if (!ftpModalEl.hidden) return;
+      ftpLastFocus = document.activeElement;
+      ftpModalEl.hidden = false;
+      document.body.style.overflow = 'hidden';
+      loadVerifyJob();
+      const closeBtn = ftpModalEl.querySelector('.ftp-head [data-ftp-close]');
+      if (closeBtn) closeBtn.focus();
+    }
+
+    function closeFtpModal() {
+      if (ftpModalEl.hidden) return;
+      ftpModalEl.hidden = true;
+      document.body.style.overflow = '';
+      if (ftpLastFocus && typeof ftpLastFocus.focus === 'function' && document.contains(ftpLastFocus)) ftpLastFocus.focus();
+      ftpLastFocus = null;
+    }
+
+    document.addEventListener('click', (event) => {
+      if (event.target.closest('[data-ftp-open]')) openFtpModal();
+      else if (event.target.closest('[data-ftp-close]')) closeFtpModal();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !ftpModalEl.hidden && $('ip-modal').hidden) closeFtpModal();
+    });
+
+    // ── FTP bağlantı testi ──
+    (function initFtpTest() {
+      const runBtn = $('ftp-test-run');
+      const resultEl = $('ftp-test-result');
+      const outputEl = $('ftp-test-output');
+      runBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        runBtn.classList.add('is-loading');
+        resultEl.hidden = false;
+        resultEl.className = 'vstate';
+        resultEl.textContent = 'Test ediliyor…';
+        try {
+          const response = await fetch('/api/ftp/test', { method: 'POST', cache: 'no-store' });
+          const data = await response.json().catch(() => ({}));
+          const ok = response.ok && data.ok;
+          resultEl.className = 'vstate ' + (ok ? 'ok' : 'error');
+          resultEl.textContent = ok ? 'Bağlantı başarılı' : 'Bağlantı başarısız';
+          outputEl.hidden = false;
+          outputEl.classList.toggle('error', !ok);
+          outputEl.textContent = [data.output, data.error].filter(Boolean).join('\n') || (ok ? 'Test başarılı.' : 'Test başarısız.');
+        } catch (err) {
+          resultEl.className = 'vstate error';
+          resultEl.textContent = 'İstek başarısız';
+          outputEl.hidden = false;
+          outputEl.classList.add('error');
+          outputEl.textContent = err.message;
+        } finally {
+          runBtn.disabled = false;
+          runBtn.classList.remove('is-loading');
+        }
+      });
+    })();
+
+    // ── Tema geçişi (seçim localStorage'da saklanır) ──
+    (function initThemeToggle() {
+      const btn = $('theme-toggle');
+      if (!btn) return;
+      btn.addEventListener('click', () => {
+        const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        try { localStorage.setItem('netflow-theme', next); } catch (e) {}
+        drawRateChart();
+      });
+    })();
+
+    // ── "Log verisi gelmiyor" uyarısını kapatma ──
+    // Kapatılan uyarı, veri akışı yeniden başlayıp uyarı kendiliğinden
+    // gizlenene kadar gösterilmez.
+    (function initNoDataDismiss() {
+      const banner = $('no-data-alert');
+      const closeBtn = $('no-data-close');
+      if (!banner || !closeBtn) return;
+      closeBtn.addEventListener('click', () => banner.classList.add('dismissed'));
+      new MutationObserver(() => {
+        if (banner.hidden) banner.classList.remove('dismissed');
+      }).observe(banner, { attributes: true, attributeFilter: ['hidden'] });
+    })();
+
+    // ── Canlı değer değişimlerinde hafif vurgu ──
+    (function initValueFlash() {
+      const ids = ['file-size-hourly', 'file-size-daily', 'file-size-monthly', 'file-size-total',
+        'ftp-uploaded', 'ftp-pending', 'ftp-deleted', 'disk-pct', 'threat-badge'];
+      ids.forEach((id) => {
+        const el = $(id);
+        if (!el) return;
+        let last = el.textContent;
+        new MutationObserver(() => {
+          if (el.textContent === last) return;
+          last = el.textContent;
+          el.classList.remove('flash');
+          void el.offsetWidth;
+          el.classList.add('flash');
+        }).observe(el, { childList: true, characterData: true, subtree: true });
+      });
+    })();
   </script>
 </body>
 </html>`

@@ -639,6 +639,16 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 		}
 	}
 
+	// Bu taramada yükleme yapılmadıysa da sunucuya ulaşılabildiğini doğrula;
+	// böylece bağlantı kopması yüklenecek dosya beklenmeden fark edilir.
+	if conn == nil && !dialFailed && ctx.Err() == nil {
+		if c, err := dialFTP(ctx, a.cfg); err != nil {
+			fail("%v (sonraki taramada yeniden denenecek)", err)
+		} else {
+			_ = c.Quit()
+		}
+	}
+
 	publish(len(hours), true)
 }
 
