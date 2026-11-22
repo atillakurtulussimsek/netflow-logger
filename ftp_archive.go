@@ -291,6 +291,64 @@ type FTPArchiver struct {
 
 	trigger chan struct{}
 	runMu   sync.Mutex
+
+	statusMu sync.Mutex
+	status   FTPStatus
+}
+
+// FTPStatus, dashboard'da gösterilen FTP arşivleme durumudur.
+type FTPStatus struct {
+	Enabled       bool   `json:"enabled"`
+	Server        string `json:"server,omitempty"`
+	Prefix        string `json:"prefix,omitempty"`
+	Backfill      bool   `json:"backfill"`
+	RetentionDays int    `json:"retention_days"`
+
+	// State: "ok", "error" veya "pending" (henüz tarama yapılmadı).
+	State          string `json:"state"`
+	LastScan       string `json:"last_scan,omitempty"`
+	LastUpload     string `json:"last_upload,omitempty"`
+	LastUploadFile string `json:"last_upload_file,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	LastErrorAt    string `json:"last_error_at,omitempty"`
+
+	// Son taramadaki yerel saat sayıları ve boyutları.
+	UploadedLocal      int    `json:"uploaded_local"`
+	UploadedLocalBytes int64  `json:"uploaded_local_bytes"`
+	Pending            int    `json:"pending"`
+	PendingBytes       int64  `json:"pending_bytes"`
+	Skipped            int    `json:"skipped"`
+	SkippedBytes       int64  `json:"skipped_bytes"`
+	OldestLocal        string `json:"oldest_local,omitempty"`
+	NextDeletion       string `json:"next_deletion,omitempty"`
+
+	// Servis açıldığından beri toplamlar.
+	UploadedTotal int   `json:"uploaded_total"`
+	DeletedTotal  int   `json:"deleted_total"`
+	DeletedBytes  int64 `json:"deleted_bytes"`
+}
+
+// Status, son FTP durumunun kopyasını döndürür.
+func (a *FTPArchiver) Status() FTPStatus {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	return a.status
+}
+
+func (a *FTPArchiver) updateStatus(fn func(*FTPStatus)) {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	fn(&a.status)
+}
+
+func (a *FTPArchiver) recordError(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("ftp: %s", msg)
+	a.updateStatus(func(st *FTPStatus) {
+		st.State = "error"
+		st.LastError = msg
+		st.LastErrorAt = a.now().In(a.location).Format(time.RFC3339)
+	})
 }
 
 func NewFTPArchiver(cfg FTPConfig, logRoot string, location *time.Location, retentionDays int, activePath func() string) *FTPArchiver {
@@ -302,6 +360,14 @@ func NewFTPArchiver(cfg FTPConfig, logRoot string, location *time.Location, rete
 		activePath:    activePath,
 		now:           time.Now,
 		trigger:       make(chan struct{}, 1),
+		status: FTPStatus{
+			Enabled:       true,
+			Server:        cfg.address(),
+			Prefix:        cfg.Prefix,
+			Backfill:      cfg.Backfill,
+			RetentionDays: retentionDays,
+			State:         "pending",
+		},
 	}
 }
 
@@ -320,7 +386,7 @@ func (a *FTPArchiver) Run(ctx context.Context) {
 	}
 
 	if conn, err := dialFTP(ctx, a.cfg); err != nil {
-		log.Printf("ftp: başlangıç bağlantı testi başarısız: %v", err)
+		a.recordError("başlangıç bağlantı testi başarısız: %v", err)
 	} else {
 		_ = conn.Quit()
 		log.Printf("ftp: %s bağlantısı doğrulandı", a.cfg.address())
@@ -345,13 +411,14 @@ type hourLog struct {
 }
 
 // RunOnce, bekleyen saatleri yükler ve süresi dolanları yerelden siler.
+// FTP'ye ulaşılamasa bile daha önce yüklenmiş saatlerin silinmesi sürer.
 func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
 
 	hours, err := a.scanHourLogs()
 	if err != nil {
-		log.Printf("ftp: log taraması başarısız: %v", err)
+		a.recordError("log taraması başarısız: %v", err)
 		return
 	}
 
@@ -362,11 +429,25 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 	}
 
 	var conn *ftp.ServerConn
+	dialFailed := false
 	defer func() {
 		if conn != nil {
 			_ = conn.Quit()
 		}
 	}()
+
+	var (
+		scanErr                  string
+		uploadedLocal, pending   int
+		skipped                  int
+		uploadedBytes, pendBytes int64
+		skippedBytes             int64
+		oldest, nextDeletion     time.Time
+	)
+	fail := func(format string, args ...any) {
+		scanErr = fmt.Sprintf(format, args...)
+		a.recordError("%s", scanErr)
+	}
 
 	for _, h := range hours {
 		if ctx.Err() != nil {
@@ -375,46 +456,109 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 		if !h.hour.Before(currentHour) || h.path == active {
 			continue
 		}
+		info, err := os.Stat(h.path)
+		if err != nil {
+			continue
+		}
+		size := info.Size() + fileSize(h.path+".sha256") + fileSize(h.path+".tsr")
+
 		digest, err := hourUploadKey(h.path)
 		if err != nil {
-			log.Printf("ftp: %s okunamadı: %v", h.path, err)
+			fail("%s okunamadı: %v", h.path, err)
 			continue
 		}
 		uploaded := readMarker(h.path) == digest
 
 		if !uploaded {
 			if !a.cfg.Backfill && h.hour.Before(since) {
+				skipped++
+				skippedBytes += size
+				if oldest.IsZero() {
+					oldest = h.hour
+				}
 				continue
 			}
-			if conn == nil {
+			if conn == nil && !dialFailed {
 				conn, err = dialFTP(ctx, a.cfg)
 				if err != nil {
-					log.Printf("ftp: %v (sonraki taramada yeniden denenecek)", err)
-					return
+					dialFailed = true
+					fail("%v (sonraki taramada yeniden denenecek)", err)
 				}
 			}
-			remotePath := remoteArchivePath(a.cfg.Prefix, h.hour)
-			err := uploadVerified(conn, remotePath, func(w io.Writer) error {
-				return writeHourArchive(w, h.path)
-			})
-			if err != nil {
-				log.Printf("ftp: %s yüklenemedi: %v (sonraki taramada yeniden denenecek)", h.path, err)
-				_ = conn.Quit()
-				conn = nil
-				continue
+			if conn != nil {
+				remotePath := remoteArchivePath(a.cfg.Prefix, h.hour)
+				err := uploadVerified(conn, remotePath, func(w io.Writer) error {
+					return writeHourArchive(w, h.path)
+				})
+				if err != nil {
+					fail("%s yüklenemedi: %v (sonraki taramada yeniden denenecek)", h.path, err)
+					_ = conn.Quit()
+					conn = nil
+				} else if err := os.WriteFile(h.path+ftpMarkerSuffix, []byte(digest+"\n"), 0o644); err != nil {
+					fail("işaret dosyası yazılamadı (%s): %v", h.path, err)
+				} else {
+					log.Printf("ftp: %s -> %s yüklendi", h.path, remotePath)
+					uploaded = true
+					a.updateStatus(func(st *FTPStatus) {
+						st.UploadedTotal++
+						st.LastUpload = a.now().In(a.location).Format(time.RFC3339)
+						st.LastUploadFile = remotePath
+					})
+				}
 			}
-			if err := os.WriteFile(h.path+ftpMarkerSuffix, []byte(digest+"\n"), 0o644); err != nil {
-				log.Printf("ftp: işaret dosyası yazılamadı (%s): %v", h.path, err)
-				continue
-			}
-			log.Printf("ftp: %s -> %s yüklendi", h.path, remotePath)
-			uploaded = true
 		}
 
 		if uploaded && a.expired(h.hour) {
-			a.removeLocal(h.path)
+			if err := a.removeLocal(h.path); err != nil {
+				fail("%v", err)
+			} else {
+				a.updateStatus(func(st *FTPStatus) {
+					st.DeletedTotal++
+					st.DeletedBytes += size
+				})
+				continue
+			}
+		}
+
+		if oldest.IsZero() {
+			oldest = h.hour
+		}
+		if uploaded {
+			uploadedLocal++
+			uploadedBytes += size
+			if a.retentionDays > 0 && nextDeletion.IsZero() {
+				nextDeletion = h.hour.Add(time.Hour + time.Duration(a.retentionDays)*24*time.Hour)
+			}
+		} else {
+			pending++
+			pendBytes += size
 		}
 	}
+
+	a.updateStatus(func(st *FTPStatus) {
+		st.LastScan = a.now().In(a.location).Format(time.RFC3339)
+		if scanErr == "" {
+			st.State = "ok"
+		}
+		st.UploadedLocal, st.UploadedLocalBytes = uploadedLocal, uploadedBytes
+		st.Pending, st.PendingBytes = pending, pendBytes
+		st.Skipped, st.SkippedBytes = skipped, skippedBytes
+		st.OldestLocal, st.NextDeletion = "", ""
+		if !oldest.IsZero() {
+			st.OldestLocal = oldest.In(a.location).Format(time.RFC3339)
+		}
+		if !nextDeletion.IsZero() {
+			st.NextDeletion = nextDeletion.In(a.location).Format(time.RFC3339)
+		}
+	})
+}
+
+func fileSize(p string) int64 {
+	info, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 func (a *FTPArchiver) expired(hour time.Time) bool {
@@ -425,11 +569,10 @@ func (a *FTPArchiver) expired(hour time.Time) bool {
 	return hour.Add(time.Hour).Before(cutoff)
 }
 
-func (a *FTPArchiver) removeLocal(logPath string) {
+func (a *FTPArchiver) removeLocal(logPath string) error {
 	for _, p := range []string{logPath, logPath + ".sha256", logPath + ".tsr", logPath + ftpMarkerSuffix} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Printf("ftp: yerel dosya silinemedi (%s): %v", p, err)
-			return
+			return fmt.Errorf("yerel dosya silinemedi (%s): %w", p, err)
 		}
 	}
 	log.Printf("ftp: saklama süresi dolan %s yerelden silindi", logPath)
@@ -441,6 +584,7 @@ func (a *FTPArchiver) removeLocal(logPath string) {
 			break
 		}
 	}
+	return nil
 }
 
 // scanHourLogs, LogRoot/YYYY/MM/DD/HH.log düzenindeki dosyaları eskiden yeniye

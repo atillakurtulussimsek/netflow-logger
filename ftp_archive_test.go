@@ -446,3 +446,68 @@ func TestLoadFTPConfig(t *testing.T) {
 		t.Fatal("negatif süre hata vermeli")
 	}
 }
+
+func TestFTPArchiverStatusAndDeletesWhenServerDown(t *testing.T) {
+	srv := newFakeFTPServer(t)
+	root := t.TempDir()
+	now := time.Date(2026, 11, 22, 14, 30, 0, 0, time.UTC)
+
+	// Daha önce yüklenmiş ve süresi dolmuş saat: FTP'ye ulaşılamasa da silinmeli.
+	expiredHour := now.Add(-20 * 24 * time.Hour).Truncate(time.Hour)
+	expiredPath := writeSealedHour(t, root, expiredHour, "old\n", "aaa")
+	if err := os.WriteFile(expiredPath+ftpMarkerSuffix, []byte("aaa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Yüklenmemiş saat: bekliyor olarak sayılmalı.
+	pendingHour := now.Add(-2 * time.Hour).Truncate(time.Hour)
+	writeSealedHour(t, root, pendingHour, "pending\n", "bbb")
+	// Geriye dönük kapalıyken başlangıçtan önceki saat: atlanan.
+	skippedHour := now.Add(-3 * 24 * time.Hour).Truncate(time.Hour)
+	writeSealedHour(t, root, skippedHour, "skip\n", "ccc")
+
+	cfg := srv.config()
+	cfg.Password = "yanlis"
+	archiver := NewFTPArchiver(cfg, root, time.UTC, 7, nil)
+	archiver.now = func() time.Time { return now }
+	archiver.RunOnce(context.Background(), now.Add(-24*time.Hour).Truncate(time.Hour))
+
+	if _, err := os.Stat(expiredPath); !os.IsNotExist(err) {
+		t.Fatal("FTP kapalıyken de yüklenmiş ve süresi dolmuş saat silinmeli")
+	}
+	st := archiver.Status()
+	if st.State != "error" || st.LastError == "" {
+		t.Fatalf("hata durumu beklenir: %+v", st)
+	}
+	if st.Pending != 1 || st.Skipped != 1 || st.UploadedLocal != 0 || st.DeletedTotal != 1 {
+		t.Fatalf("beklenmeyen sayılar: %+v", st)
+	}
+	if st.PendingBytes != int64(len("pending\n")+len("bbb\n")+len("tsr-bbb")) {
+		t.Fatalf("bekleyen boyut hatalı: %d", st.PendingBytes)
+	}
+
+	// Sunucu düzelince bekleyen yüklenir, durum güncellenir.
+	archiver.cfg.Password = srv.password
+	archiver.RunOnce(context.Background(), now.Add(-24*time.Hour).Truncate(time.Hour))
+	st = archiver.Status()
+	if st.State != "ok" || st.Pending != 0 || st.UploadedLocal != 1 || st.UploadedTotal != 1 || st.LastUpload == "" {
+		t.Fatalf("başarılı tarama sonrası durum hatalı: %+v", st)
+	}
+	wantNext := pendingHour.Add(time.Hour + 7*24*time.Hour).Format(time.RFC3339)
+	if st.NextDeletion != wantNext {
+		t.Fatalf("sonraki silme %s, beklenen %s", st.NextDeletion, wantNext)
+	}
+}
+
+func TestBuildDiskStatus(t *testing.T) {
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "a.log"), make([]byte, 1000), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, "x"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "x", "b.tsr"), make([]byte, 24), 0o644)
+	st := buildDiskStatus(root)
+	if st.LogRootBytes != 1024 {
+		t.Fatalf("log dizini boyutu 1024 olmalı: %d", st.LogRootBytes)
+	}
+	if st.Total == 0 || st.Free > st.Total {
+		t.Fatalf("disk bilgisi hatalı: %+v", st)
+	}
+}

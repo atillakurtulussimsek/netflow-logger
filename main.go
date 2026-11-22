@@ -117,6 +117,7 @@ type App struct {
 	whitelist *Whitelist
 	blocklist *Blocklist
 	geo       *GeoResolver
+	archiver  *FTPArchiver
 }
 
 type FlowRecord struct {
@@ -183,6 +184,8 @@ type DashboardState struct {
 	ActiveFile      string        `json:"active_file,omitempty"`
 	LastSHA256      string        `json:"last_sha256,omitempty"`
 	LastTSAStatus   string        `json:"last_tsa_status,omitempty"`
+	FTP             *FTPStatus    `json:"ftp,omitempty"`
+	Disk            *DiskStatus   `json:"disk,omitempty"`
 	ProcessedTotal  uint64        `json:"processed_total"`
 	PacketsTotal    uint64        `json:"packets_total"`
 	Threats         []ThreatAlert `json:"threats"`
@@ -1694,6 +1697,17 @@ func severityRank(sev string) int {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	// FTP arşivleyici: mühürlenen saatleri paketleyip yükler, süresi dolanları
+	// yerelden siler.
+	if a.cfg.FTP != nil {
+		archiver := NewFTPArchiver(*a.cfg.FTP, a.cfg.LogRoot, a.cfg.Location, a.cfg.LocalRetentionDays, a.logger.ActivePath)
+		a.archiver = archiver
+		a.logger.mu.Lock()
+		a.logger.afterSeal = archiver.Notify
+		a.logger.mu.Unlock()
+		go archiver.Run(ctx)
+	}
+
 	httpListener, err := net.Listen("tcp", a.cfg.DashboardAddress)
 	if err != nil {
 		return fmt.Errorf("dashboard listen failed: %w", err)
@@ -1723,16 +1737,6 @@ func (a *App) Run(ctx context.Context) error {
 		_ = httpServer.Shutdown(shutdownCtx)
 		_ = pc.Close()
 	}()
-
-	// FTP arşivleyici: mühürlenen saatleri paketleyip yükler, süresi dolanları
-	// yerelden siler.
-	if a.cfg.FTP != nil {
-		archiver := NewFTPArchiver(*a.cfg.FTP, a.cfg.LogRoot, a.cfg.Location, a.cfg.LocalRetentionDays, a.logger.ActivePath)
-		a.logger.mu.Lock()
-		a.logger.afterSeal = archiver.Notify
-		a.logger.mu.Unlock()
-		go archiver.Run(ctx)
-	}
 
 	// Tehdit analizcisinin bakım döngüsü: boşta kalan kaynakları ve süresi dolan
 	// uyarıları arka planda periyodik olarak temizler.
@@ -1777,6 +1781,16 @@ func (a *App) Run(ctx context.Context) error {
 			log.Printf("packet handling failed from %s: %v", addr.String(), err)
 		}
 	}
+}
+
+// ftpStatus, dashboard için FTP durumunu döndürür; FTP kapalıysa yalnız
+// Enabled=false olan bir durum döner.
+func (a *App) ftpStatus() *FTPStatus {
+	if a.archiver == nil {
+		return &FTPStatus{Enabled: false, State: "disabled", RetentionDays: a.cfg.LocalRetentionDays}
+	}
+	st := a.archiver.Status()
+	return &st
 }
 
 func (a *App) dashboardRouter() http.Handler {
@@ -2426,6 +2440,8 @@ func (a *App) handleDashboardState(w http.ResponseWriter, r *http.Request) {
 	state.FileSizeDaily = calculateLogSizeByDay(a.cfg.LogRoot, refDate)
 	state.FileSizeMonthly = calculateLogSizeByMonth(a.cfg.LogRoot, refDate)
 	state.FileSizeTotal = calculateTotalLogSize(a.cfg.LogRoot)
+	state.FTP = a.ftpStatus()
+	state.Disk = buildDiskStatus(a.cfg.LogRoot)
 	if err := json.NewEncoder(w).Encode(state); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -2463,6 +2479,8 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 		fileSizeDaily   string
 		fileSizeMonthly string
 		fileSizeTotal   string
+		ftp             *FTPStatus
+		disk            *DiskStatus
 	}
 	var cache heavyStats
 	cacheValid := false
@@ -2475,6 +2493,8 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 			fileSizeDaily:   calculateLogSizeByDay(a.cfg.LogRoot, refDate),
 			fileSizeMonthly: calculateLogSizeByMonth(a.cfg.LogRoot, refDate),
 			fileSizeTotal:   calculateTotalLogSize(a.cfg.LogRoot),
+			ftp:             a.ftpStatus(),
+			disk:            buildDiskStatus(a.cfg.LogRoot),
 		}
 		cacheValid = true
 	}
@@ -2494,6 +2514,8 @@ func (a *App) handleDashboardEvents(w http.ResponseWriter, r *http.Request) {
 		state.FileSizeDaily = cache.fileSizeDaily
 		state.FileSizeMonthly = cache.fileSizeMonthly
 		state.FileSizeTotal = cache.fileSizeTotal
+		state.FTP = cache.ftp
+		state.Disk = cache.disk
 
 		payload, err := json.Marshal(state)
 		if err != nil {
@@ -4677,6 +4699,7 @@ const dashboardHTML = `<!DOCTYPE html>
       white-space: nowrap;
     }
     .ip-stat-value.green { color: var(--green); }
+    .ip-stat-value.warn { color: var(--amber); }
     .ip-stat-sub { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .ip-tops { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3); }
@@ -4741,6 +4764,55 @@ const dashboardHTML = `<!DOCTYPE html>
       color: var(--green);
       animation: blink 1s steps(1) infinite;
     }
+
+    /* ── FTP arşivleme ve disk ───────────────────────────────────────── */
+    a.seal-badge { text-decoration: none; }
+    a.seal-badge:hover { color: var(--text); }
+    .seal-badge.warn { color: var(--amber); }
+    .seal-badge.warn::before { background: var(--amber); }
+
+    .archive-body { padding: var(--s4); display: grid; gap: var(--s4); }
+
+    .disk-row { display: grid; gap: var(--s2); }
+    .disk-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s2); }
+    .disk-pct { font-size: 18px; font-weight: 700; color: var(--text); }
+    .disk-pct.warn { color: var(--amber); }
+    .disk-pct.error { color: var(--red); }
+
+    .disk-bar {
+      display: flex;
+      height: 12px;
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      background: var(--bg);
+      overflow: hidden;
+    }
+    .disk-fill { display: block; height: 100%; width: 0; transition: width 0.4s var(--ease); }
+    .disk-fill.logs { background: var(--cyan); }
+    .disk-fill.other { background: var(--text-3); }
+
+    .disk-legend { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); font-size: 12px; color: var(--text-3); }
+    .disk-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .disk-legend strong { color: var(--text); font-weight: 600; }
+    .kv-dot.disk-logs { background: var(--cyan); }
+    .kv-dot.disk-other { background: var(--text-3); }
+    .kv-dot.disk-free { background: var(--bg); border: 1px solid var(--line-2); }
+
+    .archive-foot { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s5); }
+    .archive-foot .seal-foot { min-width: 0; }
+
+    .archive-error {
+      padding: var(--s2) var(--s3);
+      border-left: 3px solid var(--red);
+      background: var(--bg);
+      font-size: 12px;
+      color: var(--text-2);
+      overflow-wrap: anywhere;
+    }
+    .archive-error strong { color: var(--red); }
+
+    .archive-panel.disabled .archive-stats,
+    .archive-panel.disabled .archive-foot { opacity: 0.45; }
 
     /* ── Animasyonlar ────────────────────────────────────────────────── */
     @keyframes blink { 50% { opacity: 0; } }
@@ -4855,6 +4927,10 @@ const dashboardHTML = `<!DOCTYPE html>
         <span class="seal-badge" id="seal-badge">Bekliyor</span>
       </div>
       <div class="sl-item">
+        <span class="sl-key">FTP</span>
+        <a class="seal-badge" id="ftp-badge" href="#archive-panel">Kapalı</a>
+      </div>
+      <div class="sl-item">
         <span class="sl-key">Tehdit</span>
         <span class="threat-badge" id="threat-badge">0</span>
       </div>
@@ -4935,6 +5011,70 @@ const dashboardHTML = `<!DOCTYPE html>
           </dl>
         </div>
       </article>
+    </section>
+
+    <section class="panel archive-panel" id="archive-panel" aria-labelledby="archive-title">
+      <header class="panel-head">
+        <span class="panel-tag">05</span>
+        <h2 class="panel-title" id="archive-title">FTP arşivleme ve disk</h2>
+        <span class="seal-badge" id="ftp-state">Kapalı</span>
+        <span class="spacer"></span>
+        <span class="panel-meta" id="ftp-target">-</span>
+      </header>
+      <div class="archive-body">
+        <div class="disk-row">
+          <div class="disk-head">
+            <span class="sha-label">Disk doluluğu</span>
+            <span class="disk-pct" id="disk-pct">-</span>
+          </div>
+          <div class="disk-bar" role="progressbar" aria-label="Disk doluluğu" aria-valuemin="0" aria-valuemax="100" id="disk-bar">
+            <span class="disk-fill logs" id="disk-fill-logs"></span>
+            <span class="disk-fill other" id="disk-fill-other"></span>
+          </div>
+          <div class="disk-legend">
+            <span><i class="kv-dot disk-logs" aria-hidden="true"></i>Log dizini <strong id="disk-logs">-</strong></span>
+            <span><i class="kv-dot disk-other" aria-hidden="true"></i>Diğer <strong id="disk-other">-</strong></span>
+            <span><i class="kv-dot disk-free" aria-hidden="true"></i>Boş <strong id="disk-free">-</strong> / <span id="disk-total">-</span></span>
+          </div>
+        </div>
+        <div class="ip-stats archive-stats">
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yüklendi, yerelde</div>
+            <div class="ip-stat-value green" id="ftp-uploaded">-</div>
+            <div class="ip-stat-sub" id="ftp-uploaded-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yükleme bekliyor</div>
+            <div class="ip-stat-value" id="ftp-pending">-</div>
+            <div class="ip-stat-sub" id="ftp-pending-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Atlanan (geriye dönük kapalı)</div>
+            <div class="ip-stat-value" id="ftp-skipped">-</div>
+            <div class="ip-stat-sub" id="ftp-skipped-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Silinen (bu oturum)</div>
+            <div class="ip-stat-value" id="ftp-deleted">-</div>
+            <div class="ip-stat-sub" id="ftp-deleted-size">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Yerel saklama</div>
+            <div class="ip-stat-value" id="ftp-retention">-</div>
+            <div class="ip-stat-sub" id="ftp-oldest">-</div>
+          </div>
+          <div class="ip-stat">
+            <div class="ip-stat-label">Sonraki silme</div>
+            <div class="ip-stat-value" id="ftp-next-delete">-</div>
+            <div class="ip-stat-sub" id="ftp-next-delete-date">-</div>
+          </div>
+        </div>
+        <div class="archive-foot">
+          <span class="seal-foot" id="ftp-last-upload">Son yükleme: -</span>
+          <span class="seal-foot" id="ftp-last-scan">Son tarama: -</span>
+        </div>
+        <div class="archive-error" id="ftp-error" role="alert" hidden></div>
+      </div>
     </section>
 
     <div class="alert-banner" id="no-data-alert" role="alert" hidden>
@@ -5210,6 +5350,7 @@ const dashboardHTML = `<!DOCTYPE html>
     const sealBadgeEl = $('seal-badge');
     const sealShaEl = $('seal-sha');
     const sealDetailEl = $('seal-detail');
+    const archivePanelEl = $('archive-panel');
     const copyShaEl = $('copy-sha');
     const noDataEl = $('no-data-alert');
     const noDataDetailEl = $('no-data-detail');
@@ -5785,6 +5926,102 @@ const dashboardHTML = `<!DOCTYPE html>
       threatListEl.insertAdjacentHTML('beforeend', rows);
     }
 
+    function formatDateTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+
+    function formatRelative(value) {
+      if (!value) return '-';
+      const ms = new Date(value).getTime() - Date.now();
+      if (!Number.isFinite(ms)) return '-';
+      if (ms <= 0) return 'bir sonraki taramada';
+      const hours = Math.floor(ms / 3600000);
+      if (hours >= 24) return Math.floor(hours / 24) + ' gün ' + (hours % 24) + ' sa';
+      if (hours >= 1) return hours + ' sa ' + Math.floor((ms % 3600000) / 60000) + ' dk';
+      return Math.max(1, Math.floor(ms / 60000)) + ' dk';
+    }
+
+    function setBadge(el, text, cls) {
+      el.textContent = text;
+      el.className = 'seal-badge' + (cls ? ' ' + cls : '');
+    }
+
+    function updateArchive(state) {
+      const disk = state.disk;
+      if (disk) {
+        const total = Number(disk.total) || 0;
+        const logs = Number(disk.log_root_bytes) || 0;
+        const used = Number(disk.used) || 0;
+        const other = Math.max(0, used - logs);
+        const pctEl = $('disk-pct');
+        if (total > 0) {
+          const pct = used / total * 100;
+          pctEl.textContent = '%' + pct.toFixed(1) + ' dolu';
+          pctEl.className = 'disk-pct' + (pct >= 95 ? ' error' : pct >= 85 ? ' warn' : '');
+          $('disk-fill-logs').style.width = Math.min(100, logs / total * 100) + '%';
+          $('disk-fill-other').style.width = Math.min(100, other / total * 100) + '%';
+          $('disk-bar').setAttribute('aria-valuenow', pct.toFixed(0));
+          $('disk-free').textContent = formatBytes(disk.free);
+          $('disk-total').textContent = formatBytes(total);
+          $('disk-other').textContent = formatBytes(other);
+        } else {
+          pctEl.textContent = 'bilinmiyor';
+        }
+        $('disk-logs').textContent = formatBytes(logs);
+      }
+
+      const ftp = state.ftp;
+      if (!ftp) return;
+      const badgeEl = $('ftp-badge');
+      const stateEl = $('ftp-state');
+      archivePanelEl.classList.toggle('disabled', !ftp.enabled);
+      $('ftp-retention').textContent = ftp.retention_days > 0 ? ftp.retention_days + ' gün' : 'silme kapalı';
+
+      if (!ftp.enabled) {
+        setBadge(badgeEl, 'Kapalı', '');
+        setBadge(stateEl, 'Kapalı', '');
+        $('ftp-target').textContent = 'FTP_ENABLED=false';
+        $('ftp-error').hidden = true;
+        return;
+      }
+
+      let text = 'Bekliyor';
+      let cls = '';
+      if (ftp.state === 'error') { text = 'Hata'; cls = 'error'; }
+      else if (ftp.state === 'ok' && ftp.pending > 0) { text = ftp.pending + ' bekliyor'; cls = 'warn'; }
+      else if (ftp.state === 'ok') { text = 'Güncel'; cls = 'ok'; }
+      setBadge(badgeEl, text, cls);
+      setBadge(stateEl, text, cls);
+
+      $('ftp-target').textContent = (ftp.server || '-') + (ftp.prefix ? ' / ' + ftp.prefix : '') + (ftp.backfill ? ' · geriye dönük açık' : ' · geriye dönük kapalı');
+      $('ftp-uploaded').textContent = String(ftp.uploaded_local ?? 0) + ' saat';
+      $('ftp-uploaded-size').textContent = formatBytes(ftp.uploaded_local_bytes || 0);
+      $('ftp-pending').textContent = String(ftp.pending ?? 0) + ' saat';
+      $('ftp-pending-size').textContent = formatBytes(ftp.pending_bytes || 0);
+      $('ftp-skipped').textContent = String(ftp.skipped ?? 0) + ' saat';
+      $('ftp-skipped-size').textContent = formatBytes(ftp.skipped_bytes || 0);
+      $('ftp-deleted').textContent = String(ftp.deleted_total ?? 0) + ' saat';
+      $('ftp-deleted-size').textContent = formatBytes(ftp.deleted_bytes || 0);
+      $('ftp-oldest').textContent = 'en eski: ' + formatDateTime(ftp.oldest_local);
+      $('ftp-next-delete').textContent = ftp.retention_days > 0 ? formatRelative(ftp.next_deletion) : '-';
+      $('ftp-next-delete-date').textContent = formatDateTime(ftp.next_deletion);
+      $('ftp-pending').className = 'ip-stat-value' + (ftp.pending > 0 ? ' warn' : '');
+      $('ftp-skipped').className = 'ip-stat-value' + (ftp.skipped > 0 ? ' warn' : '');
+      $('ftp-last-upload').textContent = 'Son yükleme: ' + formatDateTime(ftp.last_upload) + (ftp.last_upload_file ? ' · ' + ftp.last_upload_file : '');
+      $('ftp-last-scan').textContent = 'Son tarama: ' + formatDateTime(ftp.last_scan) + ' · servis açılışından beri ' + (ftp.uploaded_total || 0) + ' yükleme';
+
+      const errEl = $('ftp-error');
+      if (ftp.last_error) {
+        errEl.hidden = false;
+        errEl.innerHTML = '<strong>' + (ftp.state === 'error' ? 'Son hata' : 'Önceki hata') + ' (' + escapeHtml(formatDateTime(ftp.last_error_at)) + '):</strong> ' + escapeHtml(ftp.last_error);
+      } else {
+        errEl.hidden = true;
+      }
+    }
+
     let renderFrame = null;
     let pendingState = null;
 
@@ -5804,6 +6041,7 @@ const dashboardHTML = `<!DOCTYPE html>
       fileSizeMonthlyEl.textContent = state.file_size_monthly || '-';
       fileSizeTotalEl.textContent = state.file_size_total || '-';
       updateIntegrity(state);
+      updateArchive(state);
       if (Array.isArray(state.threats)) updateThreats(state.threats);
       const isLive = mode === 'live';
       if (isLive) {
