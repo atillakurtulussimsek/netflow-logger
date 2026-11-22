@@ -511,3 +511,45 @@ func TestBuildDiskStatus(t *testing.T) {
 		t.Fatalf("disk bilgisi hatalı: %+v", st)
 	}
 }
+
+// Disk doluyken işaret dosyası yazılamaz; süresi dolmuş saat yine de
+// yüklendikten sonra silinmeli (silme boş alan gerektirmez).
+func TestFTPArchiverDeletesExpiredWhenMarkerUnwritable(t *testing.T) {
+	srv := newFakeFTPServer(t)
+	root := t.TempDir()
+	now := time.Date(2026, 11, 22, 14, 30, 0, 0, time.UTC)
+
+	expiredHour := now.Add(-50 * 24 * time.Hour).Truncate(time.Hour)
+	expiredPath := writeSealedHour(t, root, expiredHour, "old\n", "aaa")
+	recentHour := now.Add(-2 * time.Hour).Truncate(time.Hour)
+	recentPath := writeSealedHour(t, root, recentHour, "new\n", "bbb")
+	// İşaret yolunu klasör yaparak yazmayı başarısız kıl (ENOSPC benzetimi).
+	for _, p := range []string{expiredPath, recentPath} {
+		if err := os.Mkdir(p+ftpMarkerSuffix, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := srv.config()
+	cfg.Backfill = true
+	archiver := NewFTPArchiver(cfg, root, time.UTC, 3, nil)
+	archiver.now = func() time.Time { return now }
+	archiver.RunOnce(context.Background(), now)
+
+	if _, ok := srv.file(remoteArchivePath("", expiredHour)); !ok {
+		t.Fatal("süresi dolmuş saat yüklenmeli")
+	}
+	if _, err := os.Stat(expiredPath); !os.IsNotExist(err) {
+		t.Fatal("işaret yazılamasa da süresi dolmuş saat silinmeli")
+	}
+	if _, err := os.Stat(recentPath); err != nil {
+		t.Fatal("süresi dolmamış saat yerelde kalmalı")
+	}
+	st := archiver.Status()
+	if st.DeletedTotal != 1 || st.UploadedTotal != 2 || st.State != "error" || st.Scanning {
+		t.Fatalf("beklenmeyen durum: %+v", st)
+	}
+	if st.ScanDone != st.ScanTotal || st.ScanTotal != 2 {
+		t.Fatalf("tarama ilerlemesi hatalı: %+v", st)
+	}
+}

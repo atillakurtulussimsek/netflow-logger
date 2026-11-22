@@ -5991,6 +5991,7 @@ const dashboardHTML = `<!DOCTYPE html>
       let text = 'Bekliyor';
       let cls = '';
       if (ftp.state === 'error') { text = 'Hata'; cls = 'error'; }
+      else if (ftp.scanning) { text = 'Taranıyor'; cls = 'warn'; }
       else if (ftp.state === 'ok' && ftp.pending > 0) { text = ftp.pending + ' bekliyor'; cls = 'warn'; }
       else if (ftp.state === 'ok') { text = 'Güncel'; cls = 'ok'; }
       setBadge(badgeEl, text, cls);
@@ -6011,7 +6012,10 @@ const dashboardHTML = `<!DOCTYPE html>
       $('ftp-pending').className = 'ip-stat-value' + (ftp.pending > 0 ? ' warn' : '');
       $('ftp-skipped').className = 'ip-stat-value' + (ftp.skipped > 0 ? ' warn' : '');
       $('ftp-last-upload').textContent = 'Son yükleme: ' + formatDateTime(ftp.last_upload) + (ftp.last_upload_file ? ' · ' + ftp.last_upload_file : '');
-      $('ftp-last-scan').textContent = 'Son tarama: ' + formatDateTime(ftp.last_scan) + ' · servis açılışından beri ' + (ftp.uploaded_total || 0) + ' yükleme';
+      const scanText = ftp.scanning
+        ? 'Tarama sürüyor: ' + (ftp.scan_done || 0) + ' / ' + (ftp.scan_total || 0) + ' saat'
+        : 'Son tarama: ' + formatDateTime(ftp.last_scan);
+      $('ftp-last-scan').textContent = scanText + ' · servis açılışından beri ' + (ftp.uploaded_total || 0) + ' yükleme';
 
       const errEl = $('ftp-error');
       if (ftp.last_error) {

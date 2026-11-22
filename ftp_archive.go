@@ -320,7 +320,11 @@ type FTPStatus struct {
 	Skipped            int    `json:"skipped"`
 	SkippedBytes       int64  `json:"skipped_bytes"`
 	OldestLocal        string `json:"oldest_local,omitempty"`
-	NextDeletion       string `json:"next_deletion,omitempty"`
+	// Tarama ilerlemesi: Scanning true iken ScanDone/ScanTotal saat işlendi.
+	Scanning     bool   `json:"scanning"`
+	ScanDone     int    `json:"scan_done"`
+	ScanTotal    int    `json:"scan_total"`
+	NextDeletion string `json:"next_deletion,omitempty"`
 
 	// Servis açıldığından beri toplamlar.
 	UploadedTotal int   `json:"uploaded_total"`
@@ -449,7 +453,40 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 		a.recordError("%s", scanErr)
 	}
 
-	for _, h := range hours {
+	// publish, sayaçları dashboard'a yansıtır; uzun taramalarda (ör. geriye
+	// dönük yükleme) tarama sürerken de periyodik çağrılır.
+	publish := func(done int, finished bool) {
+		a.updateStatus(func(st *FTPStatus) {
+			st.ScanDone, st.ScanTotal, st.Scanning = done, len(hours), !finished
+			if finished {
+				st.LastScan = a.now().In(a.location).Format(time.RFC3339)
+				if scanErr == "" {
+					st.State = "ok"
+				}
+			}
+			st.UploadedLocal, st.UploadedLocalBytes = uploadedLocal, uploadedBytes
+			st.Pending, st.PendingBytes = pending, pendBytes
+			st.Skipped, st.SkippedBytes = skipped, skippedBytes
+			st.OldestLocal, st.NextDeletion = "", ""
+			if !oldest.IsZero() {
+				st.OldestLocal = oldest.In(a.location).Format(time.RFC3339)
+			}
+			if !nextDeletion.IsZero() {
+				st.NextDeletion = nextDeletion.In(a.location).Format(time.RFC3339)
+			}
+		})
+	}
+	defer func() {
+		// İptal edilen taramada da "sürüyor" durumunda kalmasın.
+		a.updateStatus(func(st *FTPStatus) { st.Scanning = false })
+	}()
+	lastPublish := time.Now()
+
+	for i, h := range hours {
+		if time.Since(lastPublish) >= 2*time.Second {
+			publish(i, false)
+			lastPublish = time.Now()
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -494,8 +531,6 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 					fail("%s yüklenemedi: %v (sonraki taramada yeniden denenecek)", h.path, err)
 					_ = conn.Quit()
 					conn = nil
-				} else if err := os.WriteFile(h.path+ftpMarkerSuffix, []byte(digest+"\n"), 0o644); err != nil {
-					fail("işaret dosyası yazılamadı (%s): %v", h.path, err)
 				} else {
 					log.Printf("ftp: %s -> %s yüklendi", h.path, remotePath)
 					uploaded = true
@@ -504,6 +539,14 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 						st.LastUpload = a.now().In(a.location).Format(time.RFC3339)
 						st.LastUploadFile = remotePath
 					})
+					// Saklama süresi dolmuşsa işaret dosyasına gerek yok; hemen
+					// silinir. Disk tamamen doluyken işaret yazılamaz ama silme
+					// boş alan gerektirmez.
+					if !a.expired(h.hour) {
+						if err := os.WriteFile(h.path+ftpMarkerSuffix, []byte(digest+"\n"), 0o644); err != nil {
+							fail("işaret dosyası yazılamadı (%s): %v", h.path, err)
+						}
+					}
 				}
 			}
 		}
@@ -535,22 +578,7 @@ func (a *FTPArchiver) RunOnce(ctx context.Context, since time.Time) {
 		}
 	}
 
-	a.updateStatus(func(st *FTPStatus) {
-		st.LastScan = a.now().In(a.location).Format(time.RFC3339)
-		if scanErr == "" {
-			st.State = "ok"
-		}
-		st.UploadedLocal, st.UploadedLocalBytes = uploadedLocal, uploadedBytes
-		st.Pending, st.PendingBytes = pending, pendBytes
-		st.Skipped, st.SkippedBytes = skipped, skippedBytes
-		st.OldestLocal, st.NextDeletion = "", ""
-		if !oldest.IsZero() {
-			st.OldestLocal = oldest.In(a.location).Format(time.RFC3339)
-		}
-		if !nextDeletion.IsZero() {
-			st.NextDeletion = nextDeletion.In(a.location).Format(time.RFC3339)
-		}
-	})
+	publish(len(hours), true)
 }
 
 func fileSize(p string) int64 {
